@@ -56,6 +56,13 @@ def to_map_units(meters: float, is_geo: bool) -> float:
     return meters / 111139.0 if is_geo else meters
 
 
+def polygon_area_m2(poly, is_geo: bool) -> float:
+    if is_geo:
+        lat_c = poly.centroid.y
+        return poly.area * (111139.0 ** 2) * math.cos(math.radians(lat_c))
+    return poly.area
+
+
 def z_to_hex(z: float, zmin: float, zmax: float) -> str:
     t = np.clip((z - zmin) / max(zmax - zmin, 1e-9), 0, 1)
     return mpl_colors.to_hex(mpl_cm.cool(t))
@@ -196,6 +203,16 @@ with info_col:
         '3. Click **Compute Route**  \n'
         '4. Download results below'
     )
+    if st.session_state.polygon:
+        poly_shape = shapely_shape(st.session_state.polygon['geometry'])
+        area_m2 = polygon_area_m2(poly_shape, is_geo)
+        st.divider()
+        st.markdown('**Polygon**')
+        if area_m2 >= 1_000_000:
+            st.metric('Area', f'{area_m2 / 1_000_000:.3f} km²')
+        else:
+            st.metric('Area', f'{area_m2:,.0f} m²')
+
     st.divider()
     st.markdown('**DTM**')
     st.markdown(
