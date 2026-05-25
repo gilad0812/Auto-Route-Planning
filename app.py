@@ -290,12 +290,22 @@ with info_col:
             xs = [wp['x'] for wp in wps]
             ys = [wp['y'] for wp in wps]
             zs = [wp['z'] for wp in wps]
-            total = sum(math.sqrt((xs[i+1]-xs[i])**2 + (ys[i+1]-ys[i])**2)
-                        for i in range(len(xs)-1))
+            if is_geo:
+                lat_m = 111139.0
+                lon_m = 111139.0 * math.cos(math.radians(sum(ys) / len(ys)))
+                total_m = sum(
+                    math.sqrt(((xs[i+1]-xs[i]) * lon_m)**2 + ((ys[i+1]-ys[i]) * lat_m)**2)
+                    for i in range(len(xs)-1)
+                )
+            else:
+                total_m = sum(
+                    math.sqrt((xs[i+1]-xs[i])**2 + (ys[i+1]-ys[i])**2)
+                    for i in range(len(xs)-1)
+                )
             st.divider()
             st.markdown('**Route**')
             st.metric('Waypoints', len(wps))
-            st.metric('Path length', f'{total:.4f} °')
+            st.metric('Path length', f'{total_m/1000:.2f} km' if total_m >= 1000 else f'{total_m:.0f} m')
             st.metric('Alt range', f'{min(zs):.0f} – {max(zs):.0f} m')
 
 # ------------------------------------------------------------------ capture new drawing
