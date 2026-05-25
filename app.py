@@ -5,6 +5,7 @@ import json
 import csv
 import io
 import base64
+import tempfile
 
 import numpy as np
 import streamlit as st
@@ -70,7 +71,7 @@ def z_to_hex(z: float, zmin: float, zmax: float) -> str:
 
 # ------------------------------------------------------------------ session state
 
-for _k, _v in [('polygon', None), ('route', None)]:
+for _k, _v in [('polygon', None), ('route', None), ('dtm_tmp_path', None), ('dtm_upload_name', None)]:
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
@@ -78,7 +79,29 @@ for _k, _v in [('polygon', None), ('route', None)]:
 
 with st.sidebar:
     st.title('Flight Parameters')
-    dtm_path = st.text_input('DTM file path', value='data/dtm.tif')
+
+    uploaded = st.file_uploader(
+        'Upload DTM/DEM',
+        type=['tif', 'tiff', 'img', 'dem', 'asc', 'hgt'],
+        help='GeoTIFF or other GDAL-supported raster',
+    )
+    if uploaded is not None and uploaded.name != st.session_state.dtm_upload_name:
+        suffix = os.path.splitext(uploaded.name)[1]
+        tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+        tmp.write(uploaded.read())
+        tmp.flush()
+        tmp.close()
+        st.session_state.dtm_tmp_path = tmp.name
+        st.session_state.dtm_upload_name = uploaded.name
+        st.session_state.polygon = None
+        st.session_state.route = None
+
+    if st.session_state.dtm_tmp_path:
+        dtm_path = st.session_state.dtm_tmp_path
+        st.caption(f'Using uploaded file: **{st.session_state.dtm_upload_name}**')
+    else:
+        dtm_path = st.text_input('or enter local file path', value='') or None
+
     st.divider()
 
     with st.expander('Enter polygon manually'):
@@ -135,8 +158,14 @@ with st.sidebar:
 
 # ------------------------------------------------------------------ load DTM
 
+if not dtm_path:
+    st.title('LiDAR Drone Route Planner')
+    st.info('Upload a DTM/DEM file (or enter a local path) in the sidebar to get started.')
+    st.stop()
+
 if not os.path.exists(dtm_path):
-    st.error(f'DTM file not found: `{dtm_path}`')
+    st.title('LiDAR Drone Route Planner')
+    st.error(f'File not found: `{dtm_path}`')
     st.stop()
 
 dtm = load_dtm(dtm_path)
