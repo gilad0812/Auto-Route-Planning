@@ -81,6 +81,40 @@ with st.sidebar:
     dtm_path = st.text_input('DTM file path', value='data/dtm.tif')
     st.divider()
 
+    with st.expander('Enter polygon manually'):
+        st.caption('One vertex per line: `lon, lat`')
+        coord_text = st.text_area(
+            'Coordinates',
+            placeholder='34.12345, 31.98765\n34.12400, 31.98765\n34.12400, 31.98700\n34.12345, 31.98700',
+            height=160,
+            label_visibility='collapsed',
+        )
+        if st.button('Apply polygon', use_container_width=True):
+            try:
+                pts = []
+                for line in coord_text.strip().splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = line.replace(';', ',').split(',')
+                    if len(parts) != 2:
+                        raise ValueError(f'Expected "lon, lat" — got: {line!r}')
+                    pts.append([float(parts[0]), float(parts[1])])
+                if len(pts) < 3:
+                    st.error('Need at least 3 vertices.')
+                else:
+                    if pts[0] != pts[-1]:
+                        pts.append(pts[0])
+                    st.session_state.polygon = {
+                        'type': 'Feature',
+                        'geometry': {'type': 'Polygon', 'coordinates': [pts]},
+                    }
+                    st.session_state.route = None
+                    st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
+    st.divider()
+
     altitude  = st.number_input('Altitude AGL (m)',      value=80.0,  min_value=1.0,    step=5.0)
     fov       = st.number_input('LiDAR FOV (°)',         value=60.0,  min_value=1.0,    max_value=179.0, step=5.0)
     overlap   = st.number_input('Overlap (%)',           value=20.0,  min_value=0.0,    max_value=99.0,  step=5.0)
