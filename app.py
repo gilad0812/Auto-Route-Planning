@@ -21,6 +21,29 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 from dtm import DTM
 from route_planner import plan_route
 
+try:
+    from helios_integration import run_feedback_loop, export_trajectory
+    from terrain_converter import dtm_to_obj
+    from helios_setup import find_helios_binary, download_and_install
+    from helios_config import (
+        DEFAULT_MIN_POINTS_PER_SQM, DEFAULT_DRONE_SPEED_MS,
+        DEFAULT_PULSE_FREQ_HZ, DEFAULT_SCAN_FREQ_HZ, DEFAULT_SCAN_ANGLE_DEG,
+        DEFAULT_MAX_ITERATIONS, DEFAULT_DTM_MESH_STEP_M,
+        DEFAULT_SCANNER_REF, DEFAULT_PLATFORM_REF,
+    )
+    _HELIOS_AVAILABLE = True
+except ImportError:
+    _HELIOS_AVAILABLE = False
+    DEFAULT_MIN_POINTS_PER_SQM = 50
+    DEFAULT_DRONE_SPEED_MS = 5.0
+    DEFAULT_PULSE_FREQ_HZ = 300_000
+    DEFAULT_SCAN_FREQ_HZ = 100.0
+    DEFAULT_SCAN_ANGLE_DEG = 30.0
+    DEFAULT_MAX_ITERATIONS = 3
+    DEFAULT_DTM_MESH_STEP_M = 2.0
+    DEFAULT_SCANNER_REF = "data/scanners/als.xml#als_default"
+    DEFAULT_PLATFORM_REF = "data/platforms.xml#linearpath"
+
 st.set_page_config(page_title='LiDAR Drone Route Planner', layout='wide')
 
 # ------------------------------------------------------------------ helpers
@@ -71,9 +94,20 @@ def z_to_hex(z: float, zmin: float, zmax: float) -> str:
 
 # ------------------------------------------------------------------ session state
 
-for _k, _v in [('polygon', None), ('route', None), ('dtm_tmp_path', None), ('dtm_upload_name', None)]:
+for _k, _v in [
+    ('polygon', None), ('route', None), ('dtm_tmp_path', None),
+    ('dtm_upload_name', None), ('helios_result', None),
+    ('helios_bin', ''), ('helios_scene_obj', ''),
+    ('helios_installing', False), ('helios_expander_open', False),
+]:
     if _k not in st.session_state:
         st.session_state[_k] = _v
+
+# Auto-detect HELIOS++ binary once per session (skipped if already found)
+if _HELIOS_AVAILABLE and not st.session_state.helios_bin:
+    _detected = find_helios_binary()
+    if _detected:
+        st.session_state.helios_bin = str(_detected)
 
 # ------------------------------------------------------------------ sidebar
 
@@ -247,6 +281,20 @@ if st.session_state.route:
         folium.Marker(latlons[-1], tooltip=f'End  {zs[-1]:.1f} m',
                       icon=folium.Icon(color='red',   icon='stop',  prefix='fa')).add_to(m)
 
+# HELIOS++ under-density zones overlay
+if st.session_state.helios_result and not st.session_state.helios_result.get('passed'):
+    _fail_cells = st.session_state.helios_result.get('failing_cells_geo', [])
+    for _lon, _lat in _fail_cells:
+        folium.Circle(
+            location=[_lat, _lon],
+            radius=0.8,
+            color='#ff2222',
+            fill=True,
+            fill_color='#ff2222',
+            fill_opacity=0.55,
+            tooltip='Under-density zone',
+        ).add_to(m)
+
 folium.LayerControl().add_to(m)
 
 # ------------------------------------------------------------------ render
@@ -361,3 +409,189 @@ if st.session_state.route:
             file_name='route.csv', mime='text/csv',
             use_container_width=True,
         )
+
+# ------------------------------------------------------------------ HELIOS++ validation
+
+st.divider()
+with st.expander('HELIOS++ LiDAR Validation', expanded=bool(st.session_state.helios_result) or st.session_state.helios_expander_open):
+
+    if not _HELIOS_AVAILABLE:
+        st.warning(
+            'helios_integration module not found. '
+            'Make sure `src/helios_integration.py` is present and `laspy` is installed.'
+        )
+    else:
+        # ── HELIOS++ binary (auto-managed) ────────────────────────────────────
+        _bin = st.session_state.helios_bin
+        _bin_ok = bool(_bin and os.path.exists(_bin))
+
+        if _bin_ok:
+            _status_c, _redetect_c = st.columns([5, 1])
+            _status_c.success(f"HELIOS++ ready: `{_bin}`")
+            if _redetect_c.button('Re-detect', use_container_width=True, key='_hredetect'):
+                st.session_state.helios_bin = ''
+                st.rerun()
+        else:
+            st.warning("HELIOS++ is not installed or could not be found on this machine.")
+            _inst_c, _manual_c = st.columns(2)
+
+            if _inst_c.button('Install HELIOS++ automatically', type='primary',
+                              use_container_width=True, key='_hinstall'):
+                st.session_state.helios_installing = True
+                st.rerun()
+
+            with _manual_c.expander('Enter path manually'):
+                _manual_path = st.text_input('Binary path', key='_hbin_manual',
+                                             placeholder='C:\\helios\\helios++.exe')
+                if st.button('Use this path', key='_hbin_use') and _manual_path:
+                    st.session_state.helios_bin = _manual_path
+                    st.rerun()
+
+        # Installation progress block (active on the rerun after clicking Install)
+        if st.session_state.helios_installing:
+            with st.status('Installing HELIOS++…', expanded=True) as _install_status:
+                try:
+                    _new_bin = download_and_install(log=st.write)
+                    st.session_state.helios_bin = str(_new_bin)
+                    st.session_state.helios_installing = False
+                    _install_status.update(label='HELIOS++ installed!', state='complete')
+                    st.rerun()
+                except Exception as _install_err:
+                    st.session_state.helios_installing = False
+                    _install_status.update(label=f'Installation failed: {_install_err}', state='error')
+
+        # Terrain OBJ + XML references (always shown)
+        helios_bin_input = st.session_state.helios_bin
+        path_c1, path_c2 = st.columns(2)
+        scene_obj_input = path_c1.text_input(
+            'Terrain OBJ',
+            value=st.session_state.helios_scene_obj,
+            placeholder='/path/to/terrain.obj',
+        )
+        st.session_state.helios_scene_obj = scene_obj_input
+
+        scanner_ref_input  = path_c1.text_input('Scanner XML ref',  value=DEFAULT_SCANNER_REF,  key='_hscan')
+        platform_ref_input = path_c2.text_input('Platform XML ref', value=DEFAULT_PLATFORM_REF, key='_hplat')
+
+        # ── Flight & density ──────────────────────────────────────────────────
+        st.markdown('**Flight & density**')
+        fd_c1, fd_c2, fd_c3 = st.columns(3)
+        h_min_pts  = fd_c1.number_input('Min points / m²',     value=DEFAULT_MIN_POINTS_PER_SQM, min_value=1,   step=5)
+        h_speed    = fd_c2.number_input('Drone speed (m/s)',    value=DEFAULT_DRONE_SPEED_MS,     min_value=0.1, step=0.5)
+        h_max_iter = fd_c3.number_input('Max refinement cycles',value=DEFAULT_MAX_ITERATIONS,     min_value=1,   max_value=10)
+
+        # ── Scanner parameters ────────────────────────────────────────────────
+        st.markdown('**Scanner**')
+        sc_c1, sc_c2, sc_c3 = st.columns(3)
+        h_pulse_freq  = sc_c1.number_input('Pulse frequency (Hz)',   value=DEFAULT_PULSE_FREQ_HZ,   min_value=1000,  step=10000)
+        h_scan_freq   = sc_c2.number_input('Scan frequency (Hz)',    value=DEFAULT_SCAN_FREQ_HZ,    min_value=1.0,   step=10.0)
+        h_scan_angle  = sc_c3.number_input('Scan half-angle (°)',    value=DEFAULT_SCAN_ANGLE_DEG,  min_value=1.0,   max_value=89.0, step=5.0)
+
+        # ── Terrain mesh ──────────────────────────────────────────────────────
+        st.markdown('**Terrain mesh**')
+        mesh_c1, mesh_c2 = st.columns([2, 1])
+        h_mesh_step = mesh_c1.number_input('Mesh vertex spacing (m)', value=DEFAULT_DTM_MESH_STEP_M, min_value=0.5, step=0.5)
+
+        if dtm_path and mesh_c2.button('Convert DTM → OBJ', use_container_width=True):
+            with st.spinner('Generating terrain mesh…'):
+                try:
+                    import tempfile as _tf
+                    _obj_tmp = _tf.NamedTemporaryFile(suffix='.obj', delete=False)
+                    _obj_tmp.close()
+                    if st.session_state.route:
+                        _valid = [wp for wp in st.session_state.route
+                                  if not math.isnan(wp.get('z', float('nan')))]
+                        _ref_lon = sum(wp['x'] for wp in _valid) / max(len(_valid), 1)
+                        _ref_lat = sum(wp['y'] for wp in _valid) / max(len(_valid), 1)
+                    else:
+                        _ref_lon = (bounds.left + bounds.right) / 2
+                        _ref_lat = (bounds.bottom + bounds.top) / 2
+                    dtm_to_obj(dtm_path, _obj_tmp.name, step_m=float(h_mesh_step),
+                               ref_lon=_ref_lon, ref_lat=_ref_lat)
+                    st.session_state.helios_scene_obj = _obj_tmp.name
+                    st.session_state.helios_expander_open = True
+                    st.success(f'OBJ written: `{_obj_tmp.name}`')
+                    st.rerun()
+                except Exception as _e:
+                    st.error(f'Conversion failed: {_e}')
+
+        # ── Run ───────────────────────────────────────────────────────────────
+        st.markdown('**Run simulation**')
+        _can_run = bool(st.session_state.route and helios_bin_input and scene_obj_input)
+        if not _can_run:
+            st.caption('Compute a route, set the HELIOS++ binary, and provide a terrain OBJ to enable.')
+
+        if _can_run and st.button('Run HELIOS++ Validation', type='primary', use_container_width=True):
+            st.session_state.helios_result = None
+            with st.spinner('Running LiDAR simulation… this may take several minutes.'):
+                import tempfile as _tf2
+                _work = os.path.join(_tf2.gettempdir(), 'helios_autoroute')
+                _result = run_feedback_loop(
+                    route=st.session_state.route,
+                    helios_bin=helios_bin_input,
+                    scene_obj_path=scene_obj_input,
+                    work_dir=_work,
+                    is_geo=is_geo,
+                    altitude_m=altitude,
+                    min_points=int(h_min_pts),
+                    speed_ms=float(h_speed),
+                    max_iterations=int(h_max_iter),
+                    pulse_freq_hz=int(h_pulse_freq),
+                    scan_freq_hz=float(h_scan_freq),
+                    scan_angle_deg=float(h_scan_angle),
+                    scanner_ref=scanner_ref_input,
+                    platform_ref=platform_ref_input,
+                )
+            st.session_state.helios_result = _result
+            st.rerun()
+
+        # ── Results ───────────────────────────────────────────────────────────
+        _res = st.session_state.helios_result
+        if _res:
+            st.divider()
+            if _res.get('error'):
+                st.error(f"Simulation error: {_res['error']}")
+            else:
+                _passed = _res['passed']
+                _iters  = _res['iterations']
+                _n_fail = len(_res.get('failing_cells_geo', []))
+
+                if _passed:
+                    st.success(
+                        f'Density validated after {_iters} iteration(s). '
+                        f'All cells meet the ≥{int(h_min_pts)} pts/m² threshold.'
+                    )
+                else:
+                    st.warning(
+                        f'Density validation failed after {_iters} iteration(s). '
+                        f'{_n_fail} under-density cell(s) remain '
+                        f'(shown as red circles on the map).'
+                    )
+
+                res_c1, res_c2, res_c3 = st.columns(3)
+                res_c1.metric('Iterations', _iters)
+                res_c2.metric('Failing cells', _n_fail)
+                _extra_wps = len(_res.get('final_route', [])) - len(st.session_state.route or [])
+                res_c3.metric('Supplemental waypoints added', max(0, _extra_wps))
+
+                if _extra_wps > 0:
+                    if st.button('Apply densified route', use_container_width=True):
+                        st.session_state.route = _res['final_route']
+                        st.session_state.helios_result = None
+                        st.rerun()
+
+                _dl1, _dl2 = st.columns(2)
+                if _res.get('trajectory_path') and os.path.exists(_res['trajectory_path']):
+                    with open(_res['trajectory_path'], 'rb') as _f:
+                        _dl1.download_button(
+                            'Download trajectory .txt', _f.read(),
+                            file_name='trajectory.txt', mime='text/plain',
+                            use_container_width=True,
+                        )
+                if _res.get('survey_xml_path') and os.path.exists(_res['survey_xml_path']):
+                    with open(_res['survey_xml_path'], 'rb') as _f:
+                        _dl2.download_button(
+                            'Download survey .xml', _f.read(),
+                            file_name='survey.xml', mime='application/xml',
+                            use_container_width=True,
+                        )
