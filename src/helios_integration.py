@@ -16,9 +16,12 @@ from __future__ import annotations
 
 import math
 import os
+import queue
 import subprocess
+import threading
+import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 from xml.dom import minidom
 from xml.etree import ElementTree as ET
 
@@ -60,20 +63,29 @@ _LAT_M = 111_139.0  # metres per degree latitude (WGS-84 approximation)
 def _route_to_metric(
     route: List[Dict],
     is_geo: bool,
+    ref_lon: Optional[float] = None,
+    ref_lat: Optional[float] = None,
 ) -> Tuple[List[Dict], float, float]:
     """
     Project geographic (lon/lat) route waypoints to flat-Earth metric coordinates.
 
     Returns (metric_route, ref_lon, ref_lat).  When is_geo=False the route is
     returned unchanged and the reference values are 0.
+
+    ref_lon / ref_lat: Optional fixed projection origin. MUST be supplied (and
+    match the origin used to build the terrain OBJ via dtm_to_obj) so the
+    survey legs and the terrain mesh share the same local coordinate frame —
+    otherwise the platform flies over a patch of empty space and HELIOS++
+    records zero points. When omitted, the route's own centroid is used.
     """
     if not is_geo:
         return route, 0.0, 0.0
 
-    lons = [wp["x"] for wp in route]
-    lats = [wp["y"] for wp in route]
-    ref_lon = sum(lons) / len(lons)
-    ref_lat = sum(lats) / len(lats)
+    if ref_lon is None or ref_lat is None:
+        lons = [wp["x"] for wp in route]
+        lats = [wp["y"] for wp in route]
+        ref_lon = sum(lons) / len(lons) if ref_lon is None else ref_lon
+        ref_lat = sum(lats) / len(lats) if ref_lat is None else ref_lat
     lon_m = _LAT_M * math.cos(math.radians(ref_lat))
 
     metric: List[Dict] = []
@@ -293,14 +305,20 @@ def build_survey_xml(
 # Task 2 – HELIOS++ Subprocess Runner
 # ─────────────────────────────────────────────────────────────────────────────
 
+class SimulationCancelled(Exception):
+    """Raised when a caller requests early termination via a stop event."""
+
+
 def run_helios(
     helios_bin: str,
     survey_xml: str,
     output_dir: Optional[str] = None,
     extra_args: Optional[List[str]] = None,
+    log: Optional[Callable[[str], None]] = None,
+    stop_event: Optional["threading.Event"] = None,
 ) -> Path:
     """
-    Execute the HELIOS++ binary and wait for completion.
+    Execute the HELIOS++ binary and wait for completion, streaming progress.
 
     Args:
         helios_bin:  Absolute path to the helios++ (or helios++.exe) binary.
@@ -308,13 +326,20 @@ def run_helios(
         output_dir:  Directory where HELIOS++ should write LAS output.
                      When None, HELIOS++ uses its own default output/ folder.
         extra_args:  Additional CLI flags forwarded verbatim.
+        log:         Optional callback(message) invoked for each progress line
+                     HELIOS++ prints (e.g. "Leg3/40 12.34% ..."), so the caller
+                     can show that the simulation is alive and not hanging.
+        stop_event:  Optional threading.Event; when set while the simulation is
+                     running, the HELIOS++ process is terminated and
+                     SimulationCancelled is raised.
 
     Returns:
         Path to the directory that contains the output .las / .laz files.
 
     Raises:
-        FileNotFoundError: helios_bin or survey_xml does not exist.
-        RuntimeError:      HELIOS++ exits with a non-zero status code.
+        FileNotFoundError:   helios_bin or survey_xml does not exist.
+        RuntimeError:        HELIOS++ exits with a non-zero status code.
+        SimulationCancelled: stop_event was set before completion.
     """
     helios_bin = Path(helios_bin)
     survey_xml = Path(survey_xml)
@@ -324,7 +349,9 @@ def run_helios(
     if not survey_xml.exists():
         raise FileNotFoundError(f"Survey XML not found: {survey_xml}")
 
-    cmd: List[str] = [str(helios_bin), str(survey_xml), "--lasOutput", "--silent", "-j", "0"]
+    # No --silent: HELIOS++ then prints per-leg progress ("LegX/Y NN.NN% ...")
+    # which we stream back through `log` so the caller can show live status.
+    cmd: List[str] = [str(helios_bin), str(survey_xml), "--lasOutput", "-j", "0"]
     if output_dir:
         cmd += ["--output", str(output_dir)]
     if extra_args:
@@ -360,21 +387,91 @@ def run_helios(
             ]
             run_env["PATH"] = os.pathsep.join(_dll_dirs) + os.pathsep + run_env.get("PATH", "")
 
-    try:
-        subprocess.run(
-            cmd,
-            check=True,
-            capture_output=True,
-            text=True,
-            cwd=str(helios_cwd),
-            env=run_env,
-        )
-    except subprocess.CalledProcessError as exc:
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        cwd=str(helios_cwd),
+        env=run_env,
+    )
+
+    # HELIOS++ fully-buffers stdout when it's piped (not a terminal), so its
+    # per-leg progress lines can sit in the child's libc buffer for a long time
+    # before they reach us — the process can be busy for minutes while we see
+    # nothing. Read its output on a background thread and emit periodic
+    # heartbeats whenever nothing has arrived for a while, so the caller can
+    # tell the simulation is alive rather than hung.
+    line_queue: "queue.Queue[Optional[str]]" = queue.Queue()
+
+    def _pump() -> None:
+        assert proc.stdout is not None
+        for raw_line in proc.stdout:
+            line_queue.put(raw_line.rstrip("\r\n"))
+        line_queue.put(None)
+
+    pump_thread = threading.Thread(target=_pump, daemon=True)
+    pump_thread.start()
+
+    tail: List[str] = []
+    start_time = time.monotonic()
+    last_activity = start_time
+    HEARTBEAT_SEC = 20.0
+    eof = False
+    cancelled = False
+    while not eof:
+        if stop_event is not None and stop_event.is_set():
+            cancelled = True
+            if log is not None:
+                log("Stop requested — terminating HELIOS++ process…")
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            break
+
+        try:
+            item = line_queue.get(timeout=2.0)
+        except queue.Empty:
+            now = time.monotonic()
+            if log is not None and now - last_activity >= HEARTBEAT_SEC:
+                elapsed = now - start_time
+                log(
+                    f"… still running ({elapsed:.0f}s elapsed, no console output yet — "
+                    "HELIOS++ buffers its progress messages, so silence is normal for "
+                    "large surveys; it has not hung)"
+                )
+                last_activity = now
+            continue
+
+        if item is None:
+            eof = True
+            continue
+
+        line = item
+        last_activity = time.monotonic()
+        if not line:
+            continue
+        tail.append(line)
+        if len(tail) > 40:
+            tail.pop(0)
+        if log is not None:
+            log(line)
+
+    if cancelled:
+        proc.wait()
+        raise SimulationCancelled("Simulation cancelled by user")
+
+    pump_thread.join()
+    returncode = proc.wait()
+    if returncode != 0:
         raise RuntimeError(
-            f"HELIOS++ exited with code {exc.returncode}.\n"
+            f"HELIOS++ exited with code {returncode}.\n"
             f"Command: {' '.join(cmd)}\n"
-            f"Stderr:\n{exc.stderr or '(none)'}"
-        ) from exc
+            f"Output (last lines):\n" + "\n".join(tail[-20:] or ["(none)"])
+        )
 
     # Locate the output directory
     search_root = Path(output_dir) if output_dir else helios_bin.parent / "output"
@@ -402,28 +499,34 @@ def verify_point_density(
     cell_size: float = CELL_SIZE_M,
 ) -> Tuple[bool, List[Tuple[float, float]]]:
     """
-    Verify that every 1 × 1 m grid cell in a LAS point cloud meets the density
-    threshold.
+    Verify that every cell in the survey area meets the point density threshold.
+
+    Accepts either a single LAS/LAZ file or a directory of per-leg files (the
+    default HELIOS++ output layout).  When a directory is given, all *.las and
+    *.laz files inside are merged into a single density grid using a two-pass
+    approach that keeps peak RAM proportional to the grid size, not the total
+    point count.
 
     Algorithm:
-        1. Load x, y from the .las file via laspy.
-        2. Bin all points into a 2-D grid of cell_size × cell_size metre cells.
-        3. Flag every populated cell (≥1 point) that has fewer than min_points.
+        Pass 1 – Read LAS headers to determine the global bounding box.
+        Pass 2 – Bin points from each file into the shared density grid, freeing
+                 each file from memory immediately after processing.
+        Flag every populated cell (≥1 point) with fewer than min_points.
 
     Args:
-        las_path:   Path to the .las or .laz file produced by HELIOS++.
+        las_path:   Path to a single .las/.laz file OR a directory of leg files.
         min_points: Required points per cell (default 50 pts/m²).
         cell_size:  Grid cell edge length in metres (default 1.0 m).
 
     Returns:
         (passed, failing_cells) where:
           - passed:        True if every populated cell meets the threshold.
-          - failing_cells: List of (x_centre, y_centre) in the same coordinate
-                           system as the LAS file.  Empty when passed=True.
+          - failing_cells: List of (x_centre, y_centre) in the LAS coordinate
+                           system.  Empty when passed=True or the cloud is empty.
 
     Raises:
         ImportError:       laspy is not installed.
-        FileNotFoundError: LAS file does not exist.
+        FileNotFoundError: las_path does not exist.
     """
     if not _LASPY_OK:
         raise ImportError(
@@ -431,34 +534,51 @@ def verify_point_density(
             "Install with:  pip install laspy[lazrs]"
         )
 
-    las_path = Path(las_path)
-    if not las_path.exists():
-        raise FileNotFoundError(f"LAS file not found: {las_path}")
+    p = Path(las_path)
+    if not p.exists():
+        raise FileNotFoundError(f"LAS path not found: {p}")
 
-    with laspy.open(str(las_path)) as reader:
-        las = reader.read()
+    if p.is_dir():
+        all_files: List[Path] = sorted(p.glob("*.las")) + sorted(p.glob("*.laz"))
+        if not all_files:
+            return False, []
+    else:
+        all_files = [p]
 
-    xs = np.asarray(las.x, dtype=np.float64)
-    ys = np.asarray(las.y, dtype=np.float64)
+    # Pass 1 — global extents from LAS headers (fast, no full data read)
+    x_min, x_max = float("inf"), float("-inf")
+    y_min, y_max = float("inf"), float("-inf")
+    any_points = False
+    for lf in all_files:
+        with laspy.open(str(lf)) as reader:
+            h = reader.header
+            if h.point_count > 0:
+                any_points = True
+                x_min = min(x_min, float(h.x_min))
+                x_max = max(x_max, float(h.x_max))
+                y_min = min(y_min, float(h.y_min))
+                y_max = max(y_max, float(h.y_max))
 
-    if xs.size == 0:
-        # Empty cloud — complete coverage failure; no specific cells to report
+    if not any_points:
         return False, []
-
-    # Build 2-D point count grid
-    x_min, x_max = xs.min(), xs.max()
-    y_min, y_max = ys.min(), ys.max()
 
     nx = max(1, int(math.ceil((x_max - x_min) / cell_size)))
     ny = max(1, int(math.ceil((y_max - y_min) / cell_size)))
-
-    xi = np.clip(((xs - x_min) / cell_size).astype(np.int32), 0, nx - 1)
-    yi = np.clip(((ys - y_min) / cell_size).astype(np.int32), 0, ny - 1)
-
     grid = np.zeros((ny, nx), dtype=np.int32)
-    np.add.at(grid, (yi, xi), 1)
 
-    # Cells with at least one point but below threshold
+    # Pass 2 — accumulate point counts, one file at a time to limit RAM usage
+    for lf in all_files:
+        with laspy.open(str(lf)) as reader:
+            las = reader.read()
+        xs = np.asarray(las.x, dtype=np.float64)
+        ys = np.asarray(las.y, dtype=np.float64)
+        del las  # free full point record immediately
+        if xs.size > 0:
+            xi = np.clip(((xs - x_min) / cell_size).astype(np.int32), 0, nx - 1)
+            yi = np.clip(((ys - y_min) / cell_size).astype(np.int32), 0, ny - 1)
+            np.add.at(grid, (yi, xi), 1)
+        del xs, ys
+
     fail_mask = (grid > 0) & (grid < min_points)
     rows, cols = np.where(fail_mask)
 
@@ -474,6 +594,9 @@ def verify_point_density(
 # Route densification helper
 # ─────────────────────────────────────────────────────────────────────────────
 
+_MAX_SUPPLEMENTAL_WPS = 2_000  # cap so the refinement sim never balloons to tens of thousands of legs
+
+
 def _supplemental_passes(
     failing_cells_metric: List[Tuple[float, float]],
     terrain_z_m: float,
@@ -482,10 +605,13 @@ def _supplemental_passes(
     step_m: float = 3.0,
 ) -> List[Dict]:
     """
-    Generate a tight boustrophedon grid over the bounding box of under-density cells.
+    Generate a boustrophedon grid over the bounding box of under-density cells.
 
     Returns waypoints in the same metric coordinate system as the input cells.
     The caller is responsible for converting back to the original CRS if needed.
+
+    Spacing is scaled up automatically when the bounding box is large so the
+    total waypoint count never exceeds _MAX_SUPPLEMENTAL_WPS.
     """
     if not failing_cells_metric:
         return []
@@ -496,6 +622,15 @@ def _supplemental_passes(
     y_min = min(ys) - 2.0
     y_max = max(ys) + 2.0
     target_z = terrain_z_m + altitude_m
+
+    # Scale up spacing if the area is too large to stay within the waypoint budget
+    span_x = max(x_max - x_min, step_m)
+    span_y = max(y_max - y_min, spacing_m)
+    estimated = math.ceil(span_x / step_m) * math.ceil(span_y / spacing_m)
+    if estimated > _MAX_SUPPLEMENTAL_WPS:
+        scale = math.sqrt(estimated / _MAX_SUPPLEMENTAL_WPS)
+        step_m    *= scale
+        spacing_m *= scale
 
     waypoints: List[Dict] = []
     y = y_min
@@ -531,6 +666,8 @@ def run_feedback_loop(
     scene_obj_path: str,
     work_dir: str,
     is_geo: bool = True,
+    ref_lon: Optional[float] = None,
+    ref_lat: Optional[float] = None,
     altitude_m: float = 80.0,
     min_points: int = MIN_POINTS_PER_SQM,
     speed_ms: float = DRONE_SPEED_MS,
@@ -540,6 +677,8 @@ def run_feedback_loop(
     scan_angle_deg: float = SCAN_ANGLE_DEG,
     scanner_ref: str = DEFAULT_SCANNER_REF,
     platform_ref: str = DEFAULT_PLATFORM_REF,
+    log: Optional[Callable[[str], None]] = None,
+    stop_event: Optional["threading.Event"] = None,
 ) -> Dict:
     """
     Full HELIOS++ validation pipeline with automatic density refinement.
@@ -555,6 +694,13 @@ def run_feedback_loop(
         scene_obj_path: Path to the terrain Wavefront OBJ mesh.
         work_dir:       Working directory for all intermediate files.
         is_geo:         True when route x=longitude, y=latitude (degrees).
+        ref_lon:        Projection-origin longitude. MUST equal the ref_lon
+                        passed to dtm_to_obj() when the terrain OBJ was built —
+                        a mismatch silently shifts the mesh away from the
+                        flight path, producing an empty point cloud. When
+                        omitted, the route's centroid is used (and reused for
+                        every refinement iteration).
+        ref_lat:        Projection-origin latitude — see ref_lon.
         altitude_m:     AGL altitude used for supplemental passes.
         min_points:     Minimum points/m² threshold.
         speed_ms:       Drone speed (m/s).
@@ -598,6 +744,10 @@ def run_feedback_loop(
         _write_scene_xml(scene_obj_path, str(scene_xml))
 
         for iteration in range(max_iterations):
+            if stop_event is not None and stop_event.is_set():
+                result["error"] = "Cancelled by user"
+                break
+
             iter_dir = work_dir / f"iter_{iteration}"
             iter_dir.mkdir(exist_ok=True)
 
@@ -607,7 +757,11 @@ def run_feedback_loop(
             result["trajectory_path"] = str(traj_path)
 
             # Convert route to metric coordinates for the survey XML
-            metric_route, ref_lon, ref_lat = _route_to_metric(current_route, is_geo)
+            # Reuse the same projection origin across all refinement iterations
+            # (and require it to match the terrain OBJ's origin — see docstring
+            # of _route_to_metric) so the mesh and the flight legs never drift
+            # apart from one run to the next.
+            metric_route, ref_lon, ref_lat = _route_to_metric(current_route, is_geo, ref_lon, ref_lat)
 
             # Stage 2 — build survey XML and run HELIOS++
             survey_xml = iter_dir / "survey.xml"
@@ -626,16 +780,13 @@ def run_feedback_loop(
 
             las_output_dir = iter_dir / "output"
             las_output_dir.mkdir(exist_ok=True)
-            las_dir = run_helios(helios_bin, str(survey_xml), str(las_output_dir))
+            las_dir = run_helios(
+                helios_bin, str(survey_xml), str(las_output_dir), log=log, stop_event=stop_event
+            )
 
-            las_files = list(las_dir.glob("*.las")) + list(las_dir.glob("*.laz"))
-            if not las_files:
-                raise RuntimeError(f"No LAS/LAZ files found under {las_dir}")
-            las_path = max(las_files, key=lambda p: p.stat().st_mtime)
-            result["las_path"] = str(las_path)
-
-            # Stage 3 — verify density
-            passed, failing_metric = verify_point_density(str(las_path), min_points)
+            # Stage 3 — verify density across all per-leg LAS files
+            result["las_path"] = str(las_dir)
+            passed, failing_metric = verify_point_density(str(las_dir), min_points)
             result["iterations"] = iteration + 1
             result["passed"] = passed
             result["failing_cells_geo"] = _cells_to_geo(
@@ -676,6 +827,8 @@ def run_feedback_loop(
 
         result["final_route"] = current_route
 
+    except SimulationCancelled:
+        result["error"] = "Cancelled by user"
     except Exception as exc:
         result["error"] = str(exc)
 

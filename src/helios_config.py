@@ -28,5 +28,5 @@ DEFAULT_MAX_ITERATIONS: int = 3        # UI default for "Max refinement cycles"
 # Matched to the Conda-installed v2.2.2 layout.
 # riegl_vux-1uav  → purpose-built UAV LiDAR scanner.
 # copter_linearpath → quadcopter on a linear-path trajectory.
-DEFAULT_SCANNER_REF: str = "data/scanners_als.xml#riegl_vux-1uav"
+DEFAULT_SCANNER_REF: str = "data/scanners_als.xml#riegl_vux_120_23"
 DEFAULT_PLATFORM_REF: str = "data/platforms.xml#copter_linearpath"
