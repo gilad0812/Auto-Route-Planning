@@ -40,6 +40,12 @@ docker build -t auto-route-planning .
 docker run -p 8501:8501 -v "$(pwd)/data:/app/data" auto-route-planning
 ```
 
+On Windows PowerShell, replace `$(pwd)` with `${PWD}`:
+
+```powershell
+docker run -p 8501:8501 -v "${PWD}/data:/app/data" auto-route-planning
+```
+
 The HELIOS++ download during `docker build` requires network access. The resulting image is portable — copy it (`docker save`/`docker load`) or rebuild from this repo on any Docker-capable machine.
 
 ## Usage
