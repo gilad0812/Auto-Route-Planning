@@ -364,8 +364,11 @@ def run_helios(
     except ImportError:
         helios_cwd = helios_bin.parent
 
-    # Build an env that includes the Conda DLL directories so the binary can
-    # load its runtime libraries (STATUS_DLL_NOT_FOUND = 0xC0000135 otherwise).
+    # Build an env that includes the Conda runtime library directories so the
+    # binary can load its dependencies (STATUS_DLL_NOT_FOUND on Windows /
+    # "error while loading shared libraries" on Linux otherwise). HELIOS++ is
+    # distributed as a full Conda env, identifiable by a conda-meta/ marker
+    # directory at its root.
     import platform as _platform
     run_env = os.environ.copy()
     if _platform.system() == "Windows":
@@ -386,6 +389,21 @@ def run_helios(
                 str(_conda_root / "DLLs"),
             ]
             run_env["PATH"] = os.pathsep.join(_dll_dirs) + os.pathsep + run_env.get("PATH", "")
+    else:
+        # Walk up from the binary to find the Conda env root (has conda-meta/)
+        _candidate = helios_bin.parent
+        _conda_root = None
+        for _ in range(8):
+            if (_candidate / "conda-meta").is_dir():
+                _conda_root = _candidate
+                break
+            _candidate = _candidate.parent
+        if _conda_root:
+            _lib_dir = _conda_root / "lib"
+            if _lib_dir.is_dir():
+                run_env["LD_LIBRARY_PATH"] = (
+                    str(_lib_dir) + os.pathsep + run_env.get("LD_LIBRARY_PATH", "")
+                )
 
     proc = subprocess.Popen(
         cmd,

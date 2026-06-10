@@ -23,6 +23,25 @@ pip install -r requirements.txt
 
 Requires a GeoTIFF DTM file at `data/dtm.tif`.
 
+### Docker (recommended for portability)
+
+Builds a self-contained image with the app, its Python dependencies, and a Linux HELIOS++ install baked in — no manual setup needed on the target machine.
+
+```bash
+docker compose up --build
+```
+
+Opens at `http://localhost:8501`. Place your DTM at `data/dtm.tif` on the host — it's mounted into the container at `/app/data`.
+
+To build/run without compose:
+
+```bash
+docker build -t auto-route-planning .
+docker run -p 8501:8501 -v "$(pwd)/data:/app/data" auto-route-planning
+```
+
+The HELIOS++ download during `docker build` requires network access. The resulting image is portable — copy it (`docker save`/`docker load`) or rebuild from this repo on any Docker-capable machine.
+
 ## Usage
 
 ### Web app (recommended)
