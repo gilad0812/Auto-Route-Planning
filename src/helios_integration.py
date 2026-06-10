@@ -650,8 +650,19 @@ def _cluster_cells(
 def _boustrophedon(
     x_min: float, x_max: float, y_min: float, y_max: float,
     target_z: float, altitude_m: float, spacing_m: float, step_m: float,
+    dtm: Optional[object] = None,
+    is_geo: bool = True,
+    ref_lon: float = 0.0,
+    ref_lat: float = 0.0,
 ) -> List[Dict]:
-    """Generate a lawnmower grid of waypoints over [x_min,x_max] x [y_min,y_max]."""
+    """
+    Generate a lawnmower grid of waypoints over [x_min,x_max] x [y_min,y_max].
+
+    For valid LiDAR strip registration each pass must hold a single, constant
+    altitude along its full length. When `dtm` is supplied, each pass's
+    altitude is set to (max terrain elevation under that pass) + altitude_m;
+    otherwise every pass falls back to the single `target_z`.
+    """
     waypoints: List[Dict] = []
     y = y_min
     flip = False
@@ -663,10 +674,25 @@ def _boustrophedon(
         n_steps = max(1, int(math.ceil(dist / step_m)))
         sign = 1 if x_end > x_start else -1
 
+        row_z = target_z
+        if dtm is not None:
+            elevs = []
+            for i in range(n_steps + 1):
+                x = x_start + sign * i * step_m
+                if is_geo:
+                    gx, gy = _cells_to_geo([(x, y)], ref_lon, ref_lat, True)[0]
+                else:
+                    gx, gy = x, y
+                e = dtm.elevation_at(gx, gy)
+                if not math.isnan(e):
+                    elevs.append(e)
+            if elevs:
+                row_z = max(elevs) + altitude_m
+
         for i in range(n_steps + 1):
             x = x_start + sign * i * step_m
             waypoints.append({
-                "x": x, "y": y, "z": target_z,
+                "x": x, "y": y, "z": row_z,
                 "target_distance": altitude_m, "error_tol": 2.0,
             })
 
@@ -684,6 +710,10 @@ def _supplemental_passes(
     spacing_m: float = 3.0,
     step_m: float = 3.0,
     cell_size: float = CELL_SIZE_M,
+    dtm: Optional[object] = None,
+    is_geo: bool = True,
+    ref_lon: float = 0.0,
+    ref_lat: float = 0.0,
 ) -> List[Dict]:
     """
     Generate a boustrophedon grid over each spatial cluster of under-density cells.
@@ -700,6 +730,12 @@ def _supplemental_passes(
     max_wps: Per-iteration waypoint budget. The caller scales this with the size
              of the original survey so a tiny survey doesn't get swamped by a
              huge supplemental pass, and a large survey isn't over-restricted.
+
+    dtm/is_geo/ref_lon/ref_lat: When `dtm` is given, each generated pass holds
+    a constant altitude derived from the terrain under that specific pass
+    (max elevation + altitude_m), matching plan_route()'s per-line altitude
+    rule. Without a DTM, every pass falls back to the single
+    terrain_z_m + altitude_m estimate.
     """
     if not failing_cells_metric:
         return []
@@ -738,6 +774,7 @@ def _supplemental_passes(
         waypoints.extend(_boustrophedon(
             x_min, x_max, y_min, y_max, target_z, altitude_m,
             spacing_m=spacing_m * scale, step_m=step_m * scale,
+            dtm=dtm, is_geo=is_geo, ref_lon=ref_lon, ref_lat=ref_lat,
         ))
 
     return waypoints
@@ -764,6 +801,7 @@ def run_feedback_loop(
     scan_angle_deg: float = SCAN_ANGLE_DEG,
     scanner_ref: str = DEFAULT_SCANNER_REF,
     platform_ref: str = DEFAULT_PLATFORM_REF,
+    dtm: Optional[object] = None,
     log: Optional[Callable[[str], None]] = None,
     stop_event: Optional["threading.Event"] = None,
 ) -> Dict:
@@ -797,6 +835,13 @@ def run_feedback_loop(
         scan_angle_deg: Half-FOV from nadir (degrees).
         scanner_ref:    HELIOS++ scanner XML reference (path#id).
         platform_ref:   HELIOS++ platform XML reference (path#id).
+        dtm:            Optional DTM (with .elevation_at(x, y)) in the same CRS
+                         as `route`. When given, supplemental passes each hold
+                         a constant altitude derived from the terrain under
+                         that pass (max elevation + altitude_m), matching
+                         plan_route()'s per-line altitude rule. Without a DTM,
+                         supplemental passes fall back to a single altitude
+                         estimate for the whole iteration.
 
     Returns:
         {
@@ -917,6 +962,10 @@ def run_feedback_loop(
                     max_wps=supplemental_cap,
                     spacing_m=3.0,
                     step_m=3.0,
+                    dtm=dtm,
+                    is_geo=is_geo,
+                    ref_lon=ref_lon,
+                    ref_lat=ref_lat,
                 )
 
                 if not extra_metric:
