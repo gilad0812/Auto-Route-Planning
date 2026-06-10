@@ -21,7 +21,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Union
 from xml.dom import minidom
 from xml.etree import ElementTree as ET
 
@@ -494,18 +494,19 @@ def run_helios(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def verify_point_density(
-    las_path: str,
+    las_path: Union[str, List[str]],
     min_points: int = MIN_POINTS_PER_SQM,
     cell_size: float = CELL_SIZE_M,
 ) -> Tuple[bool, List[Tuple[float, float]]]:
     """
     Verify that every cell in the survey area meets the point density threshold.
 
-    Accepts either a single LAS/LAZ file or a directory of per-leg files (the
-    default HELIOS++ output layout).  When a directory is given, all *.las and
-    *.laz files inside are merged into a single density grid using a two-pass
-    approach that keeps peak RAM proportional to the grid size, not the total
-    point count.
+    Accepts a single LAS/LAZ file, a directory of per-leg files (the default
+    HELIOS++ output layout), or a list of any mix of the above (used by the
+    incremental refinement loop to merge density across all iterations'
+    output directories).  All *.las and *.laz files found are merged into a
+    single density grid using a two-pass approach that keeps peak RAM
+    proportional to the grid size, not the total point count.
 
     Algorithm:
         Pass 1 – Read LAS headers to determine the global bounding box.
@@ -514,7 +515,8 @@ def verify_point_density(
         Flag every populated cell (≥1 point) with fewer than min_points.
 
     Args:
-        las_path:   Path to a single .las/.laz file OR a directory of leg files.
+        las_path:   Path (or list of paths) to .las/.laz file(s) and/or
+                    directories of leg files.
         min_points: Required points per cell (default 50 pts/m²).
         cell_size:  Grid cell edge length in metres (default 1.0 m).
 
@@ -534,16 +536,20 @@ def verify_point_density(
             "Install with:  pip install laspy[lazrs]"
         )
 
-    p = Path(las_path)
-    if not p.exists():
-        raise FileNotFoundError(f"LAS path not found: {p}")
+    paths = [las_path] if isinstance(las_path, (str, Path)) else list(las_path)
 
-    if p.is_dir():
-        all_files: List[Path] = sorted(p.glob("*.las")) + sorted(p.glob("*.laz"))
-        if not all_files:
-            return False, []
-    else:
-        all_files = [p]
+    all_files: List[Path] = []
+    for raw in paths:
+        p = Path(raw)
+        if not p.exists():
+            raise FileNotFoundError(f"LAS path not found: {p}")
+        if p.is_dir():
+            all_files.extend(sorted(p.glob("*.las")) + sorted(p.glob("*.laz")))
+        else:
+            all_files.append(p)
+
+    if not all_files:
+        return False, []
 
     # Pass 1 — global extents from LAS headers (fast, no full data read)
     x_min, x_max = float("inf"), float("-inf")
@@ -594,44 +600,58 @@ def verify_point_density(
 # Route densification helper
 # ─────────────────────────────────────────────────────────────────────────────
 
-_MAX_SUPPLEMENTAL_WPS = 2_000  # cap so the refinement sim never balloons to tens of thousands of legs
+_MIN_SUPPLEMENTAL_WPS = 20      # floor for tiny surveys, so a handful of legs still gets some refinement
+_SUPPLEMENTAL_WPS_RATIO = 1.0   # per-iteration cap = max(_MIN_SUPPLEMENTAL_WPS, ratio * len(original route))
+_CLUSTER_MERGE_RADIUS_M = 10.0  # failing cells within this distance are grouped into one local pass
 
 
-def _supplemental_passes(
-    failing_cells_metric: List[Tuple[float, float]],
-    terrain_z_m: float,
-    altitude_m: float,
-    spacing_m: float = 3.0,
-    step_m: float = 3.0,
-) -> List[Dict]:
+def _cluster_cells(
+    cells: List[Tuple[float, float]],
+    cell_size: float,
+    merge_radius_m: float,
+) -> List[List[Tuple[float, float]]]:
     """
-    Generate a boustrophedon grid over the bounding box of under-density cells.
+    Group failing cells into spatial clusters via grid-based connected components.
 
-    Returns waypoints in the same metric coordinate system as the input cells.
-    The caller is responsible for converting back to the original CRS if needed.
-
-    Spacing is scaled up automatically when the bounding box is large so the
-    total waypoint count never exceeds _MAX_SUPPLEMENTAL_WPS.
+    Cells within merge_radius_m (Chebyshev distance) of each other end up in the
+    same cluster, so isolated patches of under-density cells each get their own
+    small local supplemental pass instead of one pass spanning the whole survey.
     """
-    if not failing_cells_metric:
+    if not cells:
         return []
 
-    xs, ys = zip(*failing_cells_metric)
-    x_min = min(xs) - 2.0
-    x_max = max(xs) + 2.0
-    y_min = min(ys) - 2.0
-    y_max = max(ys) + 2.0
-    target_z = terrain_z_m + altitude_m
+    r = max(1, int(math.ceil(merge_radius_m / cell_size)))
+    grid_to_cell = {
+        (round(x / cell_size), round(y / cell_size)): (x, y)
+        for x, y in cells
+    }
+    remaining = set(grid_to_cell.keys())
+    clusters: List[List[Tuple[float, float]]] = []
 
-    # Scale up spacing if the area is too large to stay within the waypoint budget
-    span_x = max(x_max - x_min, step_m)
-    span_y = max(y_max - y_min, spacing_m)
-    estimated = math.ceil(span_x / step_m) * math.ceil(span_y / spacing_m)
-    if estimated > _MAX_SUPPLEMENTAL_WPS:
-        scale = math.sqrt(estimated / _MAX_SUPPLEMENTAL_WPS)
-        step_m    *= scale
-        spacing_m *= scale
+    while remaining:
+        seed = next(iter(remaining))
+        remaining.discard(seed)
+        stack = [seed]
+        component = [seed]
+        while stack:
+            gx, gy = stack.pop()
+            for dx in range(-r, r + 1):
+                for dy in range(-r, r + 1):
+                    neighbor = (gx + dx, gy + dy)
+                    if neighbor in remaining:
+                        remaining.discard(neighbor)
+                        stack.append(neighbor)
+                        component.append(neighbor)
+        clusters.append([grid_to_cell[g] for g in component])
 
+    return clusters
+
+
+def _boustrophedon(
+    x_min: float, x_max: float, y_min: float, y_max: float,
+    target_z: float, altitude_m: float, spacing_m: float, step_m: float,
+) -> List[Dict]:
+    """Generate a lawnmower grid of waypoints over [x_min,x_max] x [y_min,y_max]."""
     waypoints: List[Dict] = []
     y = y_min
     flip = False
@@ -652,6 +672,73 @@ def _supplemental_passes(
 
         y += spacing_m
         flip = not flip
+
+    return waypoints
+
+
+def _supplemental_passes(
+    failing_cells_metric: List[Tuple[float, float]],
+    terrain_z_m: float,
+    altitude_m: float,
+    max_wps: int,
+    spacing_m: float = 3.0,
+    step_m: float = 3.0,
+    cell_size: float = CELL_SIZE_M,
+) -> List[Dict]:
+    """
+    Generate a boustrophedon grid over each spatial cluster of under-density cells.
+
+    Returns waypoints in the same metric coordinate system as the input cells.
+    The caller is responsible for converting back to the original CRS if needed.
+
+    Failing cells are first grouped into clusters (see _cluster_cells) so that
+    isolated gaps each get a small, tightly-spaced local pass at full quality
+    instead of one giant pass over the bounding box of the whole survey.
+    Spacing is only scaled up — uniformly across all clusters — if the combined
+    waypoint count would exceed max_wps.
+
+    max_wps: Per-iteration waypoint budget. The caller scales this with the size
+             of the original survey so a tiny survey doesn't get swamped by a
+             huge supplemental pass, and a large survey isn't over-restricted.
+    """
+    if not failing_cells_metric:
+        return []
+
+    target_z = terrain_z_m + altitude_m
+
+    # Each cluster contributes a minimum of ~2 waypoints (one short pass line)
+    # no matter how much spacing is scaled up, so too many tiny clusters can
+    # blow the budget on their own. Grow the merge radius until the cluster
+    # count itself fits, before considering spacing scale-down.
+    merge_radius = _CLUSTER_MERGE_RADIUS_M
+    clusters = _cluster_cells(failing_cells_metric, cell_size, merge_radius)
+    while len(clusters) * 2 > max_wps and merge_radius < 500.0:
+        merge_radius *= 2.0
+        clusters = _cluster_cells(failing_cells_metric, cell_size, merge_radius)
+
+    bboxes: List[Tuple[float, float, float, float]] = []
+    total_estimated = 0
+    for cluster in clusters:
+        xs, ys = zip(*cluster)
+        x_min, x_max = min(xs) - 2.0, max(xs) + 2.0
+        y_min, y_max = min(ys) - 2.0, max(ys) + 2.0
+        bboxes.append((x_min, x_max, y_min, y_max))
+        span_x = max(x_max - x_min, step_m)
+        span_y = max(y_max - y_min, spacing_m)
+        total_estimated += (math.ceil(span_x / step_m) + 1) * (math.ceil(span_y / spacing_m) + 1)
+
+    # Scale up spacing — uniformly across all clusters — only if the combined
+    # waypoint count would exceed the budget.
+    scale = 1.0
+    if total_estimated > max_wps:
+        scale = math.sqrt(total_estimated / max_wps)
+
+    waypoints: List[Dict] = []
+    for x_min, x_max, y_min, y_max in bboxes:
+        waypoints.extend(_boustrophedon(
+            x_min, x_max, y_min, y_max, target_z, altitude_m,
+            spacing_m=spacing_m * scale, step_m=step_m * scale,
+        ))
 
     return waypoints
 
@@ -717,7 +804,7 @@ def run_feedback_loop(
             "iterations":        int,
             "trajectory_path":   str,
             "survey_xml_path":   str,
-            "las_path":          str | None,
+            "las_path":          List[str],   # one per-iteration LAS output dir
             "failing_cells_geo": List[Tuple[float, float]],  # original CRS
             "final_route":       List[Dict],    # original + any supplemental wps
             "error":             str | None,
@@ -731,13 +818,26 @@ def run_feedback_loop(
         "iterations": 0,
         "trajectory_path": None,
         "survey_xml_path": None,
-        "las_path": None,
+        "las_path": [],
         "failing_cells_geo": [],
         "final_route": list(route),
         "error": None,
     }
 
     current_route = list(route)
+
+    # Per-iteration supplemental waypoint budget, scaled to the size of the
+    # ORIGINAL survey (computed once, so it doesn't grow as supplemental
+    # passes accumulate into current_route across iterations).
+    supplemental_cap = max(_MIN_SUPPLEMENTAL_WPS, int(len(route) * _SUPPLEMENTAL_WPS_RATIO))
+
+    # Incremental simulation: iteration 0 simulates the full route, but every
+    # later iteration simulates ONLY the newly-added supplemental waypoints
+    # (already-validated legs are never re-flown/re-traced). The per-iteration
+    # LAS outputs are merged for the density check so the grid still reflects
+    # the full accumulated point cloud.
+    sim_metric_route: Optional[List[Dict]] = None
+    las_dirs: List[str] = []
 
     try:
         scene_xml = work_dir / "scene.xml"
@@ -751,7 +851,8 @@ def run_feedback_loop(
             iter_dir = work_dir / f"iter_{iteration}"
             iter_dir.mkdir(exist_ok=True)
 
-            # Stage 1 — export trajectory (geographic → metric internally)
+            # Stage 1 — export trajectory of the full accumulated route so far
+            # (geographic → metric internally)
             traj_path = iter_dir / "trajectory.txt"
             export_trajectory(current_route, str(traj_path), speed_ms, is_geo)
             result["trajectory_path"] = str(traj_path)
@@ -763,10 +864,14 @@ def run_feedback_loop(
             # apart from one run to the next.
             metric_route, ref_lon, ref_lat = _route_to_metric(current_route, is_geo, ref_lon, ref_lat)
 
+            # Iteration 0 simulates the full route; later iterations simulate
+            # only the supplemental waypoints added by the previous iteration.
+            survey_metric_route = metric_route if sim_metric_route is None else sim_metric_route
+
             # Stage 2 — build survey XML and run HELIOS++
             survey_xml = iter_dir / "survey.xml"
             build_survey_xml(
-                metric_route=metric_route,
+                metric_route=survey_metric_route,
                 scene_xml_path=str(scene_xml),
                 output_xml_path=str(survey_xml),
                 speed_ms=speed_ms,
@@ -783,10 +888,12 @@ def run_feedback_loop(
             las_dir = run_helios(
                 helios_bin, str(survey_xml), str(las_output_dir), log=log, stop_event=stop_event
             )
+            las_dirs.append(str(las_dir))
 
-            # Stage 3 — verify density across all per-leg LAS files
-            result["las_path"] = str(las_dir)
-            passed, failing_metric = verify_point_density(str(las_dir), min_points)
+            # Stage 3 — verify density across all per-leg LAS files from every
+            # iteration so far (full accumulated point cloud)
+            result["las_path"] = list(las_dirs)
+            passed, failing_metric = verify_point_density(las_dirs, min_points)
             result["iterations"] = iteration + 1
             result["passed"] = passed
             result["failing_cells_geo"] = _cells_to_geo(
@@ -798,7 +905,7 @@ def run_feedback_loop(
 
             # Refinement — inject supplemental passes over failing zone
             if iteration < max_iterations - 1 and failing_metric:
-                valid_zs = [float(wp["z"]) for wp in metric_route
+                valid_zs = [float(wp["z"]) for wp in survey_metric_route
                             if not math.isnan(float(wp["z"]))]
                 avg_z = float(np.mean(valid_zs)) if valid_zs else altitude_m
                 terrain_z = avg_z - altitude_m
@@ -807,11 +914,19 @@ def run_feedback_loop(
                     failing_cells_metric=failing_metric,
                     terrain_z_m=terrain_z,
                     altitude_m=altitude_m,
+                    max_wps=supplemental_cap,
                     spacing_m=3.0,
                     step_m=3.0,
                 )
 
-                if is_geo and extra_metric:
+                if not extra_metric:
+                    # No further targeted passes can be generated — stop here
+                    # rather than re-simulating nothing next iteration.
+                    break
+
+                sim_metric_route = extra_metric
+
+                if is_geo:
                     lon_m = _LAT_M * math.cos(math.radians(ref_lat))
                     extra_geo = [
                         {

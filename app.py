@@ -12,7 +12,7 @@ import queue
 import numpy as np
 import streamlit as st
 import folium
-from folium.plugins import Draw
+from folium.plugins import Draw, HeatMap
 from streamlit_folium import st_folium
 from matplotlib import cm as mpl_cm, colors as mpl_colors
 import matplotlib.pyplot as plt
@@ -289,16 +289,28 @@ if st.session_state.route:
 # HELIOS++ under-density zones overlay
 if st.session_state.helios_result and not st.session_state.helios_result.get('passed'):
     _fail_cells = st.session_state.helios_result.get('failing_cells_geo', [])
-    for _lon, _lat in _fail_cells:
-        folium.Circle(
-            location=[_lat, _lon],
-            radius=0.8,
-            color='#ff2222',
-            fill=True,
-            fill_color='#ff2222',
-            fill_opacity=0.55,
-            tooltip='Under-density zone',
-        ).add_to(m)
+    if _fail_cells:
+        if len(_fail_cells) <= 500:
+            for _lon, _lat in _fail_cells:
+                folium.Circle(
+                    location=[_lat, _lon],
+                    radius=0.8,
+                    color='#ff2222',
+                    fill=True,
+                    fill_color='#ff2222',
+                    fill_opacity=0.55,
+                    tooltip='Under-density zone',
+                ).add_to(m)
+        else:
+            # Too many individual markers would freeze the browser — render
+            # a heatmap layer instead, which scales to any point count.
+            HeatMap(
+                [[_lat, _lon, 1] for _lon, _lat in _fail_cells],
+                name='Under-density zones',
+                radius=8,
+                blur=6,
+                min_opacity=0.4,
+            ).add_to(m)
 
 folium.LayerControl().add_to(m)
 
