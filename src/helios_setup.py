@@ -14,9 +14,8 @@ Detection order
 Installation
 ────────────
 Downloads the latest release from GitHub, then runs the installer silently:
-  Windows  – NSIS .exe  →  <installer> /S /D=<install_dir>
-  Linux    – CPack .sh  →  bash <installer> --prefix=<install_dir> --skip-license
-  macOS    – CPack .sh  →  bash <installer> --prefix=<install_dir> --skip-license
+  Windows        – NSIS .exe              →  <installer> /S /D=<install_dir>
+  Linux / macOS  – conda-constructor .sh  →  <installer> -b -f -p <install_dir>
 """
 
 from __future__ import annotations
@@ -224,23 +223,27 @@ def _install_windows(installer: Path, install_dir: Path, log: Callable[[str], No
 
 
 def _install_unix(installer: Path, install_dir: Path, log: Callable[[str], None]) -> Path:
-    """Run CPack shell installer with a custom prefix."""
+    """Run the conda-constructor installer with a custom prefix.
+
+    The HELIOS++ Unix release is a conda-constructor (Miniforge-style) self-
+    extracting shell script, not a CPack installer. Its flags are: -b (batch
+    mode, accept license non-interactively), -f (allow existing prefix dir),
+    -p PREFIX (install location).
+    """
     log(f"Running installer (silent)…")
     install_dir.mkdir(parents=True, exist_ok=True)
     # Make executable
     installer.chmod(installer.stat().st_mode | stat.S_IEXEC)
     subprocess.run(
-        [str(installer), f"--prefix={install_dir.resolve()}", "--skip-license"],
+        [str(installer), "-b", "-f", "-p", str(install_dir.resolve())],
         check=True,
         timeout=600,
-        input="yes\n",
-        text=True,
     )
     binary = _find_binary_under(install_dir)
     if binary is None:
         raise RuntimeError(
             f"Installer ran but helios++ binary not found under {install_dir}.\n"
-            "The CPack prefix flag may have been ignored — try running the installer manually."
+            "The -p prefix flag may have been ignored — try running the installer manually."
         )
     return binary
 
