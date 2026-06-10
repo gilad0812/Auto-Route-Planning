@@ -51,6 +51,62 @@ _BIN_NAME = "helios++.exe" if _IS_WIN else "helios++"
 _API_LATEST = "https://api.github.com/repos/3dgeo-heidelberg/helios/releases/latest"
 
 
+# ── Custom scanner assets ─────────────────────────────────────────────────────
+# Scanner definitions used by this project that are not shipped with the
+# HELIOS++ release. They are appended (idempotently) to the installed
+# data/scanners_als.xml so survey references like
+# "data/scanners_als.xml#riegl_vux_120_23" resolve on any fresh install.
+
+_CUSTOM_ALS_SCANNERS: dict[str, str] = {
+    "riegl_vux_120_23": """\
+  <!-- ##### BEGIN RIEGL VUX-120-23 (added by auto-route-planner) ##### -->
+  <scanner  id                         = "riegl_vux_120_23"
+            accuracy_m                 = "0.01"
+            beamDivergence_rad         = "0.0004"
+            name                       = "RIEGL VUX-120-23"
+            optics                     = "oscillating"
+            pulseFreqs_Hz              = "150000,300000,600000,1200000,1800000,2400000"
+            pulseLength_ns             = "4"
+            rangeMin_m                 = "5"
+            scanAngleMax_deg           = "100"
+            scanAngleEffectiveMax_deg  = "100"
+            scanFreqMin_Hz             = "50"
+            scanFreqMax_Hz             = "400">
+    <beamOrigin x="0" y="0.085" z="0.06">
+      <rot axis="x" angle_deg="90" />
+      <rot axis="z" angle_deg="90" />
+    </beamOrigin>
+    <headRotateAxis x="0" y="0" z="1"/>
+  </scanner>
+  <!-- ##### END RIEGL VUX-120-23 ##### -->
+""",
+}
+
+
+def patch_custom_scanners(binary: Path, log: Optional[Callable[[str], None]] = None) -> None:
+    """Append project-specific scanner definitions to the installed
+    data/scanners_als.xml (no-op for scanners already present)."""
+    def _log(msg: str) -> None:
+        if log:
+            log(msg)
+
+    xml_path = find_helios_root(binary) / "data" / "scanners_als.xml"
+    if not xml_path.is_file():
+        _log(f"Warning: scanners_als.xml not found at {xml_path}; skipping custom scanner patch")
+        return
+
+    content = xml_path.read_text(encoding="utf-8")
+    changed = False
+    for scanner_id, block in _CUSTOM_ALS_SCANNERS.items():
+        if f'"{scanner_id}"' in content:
+            continue
+        content = content.replace("</document>", block + "\n</document>", 1)
+        changed = True
+        _log(f"Added custom scanner '{scanner_id}' to {xml_path}")
+    if changed:
+        xml_path.write_text(content, encoding="utf-8")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Config persistence
 # ─────────────────────────────────────────────────────────────────────────────
@@ -294,6 +350,8 @@ def download_and_install(
     except OSError:
         pass
 
+    patch_custom_scanners(binary, _log)
+
     _save_config(binary)
     _log(f"HELIOS++ ready: {binary}")
     return binary
@@ -309,6 +367,7 @@ def get_or_install(log: Optional[Callable[[str], None]] = None) -> Path:
     if existing:
         if log:
             log(f"Found existing HELIOS++ installation: {existing}")
+        patch_custom_scanners(existing, log)
         _save_config(existing)
         return existing
     return download_and_install(log)

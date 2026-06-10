@@ -3,10 +3,12 @@
 FROM python:3.11-slim
 
 # - libgomp1: OpenMP runtime required by the HELIOS++ binary
+# - libexpat1: XML parser needed by rasterio/GDAL (not in python:slim)
 # - bash, ca-certificates: required by the HELIOS++ self-extracting installer
 # - build-essential: fallback for any Python deps without prebuilt wheels
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
+    libexpat1 \
     bash \
     ca-certificates \
     build-essential \
