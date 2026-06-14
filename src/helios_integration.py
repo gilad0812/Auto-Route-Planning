@@ -220,6 +220,62 @@ def _write_scene_xml(obj_path: str, xml_path: str, scene_id: str = "terrain") ->
     return xml_path
 
 
+def _collapse_group(group: List[Dict], tol_m: float) -> List[Dict]:
+    """Reduce one same-pass run to its two endpoints when it is a straight,
+    constant-altitude line; otherwise keep it intact."""
+    if len(group) <= 2:
+        return list(group)
+    a, b = group[0], group[-1]
+
+    zs = [float(w["z"]) for w in group if not math.isnan(float(w["z"]))]
+    z_const = (not zs) or (max(zs) - min(zs) <= 0.01)
+
+    ax, ay = float(a["x"]), float(a["y"])
+    dx, dy = float(b["x"]) - ax, float(b["y"]) - ay
+    length = math.hypot(dx, dy)
+    if length < 1e-9:
+        return list(group)
+    # Perpendicular distance of every interior point to the chord a→b.
+    straight = all(
+        abs(dx * (float(w["y"]) - ay) - dy * (float(w["x"]) - ax)) / length <= tol_m
+        for w in group[1:-1]
+    )
+    return [a, b] if (straight and z_const) else list(group)
+
+
+def collapse_straight_passes(metric_route: List[Dict], tol_m: float = 0.5) -> List[Dict]:
+    """Collapse colinear, constant-altitude runs within each pass to their two
+    endpoints.
+
+    HELIOS++ interpolates the platform linearly between legs and scans
+    continuously, so a straight pass needs only its start and end legs — the
+    intermediate colinear waypoints fire identical pulses while multiplying the
+    leg count and the number of per-leg LAS output files. Collapsing them
+    leaves the trajectory, pulses, and resulting point cloud unchanged while
+    cutting leg/LAS-file count roughly to the number of passes.
+
+    Runs are grouped by `pass_id`. Any run that lacks a pass_id, or that isn't a
+    straight constant-z line within `tol_m`, is kept verbatim so route shape is
+    never distorted (turns and per-pass altitude changes are always preserved).
+    """
+    if len(metric_route) <= 2:
+        return list(metric_route)
+    out: List[Dict] = []
+    i, n = 0, len(metric_route)
+    while i < n:
+        pid = metric_route[i].get("pass_id")
+        if pid is None:
+            out.append(metric_route[i])
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and metric_route[j + 1].get("pass_id") == pid:
+            j += 1
+        out.extend(_collapse_group(metric_route[i:j + 1], tol_m))
+        i = j + 1
+    return out
+
+
 def build_survey_xml(
     metric_route: List[Dict],
     scene_xml_path: str,
@@ -232,13 +288,17 @@ def build_survey_xml(
     scanner_ref: str = DEFAULT_SCANNER_REF,
     platform_ref: str = DEFAULT_PLATFORM_REF,
     survey_name: str = "auto_route_survey",
+    collapse_legs: bool = True,
 ) -> str:
     """
     Generate a HELIOS++ survey XML from metric route waypoints.
 
-    One leg per waypoint is emitted. HELIOS++ linearly interpolates the platform
-    trajectory between consecutive leg positions, firing the scanner along each
-    segment.
+    By default each straight, constant-altitude pass is collapsed to two legs
+    (start + end) — see collapse_straight_passes. HELIOS++ linearly interpolates
+    the platform between consecutive legs and fires the scanner along each
+    segment, so this yields an identical point cloud with far fewer legs and
+    per-leg LAS output files. Set collapse_legs=False to emit one leg per
+    waypoint.
 
     Args:
         metric_route:     Waypoints in Cartesian metres (output of _route_to_metric).
@@ -252,10 +312,14 @@ def build_survey_xml(
         scanner_ref:      HELIOS++ scanner reference string (path#id).
         platform_ref:     HELIOS++ platform reference string (path#id).
         survey_name:      Identifier string for this survey.
+        collapse_legs:    When True, collapse straight passes to endpoint legs.
 
     Returns:
         Absolute path of the written survey XML.
     """
+    if collapse_legs:
+        metric_route = collapse_straight_passes(metric_route)
+
     scene_ref = f"{_posix(os.path.abspath(scene_xml_path))}#{scene_id}"
 
     doc = ET.Element("document")
