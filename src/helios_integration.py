@@ -575,10 +575,34 @@ def run_helios(
 # Task 3 – Point Density Verifier
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _points_in_polygon(
+    xs: "np.ndarray", ys: "np.ndarray", poly: List[Tuple[float, float]]
+) -> "np.ndarray":
+    """Vectorised even-odd ray-casting point-in-polygon test.
+
+    poly: list of (x, y) vertices (exterior ring) in the same coords as xs/ys.
+    Returns a boolean array, True where (xs, ys) falls inside the polygon.
+    """
+    inside = np.zeros(xs.shape, dtype=bool)
+    n = len(poly)
+    if n < 3:
+        return inside
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        crosses = (yi > ys) != (yj > ys)
+        x_at_y = (xj - xi) * (ys - yi) / ((yj - yi) or 1e-15) + xi
+        inside ^= crosses & (xs < x_at_y)
+        j = i
+    return inside
+
+
 def verify_point_density(
     las_path: Union[str, List[str]],
     min_points: int = MIN_POINTS_PER_SQM,
     cell_size: float = CELL_SIZE_M,
+    region: Optional[List[Tuple[float, float]]] = None,
 ) -> Tuple[bool, List[Tuple[float, float]]]:
     """
     Verify that every cell in the survey area meets the point density threshold.
@@ -601,6 +625,12 @@ def verify_point_density(
                     directories of leg files.
         min_points: Required points per cell (default 50 pts/m²).
         cell_size:  Grid cell edge length in metres (default 1.0 m).
+        region:     Optional polygon (list of (x, y) vertices in the LAS
+                    coordinate system) bounding the area of interest. When
+                    given, cells whose centre falls outside it are ignored — so
+                    the swath overhang scanned beyond the survey polygon never
+                    counts as a density failure. When None, every populated
+                    cell is evaluated.
 
     Returns:
         (passed, failing_cells) where:
@@ -670,10 +700,16 @@ def verify_point_density(
     fail_mask = (grid > 0) & (grid < min_points)
     rows, cols = np.where(fail_mask)
 
-    failing_cells: List[Tuple[float, float]] = [
-        (x_min + (c + 0.5) * cell_size, y_min + (r + 0.5) * cell_size)
-        for r, c in zip(rows.tolist(), cols.tolist())
-    ]
+    cx = x_min + (cols + 0.5) * cell_size
+    cy = y_min + (rows + 0.5) * cell_size
+
+    # Ignore failures outside the area of interest (swath overhang beyond the
+    # survey polygon) so they don't trigger pointless refinement.
+    if region is not None:
+        keep = _points_in_polygon(cx, cy, region)
+        cx, cy = cx[keep], cy[keep]
+
+    failing_cells: List[Tuple[float, float]] = list(zip(cx.tolist(), cy.tolist()))
 
     return len(failing_cells) == 0, failing_cells
 
@@ -1032,6 +1068,7 @@ def run_feedback_loop(
     scanner_ref: str = DEFAULT_SCANNER_REF,
     platform_ref: str = DEFAULT_PLATFORM_REF,
     dtm: Optional[object] = None,
+    region_polygon: Optional[List[Tuple[float, float]]] = None,
     log: Optional[Callable[[str], None]] = None,
     stop_event: Optional["threading.Event"] = None,
 ) -> Dict:
@@ -1065,6 +1102,10 @@ def run_feedback_loop(
         scan_angle_deg: Half-FOV from nadir (degrees).
         scanner_ref:    HELIOS++ scanner XML reference (path#id).
         platform_ref:   HELIOS++ platform XML reference (path#id).
+        region_polygon: Optional survey-polygon vertices [(x, y), ...] in the
+                        same CRS as `route`. The density check is restricted to
+                        cells inside it, so swath overhang scanned beyond the
+                        polygon doesn't count as a failure or trigger refinement.
         dtm:            Optional DTM (with .elevation_at(x, y)) in the same CRS
                          as `route`. When given, supplemental passes each hold
                          a constant altitude derived from the terrain under
@@ -1100,6 +1141,11 @@ def run_feedback_loop(
     }
 
     current_route = list(route)
+
+    # Survey polygon in metric coords, derived once the projection origin is
+    # known (first iteration). Restricts the density check to the area of
+    # interest so swath overhang beyond the polygon isn't refined.
+    region_metric: Optional[List[Tuple[float, float]]] = None
 
     # Per-iteration supplemental waypoint budget, scaled to the size of the
     # ORIGINAL survey (computed once, so it doesn't grow as supplemental
@@ -1139,6 +1185,17 @@ def run_feedback_loop(
             # apart from one run to the next.
             metric_route, ref_lon, ref_lat = _route_to_metric(current_route, is_geo, ref_lon, ref_lat)
 
+            # Project the survey polygon into the same metric frame once.
+            if region_polygon is not None and region_metric is None:
+                if is_geo:
+                    lon_m = _LAT_M * math.cos(math.radians(ref_lat))
+                    region_metric = [
+                        ((lx - ref_lon) * lon_m, (ly - ref_lat) * _LAT_M)
+                        for lx, ly in region_polygon
+                    ]
+                else:
+                    region_metric = list(region_polygon)
+
             # Iteration 0 simulates the full route; later iterations simulate
             # only the supplemental waypoints added by the previous iteration.
             survey_metric_route = metric_route if sim_metric_route is None else sim_metric_route
@@ -1168,7 +1225,7 @@ def run_feedback_loop(
             # Stage 3 — verify density across all per-leg LAS files from every
             # iteration so far (full accumulated point cloud)
             result["las_path"] = list(las_dirs)
-            passed, failing_metric = verify_point_density(las_dirs, min_points)
+            passed, failing_metric = verify_point_density(las_dirs, min_points, region=region_metric)
             result["iterations"] = iteration + 1
             result["passed"] = passed
             result["failing_cells_geo"] = _cells_to_geo(
