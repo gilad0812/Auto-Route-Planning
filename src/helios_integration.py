@@ -720,6 +720,154 @@ def _boustrophedon(
     return waypoints
 
 
+def _group_passes(metric_route: List[Dict]) -> List[Dict]:
+    """Group consecutive waypoints into passes.
+
+    Uses the planner's `pass_id` tag when present; falls back to splitting on
+    y-jumps > 0.5 m for routes produced before the tag existed. Returns dicts
+    with route indices (start/end half-open), mean y, altitude z, x extent and
+    flight direction (+1 → x increasing, -1 → decreasing).
+    """
+    passes: List[Dict] = []
+    for idx, wp in enumerate(metric_route):
+        pid = wp.get("pass_id")
+        x, y = float(wp["x"]), float(wp["y"])
+        start_new = True
+        if passes:
+            prev = passes[-1]
+            if pid is not None and prev["pid"] is not None:
+                start_new = pid != prev["pid"]
+            else:
+                start_new = abs(y - prev["y_sum"] / prev["n"]) > 0.5
+        if start_new:
+            passes.append({
+                "pid": pid, "start": idx, "end": idx + 1, "y_sum": y, "n": 1,
+                "x_min": x, "x_max": x, "x_first": x, "x_last": x,
+                "z": float(wp["z"]),
+            })
+        else:
+            p = passes[-1]
+            p["end"] = idx + 1
+            p["y_sum"] += y
+            p["n"] += 1
+            p["x_min"] = min(p["x_min"], x)
+            p["x_max"] = max(p["x_max"], x)
+            p["x_last"] = x
+    for p in passes:
+        p["y"] = p["y_sum"] / p["n"]
+        p["dir"] = 1 if p["x_last"] >= p["x_first"] else -1
+    return passes
+
+
+def _line_altitude_m(
+    x_min: float, x_max: float, y: float,
+    altitude_m: float, fallback_z: float,
+    dtm: Optional[object], is_geo: bool, ref_lon: float, ref_lat: float,
+    sample_step_m: float = 5.0,
+) -> float:
+    """Constant altitude for a pass line: (max terrain elevation under the
+    line) + altitude_m, matching plan_route()'s per-line rule. Falls back to
+    fallback_z when no DTM or no valid samples."""
+    if dtm is None:
+        return fallback_z
+    n = max(1, int(math.ceil((x_max - x_min) / sample_step_m)))
+    elevs = []
+    for i in range(n + 1):
+        x = x_min + (x_max - x_min) * i / n
+        gx, gy = _cells_to_geo([(x, y)], ref_lon, ref_lat, is_geo)[0]
+        e = dtm.elevation_at(gx, gy)
+        if not math.isnan(e):
+            elevs.append(e)
+    return (max(elevs) + altitude_m) if elevs else fallback_z
+
+
+def _parallel_fill_passes(
+    failing_cells_metric: List[Tuple[float, float]],
+    metric_route: List[Dict],
+    terrain_z_m: float,
+    altitude_m: float,
+    max_wps: int,
+    step_m: float = 3.0,
+    margin_m: float = 5.0,
+    cell_size: float = CELL_SIZE_M,
+    dtm: Optional[object] = None,
+    is_geo: bool = True,
+    ref_lon: float = 0.0,
+    ref_lat: float = 0.0,
+) -> Tuple[List[Tuple[int, List[Dict]]], List[Tuple[float, float]]]:
+    """Generate single parallel fill passes spliced between existing passes.
+
+    For each cluster of failing cells that lies between two adjacent survey
+    passes, one extra pass — parallel to its neighbours, at the gap midpoint,
+    spanning the cluster's x extent plus a margin — is generated. The result
+    stays a coherent serpentine survey (uniform strip pattern, no crossing
+    patch grids), which keeps strip registration and density preprocessing
+    simple downstream.
+
+    Returns (inserts, leftover_cells):
+      inserts        – list of (route_insert_index, waypoints) where the index
+                       refers to positions in `metric_route` BEFORE any
+                       insertion (caller must apply in descending order).
+      leftover_cells – failing cells with no flanking pass pair (survey edges,
+                       clusters outside the pass band); the caller should fall
+                       back to _supplemental_passes for these.
+    """
+    if not failing_cells_metric:
+        return [], []
+
+    merge_radius = _CLUSTER_MERGE_RADIUS_M
+    clusters = _cluster_cells(failing_cells_metric, cell_size, merge_radius)
+    while len(clusters) * 2 > max_wps and merge_radius < 500.0:
+        merge_radius *= 2.0
+        clusters = _cluster_cells(failing_cells_metric, cell_size, merge_radius)
+
+    passes = [p for p in _group_passes(metric_route) if not math.isnan(p["z"])]
+    by_y = sorted(passes, key=lambda p: p["y"])
+
+    inserts: List[Tuple[int, List[Dict]]] = []
+    leftover: List[Tuple[float, float]] = []
+    budget = max_wps
+
+    for cluster in clusters:
+        xs, ys = zip(*cluster)
+        y_c = sum(ys) / len(ys)
+        below = [p for p in by_y if p["y"] <= y_c]
+        above = [p for p in by_y if p["y"] > y_c]
+        if not below or not above:
+            leftover.extend(cluster)
+            continue
+        p_lo, p_hi = below[-1], above[0]
+
+        y_new = 0.5 * (p_lo["y"] + p_hi["y"])
+        x_min = min(xs) - margin_m
+        x_max = max(xs) + margin_m
+        n = max(1, int(math.ceil((x_max - x_min) / step_m)))
+        if n + 1 > budget:
+            step_scaled = (x_max - x_min) / max(budget - 1, 1)
+            n = max(1, int(math.ceil((x_max - x_min) / step_scaled)))
+        if n + 1 > budget:
+            leftover.extend(cluster)
+            continue
+        budget -= n + 1
+
+        anchor = p_lo if p_lo["start"] < p_hi["start"] else p_hi
+        z = _line_altitude_m(x_min, x_max, y_new, altitude_m,
+                             terrain_z_m + altitude_m, dtm, is_geo, ref_lon, ref_lat)
+
+        direction = -anchor["dir"]
+        xs_line = [x_min + (x_max - x_min) * i / n for i in range(n + 1)]
+        if direction < 0:
+            xs_line.reverse()
+        wps = [{
+            "x": x, "y": y_new, "z": z,
+            "target_distance": altitude_m, "error_tol": 2.0,
+            "pass_id": f"fill_{len(inserts)}_{y_new:.1f}",
+        } for x in xs_line]
+        inserts.append((anchor["end"], wps))
+
+    return inserts, leftover
+
+
 def _supplemental_passes(
     failing_cells_metric: List[Tuple[float, float]],
     terrain_z_m: float,
@@ -966,26 +1114,47 @@ def run_feedback_loop(
             if passed:
                 break
 
-            # Refinement — inject supplemental passes over failing zone
+            # Refinement — splice single parallel fill passes into the gaps
+            # between existing passes (keeps the route a coherent serpentine
+            # survey); fall back to local patch grids only for clusters with
+            # no flanking pass pair (survey edges).
             if iteration < max_iterations - 1 and failing_metric:
                 valid_zs = [float(wp["z"]) for wp in survey_metric_route
                             if not math.isnan(float(wp["z"]))]
                 avg_z = float(np.mean(valid_zs)) if valid_zs else altitude_m
                 terrain_z = avg_z - altitude_m
 
-                extra_metric = _supplemental_passes(
+                inserts, leftover_cells = _parallel_fill_passes(
                     failing_cells_metric=failing_metric,
+                    metric_route=metric_route,
                     terrain_z_m=terrain_z,
                     altitude_m=altitude_m,
                     max_wps=supplemental_cap,
-                    spacing_m=3.0,
                     step_m=3.0,
                     dtm=dtm,
                     is_geo=is_geo,
                     ref_lon=ref_lon,
                     ref_lat=ref_lat,
                 )
+                spliced_wps = [wp for _, wps in inserts for wp in wps]
 
+                grid_extra: List[Dict] = []
+                remaining_budget = supplemental_cap - len(spliced_wps)
+                if leftover_cells and remaining_budget >= 10:
+                    grid_extra = _supplemental_passes(
+                        failing_cells_metric=leftover_cells,
+                        terrain_z_m=terrain_z,
+                        altitude_m=altitude_m,
+                        max_wps=remaining_budget,
+                        spacing_m=3.0,
+                        step_m=3.0,
+                        dtm=dtm,
+                        is_geo=is_geo,
+                        ref_lon=ref_lon,
+                        ref_lat=ref_lat,
+                    )
+
+                extra_metric = spliced_wps + grid_extra
                 if not extra_metric:
                     # No further targeted passes can be generated — stop here
                     # rather than re-simulating nothing next iteration.
@@ -993,19 +1162,31 @@ def run_feedback_loop(
 
                 sim_metric_route = extra_metric
 
-                if is_geo:
-                    lon_m = _LAT_M * math.cos(math.radians(ref_lat))
-                    extra_geo = [
-                        {
-                            **wp,
-                            "x": ref_lon + wp["x"] / lon_m,
-                            "y": ref_lat + wp["y"] / _LAT_M,
-                        }
-                        for wp in extra_metric
-                    ]
-                    current_route = current_route + extra_geo
-                else:
-                    current_route = current_route + extra_metric
+                lon_m = _LAT_M * math.cos(math.radians(ref_lat))
+
+                def _to_route_crs(wps: List[Dict]) -> List[Dict]:
+                    if not is_geo:
+                        return [dict(wp) for wp in wps]
+                    return [{
+                        **wp,
+                        "x": ref_lon + wp["x"] / lon_m,
+                        "y": ref_lat + wp["y"] / _LAT_M,
+                    } for wp in wps]
+
+                # metric_route is index-aligned with current_route, so insert
+                # positions computed on it apply directly — applying them in
+                # descending order keeps earlier positions valid.
+                for pos, wps in sorted(inserts, key=lambda t: t[0], reverse=True):
+                    current_route[pos:pos] = _to_route_crs(wps)
+                if grid_extra:
+                    current_route = current_route + _to_route_crs(grid_extra)
+
+                if log:
+                    msg = (f"Refinement: spliced {len(inserts)} parallel fill "
+                           f"pass(es), {len(spliced_wps)} waypoints")
+                    if grid_extra:
+                        msg += f"; {len(grid_extra)} patch-grid waypoints appended"
+                    log(msg)
 
         result["final_route"] = current_route
 

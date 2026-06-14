@@ -21,7 +21,7 @@ from shapely.geometry import shape as shapely_shape
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 from dtm import DTM
-from route_planner import plan_route
+from route_planner import plan_route, plan_route_adaptive
 
 try:
     from helios_integration import run_feedback_loop, export_trajectory
@@ -180,6 +180,12 @@ with st.sidebar:
     altitude  = st.number_input('Altitude AGL (m)',      value=80.0,  min_value=1.0,    step=5.0)
     fov       = st.number_input('LiDAR FOV (°)',         value=60.0,  min_value=1.0,    max_value=179.0, step=5.0)
     overlap   = st.number_input('Overlap (%)',           value=20.0,  min_value=0.0,    max_value=99.0,  step=5.0)
+    adaptive_spacing = st.checkbox(
+        'Terrain-adaptive spacing', value=True,
+        help='Tighten pass spacing wherever terrain between two passes rises and '
+             'narrows the effective swath, instead of one constant spacing everywhere. '
+             'Reduces HELIOS++ refinement iterations and keeps point density uniform.',
+    )
     step_m    = st.number_input('Along-track step (m)',  value=50.0,  min_value=1.0,    step=5.0)
     error_tol = st.number_input('Error tolerance (m)',   value=2.0,   min_value=0.1,    step=0.5)
     st.divider()
@@ -214,11 +220,18 @@ elev_min, elev_max = float(np.nanmin(dtm.array)), float(np.nanmax(dtm.array))
 
 swath_m, spacing_m, spacing_map = swath_and_spacing(altitude, fov, overlap, is_geo)
 step_map = to_map_units(step_m, is_geo)
+# Terrain-sampling resolution for the per-pass max-elevation (clearance) check,
+# decoupled from the waypoint step: the finer of the waypoint step and the DTM's
+# native pixel size, so a peak between waypoints can't be missed — without
+# adding waypoints/legs to the route or to the HELIOS++ simulation.
+dtm_res_map = min(abs(dtm.src.res[0]), abs(dtm.src.res[1]))
+elev_step_map = min(step_map, dtm_res_map)
 
 with st.sidebar:
     st.caption(
         f'Swath width: **{swath_m:.1f} m**  \n'
         f'Pass spacing: **{spacing_m:.1f} m** ({overlap:.0f}% overlap)'
+        + (' — baseline, tightened over ridges' if adaptive_spacing else '')
     )
 
 # ------------------------------------------------------------------ compute route
@@ -228,7 +241,18 @@ if compute_btn and st.session_state.polygon is not None:
     if not poly.is_valid:
         poly = poly.buffer(0)
     with st.spinner('Computing route…'):
-        st.session_state.route = plan_route(dtm, poly, altitude, error_tol, spacing_map, step_map)
+        if adaptive_spacing:
+            st.session_state.route = plan_route_adaptive(
+                dtm, poly, altitude, error_tol,
+                scan_half_angle_deg=fov / 2.0, step=step_map,
+                overlap_frac=overlap / 100.0, is_geo=is_geo,
+                elev_sample_step=elev_step_map,
+            )
+        else:
+            st.session_state.route = plan_route(
+                dtm, poly, altitude, error_tol, spacing_map, step_map,
+                elev_sample_step=elev_step_map,
+            )
 
 # ------------------------------------------------------------------ build map
 
