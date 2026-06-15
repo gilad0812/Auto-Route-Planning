@@ -186,6 +186,12 @@ with st.sidebar:
              'narrows the effective swath, instead of one constant spacing everywhere. '
              'Reduces HELIOS++ refinement iterations and keeps point density uniform.',
     )
+    edge_coverage = st.checkbox(
+        'Edge coverage', value=False,
+        help='Run the lawnmower ~one pass spacing OUTSIDE the survey area so the '
+             'dense centre of a swath (not its thin grazing-angle tail) lands on '
+             'the AOI rim. Removes the under-density fringe around the perimeter.',
+    )
     step_m    = st.number_input('Along-track step (m)',  value=50.0,  min_value=1.0,    step=5.0)
     error_tol = st.number_input('Error tolerance (m)',   value=2.0,   min_value=0.1,    step=0.5)
     st.divider()
@@ -247,6 +253,7 @@ if compute_btn and st.session_state.polygon is not None:
                 scan_half_angle_deg=fov / 2.0, step=step_map,
                 overlap_frac=overlap / 100.0, is_geo=is_geo,
                 elev_sample_step=elev_step_map,
+                edge_margin_m=(None if edge_coverage else 0.0),
             )
         else:
             st.session_state.route = plan_route(
