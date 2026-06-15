@@ -36,13 +36,13 @@ try:
     _HELIOS_AVAILABLE = True
 except ImportError:
     _HELIOS_AVAILABLE = False
-    DEFAULT_MIN_POINTS_PER_SQM = 50
-    DEFAULT_DRONE_SPEED_MS = 5.0
-    DEFAULT_PULSE_FREQ_HZ = 300_000
-    DEFAULT_SCAN_FREQ_HZ = 100.0
-    DEFAULT_SCAN_ANGLE_DEG = 30.0
-    DEFAULT_MAX_ITERATIONS = 3
-    DEFAULT_DTM_MESH_STEP_M = 2.0
+    DEFAULT_MIN_POINTS_PER_SQM = 100
+    DEFAULT_DRONE_SPEED_MS = 6.0
+    DEFAULT_PULSE_FREQ_HZ = 600_000
+    DEFAULT_SCAN_FREQ_HZ = 224.4
+    DEFAULT_SCAN_ANGLE_DEG = 50.0     
+    DEFAULT_MAX_ITERATIONS = 1
+    DEFAULT_DTM_MESH_STEP_M = 3.0
     DEFAULT_SCANNER_REF = "data/scanners/als.xml#als_default"
     DEFAULT_PLATFORM_REF = "data/platforms.xml#linearpath"
 
@@ -177,8 +177,8 @@ with st.sidebar:
                 st.error(str(exc))
     st.divider()
 
-    altitude  = st.number_input('Altitude AGL (m)',      value=80.0,  min_value=1.0,    step=5.0)
-    fov       = st.number_input('LiDAR FOV (°)',         value=60.0,  min_value=1.0,    max_value=179.0, step=5.0)
+    altitude  = st.number_input('Altitude AGL (m)',      value=100.0,  min_value=1.0,    step=5.0)
+    fov       = st.number_input('LiDAR FOV (°)',         value=100.0,  min_value=1.0,    max_value=179.0, step=5.0)
     overlap   = st.number_input('Overlap (%)',           value=20.0,  min_value=0.0,    max_value=99.0,  step=5.0)
     adaptive_spacing = st.checkbox(
         'Terrain-adaptive spacing', value=True,

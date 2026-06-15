@@ -7,22 +7,22 @@ nothing here is read during a simulation run.
 """
 
 # ── Point density ──────────────────────────────────────────────────────────────
-DEFAULT_MIN_POINTS_PER_SQM: int = 50   # UI default for "Min points / m²"
+DEFAULT_MIN_POINTS_PER_SQM: int = 100  # UI default for "Min points / m²"
 CELL_SIZE_M: float = 1.0               # grid cell edge — not exposed in UI
 
 # ── Drone platform ─────────────────────────────────────────────────────────────
-DEFAULT_DRONE_SPEED_MS: float = 5.0    # UI default for "Drone speed (m/s)"
+DEFAULT_DRONE_SPEED_MS: float = 6.0    # UI default for "Drone speed (m/s)"
 
 # ── UAV LiDAR scanner ─────────────────────────────────────────────────────────
-DEFAULT_PULSE_FREQ_HZ: int = 300_000   # UI default for "Pulse frequency (Hz)"
-DEFAULT_SCAN_FREQ_HZ: float = 100.0    # UI default for "Scan frequency (Hz)"
-DEFAULT_SCAN_ANGLE_DEG: float = 30.0   # UI default for "Scan half-angle (°)"
+DEFAULT_PULSE_FREQ_HZ: int = 600_000   # UI default for "Pulse frequency (Hz)"
+DEFAULT_SCAN_FREQ_HZ: float = 224.4    # UI default for "Scan frequency (Hz)"
+DEFAULT_SCAN_ANGLE_DEG: float = 50.0   # UI default for "Scan half-angle (°)"
 
 # ── Terrain mesh ───────────────────────────────────────────────────────────────
-DEFAULT_DTM_MESH_STEP_M: float = 2.0   # UI default for "Mesh vertex spacing (m)"
+DEFAULT_DTM_MESH_STEP_M: float = 3.0   # UI default for "Mesh vertex spacing (m)"
 
 # ── Feedback loop ──────────────────────────────────────────────────────────────
-DEFAULT_MAX_ITERATIONS: int = 3        # UI default for "Max refinement cycles"
+DEFAULT_MAX_ITERATIONS: int = 1        # UI default for "Max refinement cycles"
 
 # ── HELIOS++ built-in references (relative to the helios++ working directory) ──
 # Matched to the Conda-installed v2.2.2 layout.
