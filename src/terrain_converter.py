@@ -33,6 +33,8 @@ def dtm_to_obj(
     step_m: float = 2.0,
     ref_lon: float = 0.0,
     ref_lat: float = 0.0,
+    crop_bounds: Tuple[float, float, float, float] | None = None,
+    margin_m: float = 0.0,
 ) -> str:
     """
     Generate a Wavefront OBJ terrain mesh from a GeoTIFF DTM.
@@ -51,6 +53,15 @@ def dtm_to_obj(
                          Larger values → coarser but faster mesh.
         ref_lon:         Reference longitude (degrees) for the local projection.
         ref_lat:         Reference latitude  (degrees) for the local projection.
+        crop_bounds:     Optional (minx, miny, maxx, maxy) in the DTM's CRS
+                         (lon/lat for geographic, metres for projected). When
+                         given, only this region — grown by `margin_m` — is
+                         meshed, instead of the whole DTM. A smaller mesh means
+                         a smaller HELIOS++ KD-tree: faster build, far less
+                         memory (avoids OOM), and fewer triangles per ray, with
+                         no fidelity loss inside the surveyed area.
+        margin_m:        Metres to expand `crop_bounds` on every side (so the
+                         outermost passes' swaths still land on meshed terrain).
 
     Returns:
         Absolute path of the written .obj file.
@@ -70,6 +81,32 @@ def dtm_to_obj(
     if nodata is not None:
         data[data == nodata] = np.nan
 
+    # Top-left world coordinates of the (possibly cropped) raster.
+    origin_x = transform.c   # left edge x
+    origin_y = transform.f   # top edge y
+
+    # ── Crop to the AOI (+ margin) before meshing ────────────────────────────
+    if crop_bounds is not None:
+        minx, miny, maxx, maxy = crop_bounds
+        if is_geo:
+            _lat_ref = ref_lat or (miny + maxy) / 2.0
+            m_x = margin_m / (_LAT_M * max(math.cos(math.radians(_lat_ref)), 1e-6))
+            m_y = margin_m / _LAT_M
+        else:
+            m_x = m_y = margin_m
+        minx -= m_x; maxx += m_x; miny -= m_y; maxy += m_y
+        c0 = int(math.floor((minx - origin_x) / pixel_w))
+        c1 = int(math.ceil((maxx - origin_x) / pixel_w))
+        r0 = int(math.floor((origin_y - maxy) / pixel_h))
+        r1 = int(math.ceil((origin_y - miny) / pixel_h))
+        c0 = max(0, min(c0, data.shape[1] - 1))
+        c1 = max(c0 + 1, min(c1, data.shape[1]))
+        r0 = max(0, min(r0, data.shape[0] - 1))
+        r1 = max(r0 + 1, min(r1, data.shape[0]))
+        data = data[r0:r1, c0:c1]
+        origin_x = origin_x + c0 * pixel_w
+        origin_y = origin_y - r0 * pixel_h
+
     # Subsample to the requested mesh resolution
     step_x = max(1, int(round(step_m / (pixel_w * (_LAT_M if is_geo else 1.0)))))
     step_y = max(1, int(round(step_m / (pixel_h * (_LAT_M if is_geo else 1.0)))))
@@ -79,12 +116,8 @@ def dtm_to_obj(
     # Fill any remaining NaN holes with nearest-neighbour propagation
     data = _fill_nodata(data)
 
-    # Top-left vertex world coordinates (before projection)
-    # transform.c = left edge x,  transform.f = top edge y
-    origin_x = transform.c
-    origin_y = transform.f
-    eff_dx = step_x * abs(transform.a)   # effective pixel width after subsampling
-    eff_dy = step_y * abs(transform.e)   # effective pixel height
+    eff_dx = step_x * pixel_w   # effective pixel width after subsampling
+    eff_dy = step_y * pixel_h   # effective pixel height
 
     # ── Compute all vertex coordinates via numpy (no Python loop) ────────────
     col_idx = np.arange(ncols, dtype=np.float64)

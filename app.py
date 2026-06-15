@@ -22,6 +22,7 @@ from shapely.geometry import shape as shapely_shape
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 from dtm import DTM
 from route_planner import plan_route, plan_route_adaptive
+from density_estimate import estimate_density_grid
 
 try:
     from helios_integration import run_feedback_loop, export_trajectory
@@ -104,6 +105,7 @@ for _k, _v in [
     ('helios_running', False), ('helios_stop_event', None),
     ('helios_queue', None), ('helios_log', []),
     ('helios_scene_ref_lon', None), ('helios_scene_ref_lat', None),
+    ('density_estimate', None),
 ]:
     if _k not in st.session_state:
         st.session_state[_k] = _v
@@ -246,6 +248,7 @@ if compute_btn and st.session_state.polygon is not None:
     poly = shapely_shape(st.session_state.polygon['geometry'])
     if not poly.is_valid:
         poly = poly.buffer(0)
+    st.session_state.density_estimate = None   # stale once the route changes
     with st.spinner('Computing route…'):
         if adaptive_spacing:
             st.session_state.route = plan_route_adaptive(
@@ -338,6 +341,31 @@ if st.session_state.helios_result and not st.session_state.helios_result.get('pa
             HeatMap(
                 [[_lat, _lon, 1] for _lon, _lat in _fail_cells],
                 name='Under-density zones',
+                radius=8,
+                blur=6,
+                min_opacity=0.4,
+            ).add_to(m)
+
+# Fast-estimate under-density zones overlay (orange, distinct from HELIOS red)
+if (st.session_state.route and st.session_state.density_estimate
+        and not st.session_state.density_estimate.get('passed')):
+    _est_cells = st.session_state.density_estimate.get('failing_cells_geo', [])
+    if _est_cells:
+        if len(_est_cells) <= 500:
+            for _lon, _lat in _est_cells:
+                folium.Circle(
+                    location=[_lat, _lon],
+                    radius=0.8,
+                    color='#ff9900',
+                    fill=True,
+                    fill_color='#ff9900',
+                    fill_opacity=0.5,
+                    tooltip='Estimated under-density',
+                ).add_to(m)
+        else:
+            HeatMap(
+                [[_lat, _lon, 1] for _lon, _lat in _est_cells],
+                name='Estimated under-density',
                 radius=8,
                 blur=6,
                 min_opacity=0.4,
@@ -554,8 +582,15 @@ with st.expander('HELIOS++ LiDAR Validation', expanded=bool(st.session_state.hel
                     else:
                         _ref_lon = (bounds.left + bounds.right) / 2
                         _ref_lat = (bounds.bottom + bounds.top) / 2
+                    # Mesh only the AOI (+ one swath margin so the outermost
+                    # passes' swaths still hit terrain) instead of the whole DTM —
+                    # smaller HELIOS++ KD-tree → much faster sim, far less memory.
+                    _crop = None
+                    if st.session_state.polygon:
+                        _crop = shapely_shape(st.session_state.polygon['geometry']).bounds
                     dtm_to_obj(dtm_path, _obj_tmp.name, step_m=float(h_mesh_step),
-                               ref_lon=_ref_lon, ref_lat=_ref_lat)
+                               ref_lon=_ref_lon, ref_lat=_ref_lat,
+                               crop_bounds=_crop, margin_m=float(swath_m))
                     st.session_state.helios_scene_obj = _obj_tmp.name
                     # Remember the exact origin baked into this mesh so the
                     # simulation reuses it verbatim — recomputing a fresh
@@ -568,6 +603,40 @@ with st.expander('HELIOS++ LiDAR Validation', expanded=bool(st.session_state.hel
                     st.rerun()
                 except Exception as _e:
                     st.error(f'Conversion failed: {_e}')
+
+        # ── Fast density estimate (analytical, no simulation) ───────────────────
+        st.markdown('**Fast density estimate**')
+        if st.button('⚡ Estimate density (no sim)', use_container_width=True,
+                     disabled=not st.session_state.route):
+            with st.spinner('Estimating density from scan geometry…'):
+                _poly = (shapely_shape(st.session_state.polygon['geometry'])
+                         if st.session_state.polygon else None)
+                _region = list(_poly.exterior.coords) if _poly else None
+                st.session_state.density_estimate = estimate_density_grid(
+                    st.session_state.route, dtm, _region,
+                    pulse_freq_hz=int(h_pulse_freq), scan_freq_hz=float(h_scan_freq),
+                    scan_half_angle_deg=float(h_scan_angle), speed_ms=float(h_speed),
+                    min_points=int(h_min_pts), is_geo=is_geo,
+                )
+            st.rerun()
+        _est = st.session_state.density_estimate
+        if _est:
+            if _est.get('error'):
+                st.error(_est['error'])
+            elif _est['passed']:
+                st.success(
+                    f"Estimate ✓ — median {_est['median_density']:.0f}, "
+                    f"min {_est['min_density']:.0f} pts/m² (≥ {int(h_min_pts)}); "
+                    f"{_est['cell_size_m']:.0f} m cells"
+                )
+            else:
+                st.warning(
+                    f"Estimate: {_est['n_fail']} of {_est['n_cells']} cells "
+                    f"< {int(h_min_pts)} pts/m² (orange on map). "
+                    f"median {_est['median_density']:.0f}, min {_est['min_density']:.0f}."
+                )
+            st.caption('Geometric estimate — no occlusion/vegetation. '
+                       'Confirm with one HELIOS++ run.')
 
         # ── Run ───────────────────────────────────────────────────────────────
         st.markdown('**Run simulation**')
