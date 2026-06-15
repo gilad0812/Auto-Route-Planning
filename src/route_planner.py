@@ -1,6 +1,6 @@
 import math
 import numpy as np
-from shapely.geometry import shape, LineString, Point, mapping
+from shapely.geometry import shape, LineString, Point, Polygon, mapping
 
 _LAT_M = 111139.0  # metres per degree latitude (WGS-84 approximation)
 
@@ -123,27 +123,61 @@ def _sample_line_in_polygon(polygon, y, step):
     return pts
 
 
+def _auto_pass_angle(dtm, polygon, lon_m, lat_m, n=15):
+    """Estimate the best pass heading (radians, in the local metric frame) for a
+    survey over `polygon`: along the terrain contours, i.e. perpendicular to the
+    mean slope. Passes that run along contours stay at near-constant terrain
+    elevation, so the constant-altitude-per-pass rule doesn't fly the drone far
+    above the low end of a pass (which widens the swath and thins density).
+
+    Returns 0.0 (east–west) when terrain is flat/symmetric or unreadable.
+    """
+    minx, miny, maxx, maxy = polygon.bounds
+    xs = np.linspace(minx, maxx, n)
+    ys = np.linspace(miny, maxy, n)
+    Z = np.full((n, n), np.nan)
+    for i, yy in enumerate(ys):
+        for j, xx in enumerate(xs):
+            if polygon.intersects(Point(xx, yy)):
+                e = dtm.elevation_at(xx, yy)
+                if not math.isnan(e):
+                    Z[i, j] = e
+    if np.all(np.isnan(Z)):
+        return 0.0
+    Zf = np.where(np.isnan(Z), np.nanmean(Z), Z)
+    de = (xs[-1] - xs[0]) / (n - 1) * lon_m          # metres per grid step (east)
+    dn = (ys[-1] - ys[0]) / (n - 1) * lat_m          # metres per grid step (north)
+    gy, gx = np.gradient(Zf, max(dn, 1e-6), max(de, 1e-6))
+    mgx, mgy = float(np.mean(gx)), float(np.mean(gy))
+    if math.hypot(mgx, mgy) < 1e-5:                  # ~flat / symmetric peak
+        return 0.0
+    return math.atan2(mgy, mgx) + math.pi / 2.0       # perpendicular to slope
+
+
 def plan_route_adaptive(dtm, polygon, distance_above_surface, error_tolerance,
                         scan_half_angle_deg, step,
                         overlap_frac=0.2, is_geo=True, min_spacing_m=2.0,
-                        elev_sample_step=None):
-    """Plan a lawnmower route with terrain-adaptive pass spacing.
+                        elev_sample_step=None, orientation='auto'):
+    """Plan a lawnmower route with terrain-adaptive pass spacing AND orientation.
 
-    Altitude follows the same rule as plan_route (constant per pass:
-    max terrain elevation along the pass + AGL). Spacing, however, is chosen
-    per gap instead of globally: the baseline is the flat-ground optimum
-    (2 * AGL * tan(half_angle) * (1 - overlap)), but it is tightened wherever
-    terrain BETWEEN two passes rises above the terrain under them. At such a
-    ridge the effective swath of both flanking passes shrinks (the drone is
-    pegged to the max elevation under its own line, not the ridge), which is
-    exactly where constant-spacing plans develop coverage gaps that the
-    HELIOS++ feedback loop would otherwise have to repair.
+    Two terrain adaptations:
 
-    Coverage rule per gap: spacing <= (half_swath_cur + half_swath_next)
-    evaluated at the highest terrain sample in the strip between the passes,
-    scaled by (1 - overlap_frac). The candidate spacing depends on the next
-    pass's altitude, which depends on its position, so the choice is iterated
-    to a fixed point (3 rounds is plenty in practice).
+    1. Orientation — passes run ALONG the terrain contours (perpendicular to the
+       mean slope) instead of always east-west. Because altitude is held constant
+       per pass at (max terrain under the pass + AGL), a pass that crosses a large
+       elevation range forces the drone far above the low end, widening the swath
+       and thinning point density there. Contour-aligned passes stay at roughly
+       constant terrain elevation, keeping density uniform. `orientation` may be
+       'auto' (default), 'ew', or 'ns'.
+
+    2. Spacing — tightened wherever terrain between two passes rises and shrinks
+       their effective swath, so coverage holds over ridges:
+       spacing <= (half_swath_cur + half_swath_next) * (1 - overlap_frac),
+       evaluated at the highest terrain in the strip, iterated to a fixed point.
+
+    Implementation: everything runs in a local metric frame rotated so passes are
+    horizontal; terrain is sampled by mapping back to the DTM CRS, and waypoints
+    are emitted back in that CRS (x, y).
 
     Returns list of dicts: {x, y, z, target_distance, error_tol, pass_id}.
     """
@@ -151,31 +185,69 @@ def plan_route_adaptive(dtm, polygon, distance_above_surface, error_tolerance,
     tan_t = math.tan(math.radians(scan_half_angle_deg))
     base_spacing_m = 2.0 * agl * tan_t * (1.0 - overlap_frac)
 
-    minx, miny, maxx, maxy = polygon.bounds
-    units_per_m = (1.0 / _LAT_M) if is_geo else 1.0
-    strip_xs = [minx + (maxx - minx) * i / 12.0 for i in range(13)]
+    # Local metric frame centred on the polygon.
+    c = polygon.centroid
+    lon0, lat0 = c.x, c.y
+    if is_geo:
+        lat_m = _LAT_M
+        lon_m = _LAT_M * math.cos(math.radians(lat0))
+    else:
+        lat_m = lon_m = 1.0
+
+    if orientation == 'ew':
+        theta = 0.0
+    elif orientation == 'ns':
+        theta = math.pi / 2.0
+    else:
+        theta = _auto_pass_angle(dtm, polygon, lon_m, lat_m)
+    ct, st = math.cos(theta), math.sin(theta)
+
+    def g2uv(x, y):                       # DTM CRS -> rotated metric (u along pass, v across)
+        e = (x - lon0) * lon_m
+        nn = (y - lat0) * lat_m
+        return (e * ct + nn * st, -e * st + nn * ct)
+
+    def uv2g(u, v):                       # rotated metric -> DTM CRS
+        e = u * ct - v * st
+        nn = u * st + v * ct
+        return (lon0 + e / lon_m, lat0 + nn / lat_m)
+
+    def elev_uv(u, v):
+        gx, gy = uv2g(u, v)
+        return dtm.elevation_at(gx, gy)
+
+    poly_uv = Polygon([g2uv(px, py) for px, py in polygon.exterior.coords])
+    if not poly_uv.is_valid:
+        poly_uv = poly_uv.buffer(0)
+
+    # step / elev_sample_step arrive in map units; convert to metres for the frame.
+    to_m = lat_m if is_geo else 1.0
+    step_m = max(step * to_m, 0.5)
+    esample_m = (elev_sample_step * to_m) if elev_sample_step else None
+
+    minu, minv, maxu, maxv = poly_uv.bounds
+    strip_us = [minu + (maxu - minu) * i / 12.0 for i in range(13)]
 
     route = []
-    y = miny
+    v = minv
     toggle = False
     pass_id = 0
-    while y <= maxy:
-        pts = _sample_line_in_polygon(polygon, y, step)
+    while v <= maxv:
+        pts = _sample_line_in_polygon(poly_uv, v, step_m)   # (u, v) in metres
         z = float('nan')
         if pts:
-            # Sample terrain finely for the clearance calc (independent of the
-            # waypoint step) so a peak between waypoints isn't missed.
-            if elev_sample_step and elev_sample_step < step:
-                elev_pts = _sample_line_in_polygon(polygon, y, elev_sample_step)
+            if esample_m and esample_m < step_m:
+                elev_pts = _sample_line_in_polygon(poly_uv, v, esample_m)
             else:
                 elev_pts = pts
-            elevs = [dtm.elevation_at(px, py) for px, py in elev_pts]
+            elevs = [elev_uv(pu, pv) for pu, pv in elev_pts]
             valid = [e for e in elevs if not math.isnan(e)]
             if valid:
                 z = max(valid) + agl
             ordered = list(reversed(pts)) if toggle else pts
-            for px, py in ordered:
-                route.append({'x': px, 'y': py, 'z': z,
+            for pu, pv in ordered:
+                gx, gy = uv2g(pu, pv)
+                route.append({'x': gx, 'y': gy, 'z': z,
                               'target_distance': agl, 'error_tol': error_tolerance,
                               'pass_id': pass_id})
             pass_id += 1
@@ -184,18 +256,18 @@ def plan_route_adaptive(dtm, polygon, distance_above_surface, error_tolerance,
         z_cur = z if not math.isnan(z) else None
         s_m = base_spacing_m
         for _ in range(3):
-            y_next = y + s_m * units_per_m
+            v_next = v + s_m
             strip_elevs, next_elevs = [], []
             for frac in (0.25, 0.5, 0.75):
-                yy = y + (y_next - y) * frac
-                for x in strip_xs:
-                    if polygon.intersects(Point(x, yy)):
-                        e = dtm.elevation_at(x, yy)
+                vv = v + (v_next - v) * frac
+                for u in strip_us:
+                    if poly_uv.intersects(Point(u, vv)):
+                        e = elev_uv(u, vv)
                         if not math.isnan(e):
                             strip_elevs.append(e)
-            for x in strip_xs:
-                if polygon.intersects(Point(x, y_next)):
-                    e = dtm.elevation_at(x, y_next)
+            for u in strip_us:
+                if poly_uv.intersects(Point(u, v_next)):
+                    e = elev_uv(u, v_next)
                     if not math.isnan(e):
                         next_elevs.append(e)
             if not strip_elevs and not next_elevs:
@@ -212,6 +284,6 @@ def plan_route_adaptive(dtm, polygon, distance_above_surface, error_tolerance,
                 s_m = s_new
                 break
             s_m = s_new
-        y += s_m * units_per_m
+        v += s_m
 
     return route
