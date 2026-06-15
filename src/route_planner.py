@@ -123,35 +123,64 @@ def _sample_line_in_polygon(polygon, y, step):
     return pts
 
 
-def _auto_pass_angle(dtm, polygon, lon_m, lat_m, n=15):
-    """Estimate the best pass heading (radians, in the local metric frame) for a
-    survey over `polygon`: along the terrain contours, i.e. perpendicular to the
-    mean slope. Passes that run along contours stay at near-constant terrain
-    elevation, so the constant-altitude-per-pass rule doesn't fly the drone far
-    above the low end of a pass (which widens the swath and thins density).
+def _auto_pass_angle(dtm, polygon, lon_m, lat_m, n=21, n_angles=180):
+    """Pick the pass heading (radians, in the local metric frame) that best follows
+    the terrain contours, by SEARCHING for the orientation that minimises how much
+    a single pass climbs or descends.
 
-    Returns 0.0 (east–west) when terrain is flat/symmetric or unreadable.
+    Passes run along the rotated frame's u-axis, so a pass is a strip of (near-)
+    constant across-axis v. For each candidate heading the sampled terrain is
+    binned by v and we measure the mean elevation spread within a bin — i.e. how
+    much a pass at that heading would change elevation. The minimising heading
+    keeps every pass at near-constant terrain elevation, so the constant-altitude-
+    per-pass rule doesn't fly the drone far above a pass's low end (which widens
+    the swath and thins point density).
+
+    This replaces a mean-gradient heuristic that CANCELLED OUT on a ridge, valley
+    or peak inside the AOI (opposing slopes average to ~zero) and produced passes
+    that crossed the slope instead of hugging it. Returns 0.0 (east–west) for flat
+    or unreadable terrain.
     """
     minx, miny, maxx, maxy = polygon.bounds
     xs = np.linspace(minx, maxx, n)
     ys = np.linspace(miny, maxy, n)
-    Z = np.full((n, n), np.nan)
-    for i, yy in enumerate(ys):
-        for j, xx in enumerate(xs):
+    cx, cy = (minx + maxx) / 2.0, (miny + maxy) / 2.0
+    pxs, pys, pes = [], [], []                       # sample points in local metres
+    for yy in ys:
+        for xx in xs:
             if polygon.intersects(Point(xx, yy)):
                 e = dtm.elevation_at(xx, yy)
                 if not math.isnan(e):
-                    Z[i, j] = e
-    if np.all(np.isnan(Z)):
+                    pxs.append((xx - cx) * lon_m)
+                    pys.append((yy - cy) * lat_m)
+                    pes.append(e)
+    if len(pes) < 4:
         return 0.0
-    Zf = np.where(np.isnan(Z), np.nanmean(Z), Z)
-    de = (xs[-1] - xs[0]) / (n - 1) * lon_m          # metres per grid step (east)
-    dn = (ys[-1] - ys[0]) / (n - 1) * lat_m          # metres per grid step (north)
-    gy, gx = np.gradient(Zf, max(dn, 1e-6), max(de, 1e-6))
-    mgx, mgy = float(np.mean(gx)), float(np.mean(gy))
-    if math.hypot(mgx, mgy) < 1e-5:                  # ~flat / symmetric peak
+    pxs, pys, pes = np.asarray(pxs), np.asarray(pys), np.asarray(pes)
+    if float(pes.max() - pes.min()) < 1.0:           # ~flat: orientation irrelevant
         return 0.0
-    return math.atan2(mgy, mgx) + math.pi / 2.0       # perpendicular to slope
+
+    # Fixed metric band width (independent of heading) so the spread metric is
+    # comparable across all candidate angles.
+    span = max(float(pxs.max() - pxs.min()), float(pys.max() - pys.min()), 1.0)
+    band = span / 14.0
+
+    best_theta, best_cost = 0.0, float('inf')
+    for k in range(n_angles):
+        theta = math.pi * k / n_angles               # 0 … <π (a pass axis is bidirectional)
+        ct, st = math.cos(theta), math.sin(theta)
+        v = -pxs * st + pys * ct                     # across-pass coordinate
+        idx = np.floor((v - v.min()) / band).astype(int)
+        cost, weight = 0.0, 0
+        for b in np.unique(idx):
+            ez = pes[idx == b]
+            if ez.size >= 2:
+                cost += float(ez.max() - ez.min()) * ez.size
+                weight += ez.size
+        cost = cost / weight if weight else float('inf')
+        if cost < best_cost - 1e-9:
+            best_cost, best_theta = cost, theta
+    return best_theta
 
 
 def plan_route_adaptive(dtm, polygon, distance_above_surface, error_tolerance,
