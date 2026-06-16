@@ -123,29 +123,46 @@ def estimate_density_grid(
     if dtm.nodata is not None:
         terr = np.where(terr == dtm.nodata, np.nan, terr)
 
+    # Terrain surface normal per cell, from the local slope (∂z/∂east, ∂z/∂north),
+    # so we can charge the TRUE laser incidence onto the tilted ground — not just
+    # the nadir scan angle. A face tilted away from the flight line is hit at a
+    # grazing angle (footprint stretches → density drops); a back-facing surface
+    # isn't hit at all. This is what makes the estimate catch steep-slope thinning.
+    terr_f = np.where(np.isnan(terr), np.nanmean(terr), terr)
+    g_n, g_e = np.gradient(terr_f, cell, cell)     # ∂z/∂north (rows), ∂z/∂east (cols)
+    nrm = np.sqrt(1.0 + g_e * g_e + g_n * g_n)
+
+    cu = (minlon + maxlon) / 2.0
+    cvv = (minlat + maxlat) / 2.0
+
     # ── Accumulate density from every pass ───────────────────────────────────
     density = np.zeros((ny, nx), dtype=float)
     for pts in passes:
         z_pass = float(pts[0]["z"])
-        ax = (pts[0]["x"] - (minlon + maxlon) / 2.0) * lon_m
-        ay = (pts[0]["y"] - (minlat + maxlat) / 2.0) * lat_m
-        bx = (pts[-1]["x"] - (minlon + maxlon) / 2.0) * lon_m
-        by = (pts[-1]["y"] - (minlat + maxlat) / 2.0) * lat_m
+        ax = (pts[0]["x"] - cu) * lon_m
+        ay = (pts[0]["y"] - cvv) * lat_m
+        bx = (pts[-1]["x"] - cu) * lon_m
+        by = (pts[-1]["y"] - cvv) * lat_m
         dx, dy = bx - ax, by - ay
         L2 = dx * dx + dy * dy
         if L2 < 1e-9:
-            d = np.hypot(E - ax, N - ay)
+            fx, fy = ax, ay
         else:
             tt = np.clip(((E - ax) * dx + (N - ay) * dy) / L2, 0.0, 1.0)
-            d = np.hypot(E - (ax + tt * dx), N - (ay + tt * dy))
-
-        h = z_pass - terr                          # AGL above each cell
+            fx, fy = ax + tt * dx, ay + tt * dy
+        ox, oy = E - fx, N - fy                     # horizontal aircraft→cell offset
+        d = np.hypot(ox, oy)
+        h = z_pass - terr                           # AGL above each cell
         with np.errstate(invalid="ignore"):
-            covered = np.isfinite(h) & (h > 1.0) & (d <= h * tan_half)
-            cos2 = np.where(covered, (h * h) / (d * d + h * h), 0.0)
+            R = np.sqrt(d * d + h * h)              # slant range
+            # cos(incidence) between the ray and the surface normal; for flat
+            # ground this reduces to cos(scan angle) = h/R (the old model).
+            cos_i = (h + ox * g_e + oy * g_n) / (np.maximum(R, 1e-6) * nrm)
+            covered = (np.isfinite(h) & (h > 1.0)
+                       & (d <= h * tan_half) & (cos_i > 0.0))
             contrib = np.where(
                 covered,
-                pulse_freq_hz * cos2 / (speed_ms * np.maximum(h, 1.0) * fov),
+                pulse_freq_hz * cos_i / (speed_ms * np.maximum(R, 1.0) * fov),
                 0.0,
             )
         density += contrib
