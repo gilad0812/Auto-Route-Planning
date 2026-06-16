@@ -194,6 +194,13 @@ with st.sidebar:
              'dense centre of a swath (not its thin grazing-angle tail) lands on '
              'the AOI rim. Removes the under-density fringe around the perimeter.',
     )
+    max_relief_line = st.number_input(
+        'Max climb per line (m, 0 = off)', value=0.0, min_value=0.0, step=10.0,
+        help='When a straight pass would climb/descend more than this, split it '
+             'into separate straight lines, each held at its own constant altitude '
+             '(registration-safe) so the drone stays low above steep terrain. '
+             '0 disables splitting.',
+    )
     step_m    = st.number_input('Along-track step (m)',  value=50.0,  min_value=1.0,    step=5.0)
     error_tol = st.number_input('Error tolerance (m)',   value=2.0,   min_value=0.1,    step=0.5)
     st.divider()
@@ -257,6 +264,7 @@ if compute_btn and st.session_state.polygon is not None:
                 overlap_frac=overlap / 100.0, is_geo=is_geo,
                 elev_sample_step=elev_step_map,
                 edge_margin_m=(None if edge_coverage else 0.0),
+                max_relief_per_line_m=(max_relief_line if max_relief_line > 0 else None),
             )
         else:
             st.session_state.route = plan_route(

@@ -183,11 +183,53 @@ def _auto_pass_angle(dtm, polygon, lon_m, lat_m, n=21, n_angles=180):
     return best_theta
 
 
+def _seg_max_elev(p0, p1, elev_uv, sample_step):
+    """Max terrain elevation along a straight (u,v) segment, densely sampled so a
+    peak between the endpoints can't be missed. NaN when no valid terrain."""
+    (u0, v0), (u1, v1) = p0, p1
+    dist = math.hypot(u1 - u0, v1 - v0)
+    n = max(1, int(math.ceil(dist / max(sample_step, 0.5))))
+    vals = []
+    for i in range(n + 1):
+        e = elev_uv(u0 + (u1 - u0) * i / n, v0 + (v1 - v0) * i / n)
+        if not math.isnan(e):
+            vals.append(e)
+    return max(vals) if vals else float("nan")
+
+
+def _split_by_relief(points, elevs, max_relief):
+    """Split an ordered list of pass waypoints into contiguous chunks so each
+    chunk's terrain spans no more than `max_relief` metres. Consecutive chunks
+    share their boundary waypoint so coverage stays continuous. Each chunk later
+    becomes its own straight line at its own constant altitude — the registration-
+    safe way to hold low AGL across terrain a single constant-altitude line can't.
+    """
+    chunks = []
+    start = 0
+    cmin = cmax = None
+    for i in range(len(points)):
+        e = elevs[i]
+        if e is None or math.isnan(e):
+            continue
+        nmin = e if cmin is None else min(cmin, e)
+        nmax = e if cmax is None else max(cmax, e)
+        if cmin is not None and (nmax - nmin) > max_relief and i - start >= 1:
+            chunks.append(points[start:i])        # waypoints start … i-1
+            start = i - 1                          # next chunk shares the boundary
+            be = elevs[i - 1]
+            base = be if (be is not None and not math.isnan(be)) else e
+            cmin, cmax = min(base, e), max(base, e)
+        else:
+            cmin, cmax = nmin, nmax
+    chunks.append(points[start:])
+    return [c for c in chunks if len(c) >= 1]
+
+
 def plan_route_adaptive(dtm, polygon, distance_above_surface, error_tolerance,
                         scan_half_angle_deg, step,
                         overlap_frac=0.2, is_geo=True, min_spacing_m=2.0,
                         elev_sample_step=None, orientation='auto',
-                        edge_margin_m=None):
+                        edge_margin_m=None, max_relief_per_line_m=None):
     """Plan a lawnmower route with terrain-adaptive pass spacing AND orientation.
 
     Three terrain/density adaptations:
@@ -198,7 +240,14 @@ def plan_route_adaptive(dtm, polygon, distance_above_surface, error_tolerance,
        elevation range forces the drone far above the low end, widening the swath
        and thinning point density there. Contour-aligned passes stay at roughly
        constant terrain elevation, keeping density uniform. `orientation` may be
-       'auto' (default), 'ew', or 'ns'.
+       'auto' (default, minimise within-pass climb), 'ew', or 'ns'.
+
+    4. Altitude-split lines — when `max_relief_per_line_m` is set, any pass whose
+       terrain spans more than that is broken into several contiguous STRAIGHT
+       lines, each held at its own constant altitude (registration-safe). This
+       keeps the drone at low AGL across terrain a single constant-altitude line
+       would otherwise force it high above — without curving the line. Each split
+       segment is emitted as its own pass_id ("a new line"). None = never split.
 
     2. Spacing — tightened wherever terrain between two passes rises and shrinks
        their effective swath, so coverage holds over ridges:
@@ -286,21 +335,41 @@ def plan_route_adaptive(dtm, polygon, distance_above_surface, error_tolerance,
         pts = _sample_line_in_polygon(poly_cov, v, step_m)   # (u, v) in metres
         z = float('nan')
         if pts:
+            ordered = list(reversed(pts)) if toggle else pts
+            # Whole-line altitude (dense for safety) — used for the spacing
+            # fixed-point below and as the altitude when the line isn't split.
             if esample_m and esample_m < step_m:
                 elev_pts = _sample_line_in_polygon(poly_cov, v, esample_m)
             else:
-                elev_pts = pts
-            elevs = [elev_uv(pu, pv) for pu, pv in elev_pts]
-            valid = [e for e in elevs if not math.isnan(e)]
+                elev_pts = ordered
+            valid = [e for e in (elev_uv(pu, pv) for pu, pv in elev_pts)
+                     if not math.isnan(e)]
             if valid:
                 z = max(valid) + agl
-            ordered = list(reversed(pts)) if toggle else pts
-            for pu, pv in ordered:
-                gx, gy = uv2g(pu, pv)
-                route.append({'x': gx, 'y': gy, 'z': z,
-                              'target_distance': agl, 'error_tol': error_tolerance,
-                              'pass_id': pass_id})
-            pass_id += 1
+
+            # Split the line where its terrain spans more than the relief budget.
+            if max_relief_per_line_m:
+                we = [elev_uv(pu, pv) for pu, pv in ordered]
+                wv = [e for e in we if not math.isnan(e)]
+                relief = (max(wv) - min(wv)) if wv else 0.0
+                chunks = (_split_by_relief(ordered, we, max_relief_per_line_m)
+                          if relief > max_relief_per_line_m else [ordered])
+            else:
+                chunks = [ordered]
+
+            sstep = esample_m or step_m
+            for chunk in chunks:
+                if len(chunks) == 1:
+                    cz = z
+                else:
+                    ce = _seg_max_elev(chunk[0], chunk[-1], elev_uv, sstep)
+                    cz = (ce + agl) if not math.isnan(ce) else float('nan')
+                for pu, pv in chunk:
+                    gx, gy = uv2g(pu, pv)
+                    route.append({'x': gx, 'y': gy, 'z': cz,
+                                  'target_distance': agl, 'error_tol': error_tolerance,
+                                  'pass_id': pass_id})
+                pass_id += 1
             toggle = not toggle
 
         z_cur = z if not math.isnan(z) else None
