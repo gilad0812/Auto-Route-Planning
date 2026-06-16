@@ -279,7 +279,7 @@ def plan_route_adaptive(dtm, polygon, distance_above_surface, error_tolerance,
         # BEYOND each parallel (top/bottom) AOI edge — giving the rim two-sided
         # overlap — rather than the margin falling inside a single pass gap and
         # adding nothing across. (The along-pass extension this also buys is cheap.)
-        edge_margin_m = 1.15 * base_spacing_m
+        edge_margin_m = 1.01 * base_spacing_m
 
     # Local metric frame centred on the polygon.
     c = polygon.centroid
