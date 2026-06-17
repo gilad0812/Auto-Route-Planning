@@ -53,6 +53,7 @@ def estimate_density_grid(
     route, dtm, region, *,
     pulse_freq_hz, scan_freq_hz, scan_half_angle_deg, speed_ms, min_points,
     is_geo=True, cell_size_m=1.0, max_cells=3_000_000,
+    occlusion=True, occ_margin_m=2.0,
 ):
     """Estimate per-cell point density for `route` over `dtm`.
 
@@ -135,6 +136,12 @@ def estimate_density_grid(
     cu = (minlon + maxlon) / 2.0
     cvv = (minlat + maxlat) / 2.0
 
+    def _terr_EN(Em, Nm):
+        """Terrain elevation at metric points (E, N) — for the occlusion march."""
+        cq = np.clip(((cu + Em / lon_m - t.c) / t.a).astype(int), 0, arr.shape[1] - 1)
+        rq = np.clip(((cvv + Nm / lat_m - t.f) / t.e).astype(int), 0, arr.shape[0] - 1)
+        return arr[rq, cq]
+
     # ── Accumulate density from every pass ───────────────────────────────────
     density = np.zeros((ny, nx), dtype=float)
     for pts in passes:
@@ -165,6 +172,20 @@ def estimate_density_grid(
                 pulse_freq_hz * cos_i / (speed_ms * np.maximum(R, 1.0) * fov),
                 0.0,
             )
+        # Occlusion: march from the aircraft (foot of the pass, at z_pass) down to
+        # the cell; if terrain in between rises above the sight line, the beam is
+        # blocked → this pass deposits nothing here (shadowed gully floor / lee
+        # face behind a ridge or cliff). This is the dominant effect HELIOS sees
+        # that pure scan geometry misses.
+        if occlusion:
+            with np.errstate(invalid="ignore"):
+                blocked = np.zeros_like(h, dtype=bool)
+                for tf in (0.25, 0.45, 0.65, 0.82, 0.93):
+                    Em = E - (1.0 - tf) * ox        # march point foot→cell
+                    Nm = N - (1.0 - tf) * oy
+                    los = z_pass - tf * h           # straight sight-line altitude
+                    blocked |= covered & (_terr_EN(Em, Nm) > los + occ_margin_m)
+            contrib = np.where(blocked, 0.0, contrib)
         density += contrib
 
     # ── Region mask + failure detection ──────────────────────────────────────

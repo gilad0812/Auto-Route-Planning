@@ -6,6 +6,7 @@ import csv
 import io
 import base64
 import tempfile
+import shutil
 import threading
 import queue
 
@@ -127,6 +128,11 @@ with st.sidebar:
         help='GeoTIFF or other GDAL-supported raster',
     )
     if uploaded is not None and uploaded.name != st.session_state.dtm_upload_name:
+        if st.session_state.dtm_tmp_path:        # drop the previous upload's temp file
+            try:
+                os.remove(st.session_state.dtm_tmp_path)
+            except OSError:
+                pass
         suffix = os.path.splitext(uploaded.name)[1]
         tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
         tmp.write(uploaded.read())
@@ -580,6 +586,13 @@ with st.expander('HELIOS++ LiDAR Validation', expanded=bool(st.session_state.hel
             with st.spinner('Generating terrain mesh…'):
                 try:
                     import tempfile as _tf
+                    _prev_obj = st.session_state.helios_scene_obj   # drop prior mesh
+                    if _prev_obj and os.path.basename(_prev_obj).startswith('tmp') \
+                            and os.path.exists(_prev_obj):
+                        try:
+                            os.remove(_prev_obj)
+                        except OSError:
+                            pass
                     _obj_tmp = _tf.NamedTemporaryFile(suffix='.obj', delete=False)
                     _obj_tmp.close()
                     if st.session_state.route:
@@ -669,6 +682,11 @@ with st.expander('HELIOS++ LiDAR Validation', expanded=bool(st.session_state.hel
                 st.session_state.helios_stop_event = _stop_event
 
                 _work = os.path.join(tempfile.gettempdir(), 'helios_autoroute')
+                # Wipe the previous run's output first — HELIOS dumps large LAS
+                # point clouds here every run; without this they pile up forever
+                # (they're regenerated each run, only the result summary is kept).
+                shutil.rmtree(_work, ignore_errors=True)
+                os.makedirs(_work, exist_ok=True)
 
                 _region = (
                     list(shapely_shape(st.session_state.polygon['geometry']).exterior.coords)
