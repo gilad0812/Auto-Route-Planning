@@ -203,6 +203,14 @@ with st.sidebar:
     )
     step_m    = st.number_input('Along-track step (m)',  value=50.0,  min_value=1.0,    step=5.0)
     error_tol = st.number_input('Error tolerance (m)',   value=2.0,   min_value=0.1,    step=0.5)
+
+    st.markdown('**Scanner & density**')
+    st.caption('Drives the density estimate run on Compute, and HELIOS++ '
+               'validation. Scan half-angle = FOV / 2.')
+    min_points = st.number_input('Min points / m²',      value=DEFAULT_MIN_POINTS_PER_SQM, min_value=1,   step=5)
+    speed_ms   = st.number_input('Drone speed (m/s)',    value=DEFAULT_DRONE_SPEED_MS,     min_value=0.1, step=0.5)
+    pulse_freq = st.number_input('Pulse frequency (Hz)', value=DEFAULT_PULSE_FREQ_HZ,      min_value=1000, step=10000)
+    scan_freq  = st.number_input('Scan frequency (Hz)',  value=DEFAULT_SCAN_FREQ_HZ,       min_value=1.0, step=10.0)
     st.divider()
 
     compute_btn = st.button(
@@ -269,6 +277,16 @@ if compute_btn and st.session_state.polygon is not None:
             st.session_state.route = plan_route(
                 dtm, poly, altitude, error_tol, spacing_map, step_map,
                 elev_sample_step=elev_step_map,
+            )
+    # Auto density estimate (analytical, ~1 s) so Compute immediately shows
+    # whether the route meets the target — no separate button press.
+    if st.session_state.route:
+        with st.spinner('Estimating density…'):
+            st.session_state.density_estimate = estimate_density_grid(
+                st.session_state.route, dtm, list(poly.exterior.coords),
+                pulse_freq_hz=int(pulse_freq), scan_freq_hz=float(scan_freq),
+                scan_half_angle_deg=fov / 2.0, speed_ms=float(speed_ms),
+                min_points=int(min_points), is_geo=is_geo,
             )
 
 # ------------------------------------------------------------------ build map
@@ -384,6 +402,8 @@ folium.LayerControl().add_to(m)
 
 st.title('LiDAR Drone Route Planner')
 
+# Map with a static info column (How to use + DTM) to its right; the dynamic
+# logs (polygon area, route, density) go underneath the map.
 map_col, info_col = st.columns([3, 1])
 
 with map_col:
@@ -397,16 +417,6 @@ with info_col:
         '3. Click **Compute Route**  \n'
         '4. Download results below'
     )
-    if st.session_state.polygon:
-        poly_shape = shapely_shape(st.session_state.polygon['geometry'])
-        area_m2 = polygon_area_m2(poly_shape, is_geo)
-        st.divider()
-        st.markdown('**Polygon**')
-        if area_m2 >= 1_000_000:
-            st.metric('Area', f'{area_m2 / 1_000_000:.3f} km²')
-        else:
-            st.metric('Area', f'{area_m2:,.0f} m²')
-
     st.divider()
     st.markdown('**DTM**')
     st.markdown(
@@ -414,6 +424,21 @@ with info_col:
         f'CRS: `{dtm.src.crs}`  \n'
         f'Size: {dtm.array.shape[1]} × {dtm.array.shape[0]} px'
     )
+
+st.divider()
+poly_col, route_col, dens_col = st.columns(3)
+
+with poly_col:
+    if st.session_state.polygon:
+        poly_shape = shapely_shape(st.session_state.polygon['geometry'])
+        area_m2 = polygon_area_m2(poly_shape, is_geo)
+        st.markdown('**Polygon**')
+        if area_m2 >= 1_000_000:
+            st.metric('Area', f'{area_m2 / 1_000_000:.3f} km²')
+        else:
+            st.metric('Area', f'{area_m2:,.0f} m²')
+
+with route_col:
     if st.session_state.route:
         wps = [wp for wp in st.session_state.route
                if not (isinstance(wp['z'], float) and math.isnan(wp['z']))]
@@ -433,11 +458,27 @@ with info_col:
                     math.sqrt((xs[i+1]-xs[i])**2 + (ys[i+1]-ys[i])**2)
                     for i in range(len(xs)-1)
                 )
-            st.divider()
             st.markdown('**Route**')
             st.metric('Waypoints', len(wps))
             st.metric('Path length', f'{total_m/1000:.2f} km' if total_m >= 1000 else f'{total_m:.0f} m')
             st.metric('Alt range', f'{min(zs):.0f} – {max(zs):.0f} m')
+
+with dens_col:
+    _est = st.session_state.density_estimate
+    if st.session_state.route and _est:
+        st.markdown('**Density estimate**')
+        if _est.get('error'):
+            st.error(_est['error'])
+        else:
+            if _est['passed']:
+                st.success(f"✓ ≥ {int(min_points)} pts/m² across the AOI")
+            else:
+                st.warning(f"{_est['n_fail']} / {_est['n_cells']} cells "
+                           f"< {int(min_points)} pts/m² (orange on map)")
+            st.metric('Median density', f"{_est['median_density']:.0f} pts/m²")
+            st.metric('Min density',    f"{_est['min_density']:.0f} pts/m²")
+            st.caption(f"{_est['cell_size_m']:.0f} m cells · geometric estimate "
+                       "(no vegetation) — confirm with HELIOS++.")
 
 # ------------------------------------------------------------------ capture new drawing
 
@@ -556,19 +597,18 @@ with st.expander('HELIOS++ LiDAR Validation', expanded=bool(st.session_state.hel
         scanner_ref_input  = path_c1.text_input('Scanner XML ref',  value=DEFAULT_SCANNER_REF,  key='_hscan')
         platform_ref_input = path_c2.text_input('Platform XML ref', value=DEFAULT_PLATFORM_REF, key='_hplat')
 
-        # ── Flight & density ──────────────────────────────────────────────────
-        st.markdown('**Flight & density**')
-        fd_c1, fd_c2, fd_c3 = st.columns(3)
-        h_min_pts  = fd_c1.number_input('Min points / m²',     value=DEFAULT_MIN_POINTS_PER_SQM, min_value=1,   step=5)
-        h_speed    = fd_c2.number_input('Drone speed (m/s)',    value=DEFAULT_DRONE_SPEED_MS,     min_value=0.1, step=0.5)
-        h_max_iter = fd_c3.number_input('Max refinement cycles',value=DEFAULT_MAX_ITERATIONS,     min_value=1,   max_value=10)
-
-        # ── Scanner parameters ────────────────────────────────────────────────
-        st.markdown('**Scanner**')
-        sc_c1, sc_c2, sc_c3 = st.columns(3)
-        h_pulse_freq  = sc_c1.number_input('Pulse frequency (Hz)',   value=DEFAULT_PULSE_FREQ_HZ,   min_value=1000,  step=10000)
-        h_scan_freq   = sc_c2.number_input('Scan frequency (Hz)',    value=DEFAULT_SCAN_FREQ_HZ,    min_value=1.0,   step=10.0)
-        h_scan_angle  = sc_c3.number_input('Scan half-angle (°)',    value=DEFAULT_SCAN_ANGLE_DEG,  min_value=1.0,   max_value=89.0, step=5.0)
+        # ── Refinement ────────────────────────────────────────────────────────
+        # Density & scanner params (min points, speed, pulse/scan freq, and scan
+        # half-angle = FOV/2) come from the sidebar — shared with the on-compute
+        # estimate so validation matches what the route was planned/estimated for.
+        st.markdown('**Refinement**')
+        h_max_iter = st.number_input('Max refinement cycles', value=DEFAULT_MAX_ITERATIONS,
+                                     min_value=1, max_value=10)
+        st.caption(
+            f'Density {int(min_points)} pts/m² · speed {speed_ms:.1f} m/s · '
+            f'pulse {int(pulse_freq)} Hz · scan {scan_freq:.0f} Hz · '
+            f'half-angle {fov / 2:.0f}° — set in the sidebar.'
+        )
 
         # ── Terrain mesh ──────────────────────────────────────────────────────
         st.markdown('**Terrain mesh**')
@@ -618,40 +658,6 @@ with st.expander('HELIOS++ LiDAR Validation', expanded=bool(st.session_state.hel
                 except Exception as _e:
                     st.error(f'Conversion failed: {_e}')
 
-        # ── Fast density estimate (analytical, no simulation) ───────────────────
-        st.markdown('**Fast density estimate**')
-        if st.button('⚡ Estimate density (no sim)', use_container_width=True,
-                     disabled=not st.session_state.route):
-            with st.spinner('Estimating density from scan geometry…'):
-                _poly = (shapely_shape(st.session_state.polygon['geometry'])
-                         if st.session_state.polygon else None)
-                _region = list(_poly.exterior.coords) if _poly else None
-                st.session_state.density_estimate = estimate_density_grid(
-                    st.session_state.route, dtm, _region,
-                    pulse_freq_hz=int(h_pulse_freq), scan_freq_hz=float(h_scan_freq),
-                    scan_half_angle_deg=float(h_scan_angle), speed_ms=float(h_speed),
-                    min_points=int(h_min_pts), is_geo=is_geo,
-                )
-            st.rerun()
-        _est = st.session_state.density_estimate
-        if _est:
-            if _est.get('error'):
-                st.error(_est['error'])
-            elif _est['passed']:
-                st.success(
-                    f"Estimate ✓ — median {_est['median_density']:.0f}, "
-                    f"min {_est['min_density']:.0f} pts/m² (≥ {int(h_min_pts)}); "
-                    f"{_est['cell_size_m']:.0f} m cells"
-                )
-            else:
-                st.warning(
-                    f"Estimate: {_est['n_fail']} of {_est['n_cells']} cells "
-                    f"< {int(h_min_pts)} pts/m² (orange on map). "
-                    f"median {_est['median_density']:.0f}, min {_est['min_density']:.0f}."
-                )
-            st.caption('Geometric estimate — no occlusion/vegetation. '
-                       'Confirm with one HELIOS++ run.')
-
         # ── Run ───────────────────────────────────────────────────────────────
         st.markdown('**Run simulation**')
         _can_run = bool(st.session_state.route and helios_bin_input and scene_obj_input)
@@ -691,8 +697,8 @@ with st.expander('HELIOS++ LiDAR Validation', expanded=bool(st.session_state.hel
                     _work=_work, _is_geo=is_geo, _alt=altitude,
                     _ref_lon=st.session_state.helios_scene_ref_lon,
                     _ref_lat=st.session_state.helios_scene_ref_lat,
-                    _min_pts=int(h_min_pts), _speed=float(h_speed), _max_iter=int(h_max_iter),
-                    _pulse=int(h_pulse_freq), _scan_freq=float(h_scan_freq), _scan_angle=float(h_scan_angle),
+                    _min_pts=int(min_points), _speed=float(speed_ms), _max_iter=int(h_max_iter),
+                    _pulse=int(pulse_freq), _scan_freq=float(scan_freq), _scan_angle=float(fov / 2.0),
                     _scanner_ref=scanner_ref_input, _platform_ref=platform_ref_input,
                     _dtm=dtm, _region=_region,
                     _q=_q, _stop_event=_stop_event,
@@ -793,7 +799,7 @@ with st.expander('HELIOS++ LiDAR Validation', expanded=bool(st.session_state.hel
                 if _passed:
                     st.success(
                         f'Density validated after {_iters} iteration(s). '
-                        f'All cells meet the ≥{int(h_min_pts)} pts/m² threshold.'
+                        f'All cells meet the ≥{int(min_points)} pts/m² threshold.'
                     )
                 else:
                     st.warning(
