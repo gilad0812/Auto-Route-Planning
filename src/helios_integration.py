@@ -633,10 +633,14 @@ def verify_point_density(
                     cell is evaluated.
 
     Returns:
-        (passed, failing_cells) where:
+        (passed, failing_cells, stats) where:
           - passed:        True if every populated cell meets the threshold.
           - failing_cells: List of (x_centre, y_centre) in the LAS coordinate
                            system.  Empty when passed=True or the cloud is empty.
+          - stats:         Dict of AOI density statistics over every cell incl.
+                           empty ones — n_cells, n_met, n_under, n_void,
+                           median_density, min_density, cell_size_m (pts/m²).
+                           Empty {} when the cloud is empty.
 
     Raises:
         ImportError:       laspy is not installed.
@@ -661,7 +665,7 @@ def verify_point_density(
             all_files.append(p)
 
     if not all_files:
-        return False, []
+        return False, [], {}
 
     # Pass 1 — global extents from LAS headers (fast, no full data read)
     x_min, x_max = float("inf"), float("-inf")
@@ -678,7 +682,7 @@ def verify_point_density(
                 y_max = max(y_max, float(h.y_max))
 
     if not any_points:
-        return False, []
+        return False, [], {}
 
     nx = max(1, int(math.ceil((x_max - x_min) / cell_size)))
     ny = max(1, int(math.ceil((y_max - y_min) / cell_size)))
@@ -711,7 +715,30 @@ def verify_point_density(
 
     failing_cells: List[Tuple[float, float]] = list(zip(cx.tolist(), cy.tolist()))
 
-    return len(failing_cells) == 0, failing_cells
+    # ── AOI density statistics (coverage %, voids, median/min) ───────────────
+    # Per-cell density in pts/m² over every AOI cell INCLUDING empty ones, so
+    # coverage reflects the whole surveyed area (the pass/fail logic above only
+    # flags populated-but-thin cells; here voids = empty cells are counted too).
+    all_cx = x_min + (np.arange(nx) + 0.5) * cell_size
+    all_cy = y_min + (np.arange(ny) + 0.5) * cell_size
+    gx, gy = np.meshgrid(all_cx, all_cy)
+    if region is not None:
+        in_region = _points_in_polygon(gx.ravel(), gy.ravel(), region).reshape(grid.shape)
+    else:
+        in_region = np.ones_like(grid, dtype=bool)
+    dens = grid[in_region].astype(float) / (cell_size * cell_size)   # pts/m²
+    n_cells = int(dens.size)
+    stats = {
+        "n_cells": n_cells,
+        "n_met":   int((dens >= min_points).sum()),
+        "n_under": int(((dens > 0) & (dens < min_points)).sum()),
+        "n_void":  int((dens <= 0).sum()),
+        "median_density": float(np.median(dens)) if n_cells else 0.0,
+        "min_density":    float(dens.min()) if n_cells else 0.0,
+        "cell_size_m": cell_size,
+    }
+
+    return len(failing_cells) == 0, failing_cells, stats
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1225,9 +1252,11 @@ def run_feedback_loop(
             # Stage 3 — verify density across all per-leg LAS files from every
             # iteration so far (full accumulated point cloud)
             result["las_path"] = list(las_dirs)
-            passed, failing_metric = verify_point_density(las_dirs, min_points, region=region_metric)
+            passed, failing_metric, density_stats = verify_point_density(
+                las_dirs, min_points, region=region_metric)
             result["iterations"] = iteration + 1
             result["passed"] = passed
+            result["density_stats"] = density_stats
             result["failing_cells_geo"] = _cells_to_geo(
                 failing_metric, ref_lon, ref_lat, is_geo
             )

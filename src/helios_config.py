@@ -15,6 +15,10 @@ DEFAULT_DRONE_SPEED_MS: float = 6.0    # UI default for "Drone speed (m/s)"
 
 # ── UAV LiDAR scanner ─────────────────────────────────────────────────────────
 DEFAULT_PULSE_FREQ_HZ: int = 600_000   # UI default for "Pulse frequency (Hz)"
+# Discrete pulse rates the default scanner (riegl_vux_120_23) supports — HELIOS
+# only accepts these, so the UI is restricted to them to keep the density
+# estimate in lockstep with the simulation (an arbitrary value would diverge).
+DEFAULT_PULSE_FREQS_HZ: tuple = (150_000, 300_000, 600_000, 1_200_000, 1_800_000, 2_400_000)
 DEFAULT_SCAN_FREQ_HZ: float = 224.4    # UI default for "Scan frequency (Hz)"
 DEFAULT_SCAN_ANGLE_DEG: float = 50.0   # UI default for "Scan half-angle (°)"
 

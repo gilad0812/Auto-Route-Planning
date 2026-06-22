@@ -206,6 +206,9 @@ def estimate_density_grid(
         "failing_cells_geo": failing_geo,
         "n_fail": len(failing_geo),
         "n_cells": int(inside.sum()),
+        # Voids = AOI cells the scan reaches with ~zero points (occlusion shadows /
+        # coverage gaps) — distinct from merely under-dense cells.
+        "n_void": int((in_vals <= 0.0).sum()),
         "median_density": float(np.median(in_vals)) if in_vals.size else 0.0,
         "min_density": float(in_vals.min()) if in_vals.size else 0.0,
         "cell_size_m": cell,

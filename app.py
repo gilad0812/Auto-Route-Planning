@@ -31,8 +31,8 @@ try:
     from helios_setup import find_helios_binary, download_and_install
     from helios_config import (
         DEFAULT_MIN_POINTS_PER_SQM, DEFAULT_DRONE_SPEED_MS,
-        DEFAULT_PULSE_FREQ_HZ, DEFAULT_SCAN_FREQ_HZ, DEFAULT_SCAN_ANGLE_DEG,
-        DEFAULT_MAX_ITERATIONS, DEFAULT_DTM_MESH_STEP_M,
+        DEFAULT_PULSE_FREQ_HZ, DEFAULT_PULSE_FREQS_HZ, DEFAULT_SCAN_FREQ_HZ,
+        DEFAULT_SCAN_ANGLE_DEG, DEFAULT_MAX_ITERATIONS, DEFAULT_DTM_MESH_STEP_M,
         DEFAULT_SCANNER_REF, DEFAULT_PLATFORM_REF,
     )
     _HELIOS_AVAILABLE = True
@@ -41,6 +41,7 @@ except ImportError:
     DEFAULT_MIN_POINTS_PER_SQM = 100
     DEFAULT_DRONE_SPEED_MS = 6.0
     DEFAULT_PULSE_FREQ_HZ = 600_000
+    DEFAULT_PULSE_FREQS_HZ = (150_000, 300_000, 600_000, 1_200_000, 1_800_000, 2_400_000)
     DEFAULT_SCAN_FREQ_HZ = 224.4
     DEFAULT_SCAN_ANGLE_DEG = 50.0     
     DEFAULT_MAX_ITERATIONS = 1
@@ -209,7 +210,14 @@ with st.sidebar:
                'validation. Scan half-angle = FOV / 2.')
     min_points = st.number_input('Min points / m²',      value=DEFAULT_MIN_POINTS_PER_SQM, min_value=1,   step=5)
     speed_ms   = st.number_input('Drone speed (m/s)',    value=DEFAULT_DRONE_SPEED_MS,     min_value=0.1, step=0.5)
-    pulse_freq = st.number_input('Pulse frequency (Hz)', value=DEFAULT_PULSE_FREQ_HZ,      min_value=1000, step=10000)
+    pulse_freq = st.selectbox(
+        'Pulse frequency (Hz)', options=list(DEFAULT_PULSE_FREQS_HZ),
+        index=(DEFAULT_PULSE_FREQS_HZ.index(DEFAULT_PULSE_FREQ_HZ)
+               if DEFAULT_PULSE_FREQ_HZ in DEFAULT_PULSE_FREQS_HZ else 0),
+        format_func=lambda v: f'{v:,}',
+        help='Limited to the scanner\'s supported pulse rates — HELIOS only '
+             'accepts these, so the estimate stays in lockstep with the sim.',
+    )
     scan_freq  = st.number_input('Scan frequency (Hz)',  value=DEFAULT_SCAN_FREQ_HZ,       min_value=1.0, step=10.0)
     st.divider()
 
@@ -470,14 +478,20 @@ with dens_col:
         if _est.get('error'):
             st.error(_est['error'])
         else:
+            _ncell = max(_est['n_cells'], 1)
+            _cov = 100.0 * (_est['n_cells'] - _est['n_fail']) / _ncell
+            _void = _est.get('n_void', 0)
             if _est['passed']:
                 st.success(f"✓ ≥ {int(min_points)} pts/m² across the AOI")
             else:
                 st.warning(f"{_est['n_fail']} / {_est['n_cells']} cells "
                            f"< {int(min_points)} pts/m² (orange on map)")
+            st.metric('Coverage', f"{_cov:.1f}%")
             st.metric('Median density', f"{_est['median_density']:.0f} pts/m²")
             st.metric('Min density',    f"{_est['min_density']:.0f} pts/m²")
-            st.caption(f"{_est['cell_size_m']:.0f} m cells · geometric estimate "
+            _void_pct = 100.0 * _void / _ncell
+            st.caption(f"Voids (≈0 pts): {_void} cells ({_void_pct:.1f}%)  ·  "
+                       f"{_est['cell_size_m']:.0f} m cells · geometric estimate "
                        "(no vegetation) — confirm with HELIOS++.")
 
 # ------------------------------------------------------------------ capture new drawing
@@ -813,6 +827,16 @@ with st.expander('HELIOS++ LiDAR Validation', expanded=bool(st.session_state.hel
                 res_c2.metric('Failing cells', _n_fail)
                 _extra_wps = len(_res.get('final_route', [])) - len(st.session_state.route or [])
                 res_c3.metric('Supplemental waypoints added', max(0, _extra_wps))
+
+                # ── Coverage / voids summary (HELIOS ground truth) ─────────────
+                _hs = _res.get('density_stats') or {}
+                if _hs.get('n_cells'):
+                    _hcov = 100.0 * _hs['n_met'] / _hs['n_cells']
+                    _hvoid_pct = 100.0 * _hs['n_void'] / _hs['n_cells']
+                    hc1, hc2, hc3 = st.columns(3)
+                    hc1.metric('Coverage', f"{_hcov:.1f}%")
+                    hc2.metric('Median density', f"{_hs['median_density']:.0f} pts/m²")
+                    hc3.metric('Voids', f"{_hs['n_void']} ({_hvoid_pct:.1f}%)")
 
                 if _extra_wps > 0:
                     if st.button('Apply densified route', use_container_width=True):
