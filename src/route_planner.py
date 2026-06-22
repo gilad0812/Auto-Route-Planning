@@ -229,7 +229,7 @@ def plan_route_adaptive(dtm, polygon, distance_above_surface, error_tolerance,
                         scan_half_angle_deg, step,
                         overlap_frac=0.2, is_geo=True, min_spacing_m=2.0,
                         elev_sample_step=None, orientation='auto',
-                        edge_margin_m=None, max_relief_per_line_m=None):
+                        max_relief_per_line_m=None):
     """Plan a lawnmower route with terrain-adaptive pass spacing AND orientation.
 
     Three terrain/density adaptations:
@@ -254,15 +254,10 @@ def plan_route_adaptive(dtm, polygon, distance_above_surface, error_tolerance,
        spacing <= (half_swath_cur + half_swath_next) * (1 - overlap_frac),
        evaluated at the highest terrain in the strip, iterated to a fixed point.
 
-    3. Edge margin — to make the FIRST HELIOS run pass density validation at the
-       perimeter (avoiding an expensive second simulation). `edge_margin_m` runs
-       the lawnmower this far OUTSIDE the AOI, so the outermost/end-of-pass swaths
-       put their dense nadir over the AOI rim instead of only a thin grazing-angle
-       tail. Implemented by buffering the survey polygon in the rotated frame.
-       Default = ~1.15 pass spacings: just enough to guarantee a full extra pass
-       lands beyond every parallel edge (two-sided overlap for the rim) without
-       wasted flight. (To raise density everywhere, increase `overlap_frac` —
-       spacing scales with 1 − overlap, so overlap is the single density knob.)
+    The lawnmower runs to the AOI boundary only (no margin outside it): rim
+    density is the operator's responsibility, handled by drawing the survey
+    polygon slightly larger than the ROI — so flying passes beyond the boundary
+    would just double-pay for margin and lengthen the route.
 
     Implementation: everything runs in a local metric frame rotated so passes are
     horizontal; terrain is sampled by mapping back to the DTM CRS, and waypoints
@@ -274,12 +269,6 @@ def plan_route_adaptive(dtm, polygon, distance_above_surface, error_tolerance,
     tan_t = math.tan(math.radians(scan_half_angle_deg))
     half_swath_m = agl * tan_t
     base_spacing_m = 2.0 * half_swath_m * (1.0 - overlap_frac)
-    if edge_margin_m is None:
-        # Slightly more than one pass spacing: guarantees a full extra pass lands
-        # BEYOND each parallel (top/bottom) AOI edge — giving the rim two-sided
-        # overlap — rather than the margin falling inside a single pass gap and
-        # adding nothing across. (The along-pass extension this also buys is cheap.)
-        edge_margin_m = 1.01 * base_spacing_m
 
     # Local metric frame centred on the polygon.
     c = polygon.centroid
@@ -315,9 +304,9 @@ def plan_route_adaptive(dtm, polygon, distance_above_surface, error_tolerance,
     poly_uv = Polygon([g2uv(px, py) for px, py in polygon.exterior.coords])
     if not poly_uv.is_valid:
         poly_uv = poly_uv.buffer(0)
-    # Coverage polygon: the AOI grown by the edge margin so passes run past the
-    # rim. Sampling against this puts the dense swath centre over the AOI edge.
-    poly_cov = poly_uv.buffer(edge_margin_m) if edge_margin_m > 0 else poly_uv
+    # Coverage polygon: the AOI itself (passes stop at the boundary; rim margin is
+    # handled by the operator over-drawing the survey polygon, not by flying past it).
+    poly_cov = poly_uv
 
     # step / elev_sample_step arrive in map units; convert to metres for the frame.
     to_m = lat_m if is_geo else 1.0
