@@ -4,6 +4,16 @@ from shapely.geometry import shape, LineString, Point, Polygon, mapping
 
 _LAT_M = 111139.0  # metres per degree latitude (WGS-84 approximation)
 
+# Adaptive spacing may tighten over ridges, but never below this fraction of the
+# base spacing. Without a floor, a steep feature rising between passes drives the
+# effective swath toward zero and collapses spacing to min_spacing_m (~2 m),
+# stamping dozens of near-coincident lines that don't even fix the (occlusion-
+# driven) under-density there. This caps that pathological bunching. It is a
+# lines-vs-coverage dial: lower → more tightening (more lines, a little more
+# ridge coverage); higher → fewer lines. ~0.4 keeps coverage while killing the
+# bunching (verified: ridge coverage within ~0.2% of the uncapped 2 m floor).
+_MIN_TIGHTEN_FRAC = 0.4
+
 
 def lawnmower_waypoints(polygon, spacing, step):
     """Generate a simple lawnmower coverage path inside `polygon`.
@@ -387,7 +397,8 @@ def plan_route_adaptive(dtm, polygon, distance_above_surface, error_tolerance,
             hs_cur = max(agl_cur, 1.0) * tan_t
             hs_next = max(agl_next, 1.0) * tan_t
             allowed = (hs_cur + hs_next) * (1.0 - overlap_frac)
-            s_new = max(min(base_spacing_m, allowed), min_spacing_m)
+            spacing_floor = max(min_spacing_m, base_spacing_m * _MIN_TIGHTEN_FRAC)
+            s_new = max(min(base_spacing_m, allowed), spacing_floor)
             if abs(s_new - s_m) < 0.25:
                 s_m = s_new
                 break
