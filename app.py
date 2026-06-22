@@ -45,8 +45,8 @@ except ImportError:
     DEFAULT_SCAN_ANGLE_DEG = 50.0     
     DEFAULT_MAX_ITERATIONS = 1
     DEFAULT_DTM_MESH_STEP_M = 3.0
-    DEFAULT_SCANNER_REF = "data/scanners/als.xml#als_default"
-    DEFAULT_PLATFORM_REF = "data/platforms.xml#linearpath"
+    DEFAULT_SCANNER_REF = "data/scanners_als.xml#riegl_vux_120_23"
+    DEFAULT_PLATFORM_REF = "data/platforms.xml#copter_linearpath"
 
 st.set_page_config(page_title='LiDAR Drone Route Planner', layout='wide')
 
