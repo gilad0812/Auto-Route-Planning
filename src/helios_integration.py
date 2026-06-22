@@ -7,9 +7,8 @@ Stage 1 │ export_trajectory   – route → trajectory .txt (timestamp x y z h
 Stage 2 │ run_helios           – survey .xml → HELIOS++ subprocess → .las output
 Stage 3 │ verify_point_density – .las → 1×1 m density grid → pass/fail + cells
 ────────────────────────────────────────────────────────────────────────────
-Orchestrator: run_feedback_loop chains all three stages and re-runs with
-supplemental lawnmower passes injected over under-density zones until either
-all cells pass or MAX_ITERATIONS is reached.
+Orchestrator: run_feedback_loop chains all three stages in a single simulation
+pass and reports whether point density meets the threshold across the AOI.
 """
 
 from __future__ import annotations
@@ -701,7 +700,15 @@ def verify_point_density(
             np.add.at(grid, (yi, xi), 1)
         del xs, ys
 
-    fail_mask = (grid > 0) & (grid < min_points)
+    # With an AOI polygon, count EVERY in-region cell below the threshold —
+    # including empty ones (occlusion voids are real coverage gaps); the polygon
+    # mask below excludes the rectangular grid's empty margin. Without a polygon
+    # we can't tell "outside the survey" from "void inside it", so we fall back to
+    # only judging populated cells (grid > 0) to avoid flagging the empty margin.
+    if region is not None:
+        fail_mask = (grid < min_points)
+    else:
+        fail_mask = (grid > 0) & (grid < min_points)
     rows, cols = np.where(fail_mask)
 
     cx = x_min + (cols + 0.5) * cell_size
@@ -742,338 +749,6 @@ def verify_point_density(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Route densification helper
-# ─────────────────────────────────────────────────────────────────────────────
-
-_MIN_SUPPLEMENTAL_WPS = 20      # floor for tiny surveys, so a handful of legs still gets some refinement
-_SUPPLEMENTAL_WPS_RATIO = 1.0   # per-iteration cap = max(_MIN_SUPPLEMENTAL_WPS, ratio * len(original route))
-_CLUSTER_MERGE_RADIUS_M = 10.0  # failing cells within this distance are grouped into one local pass
-
-
-def _cluster_cells(
-    cells: List[Tuple[float, float]],
-    cell_size: float,
-    merge_radius_m: float,
-) -> List[List[Tuple[float, float]]]:
-    """
-    Group failing cells into spatial clusters via grid-based connected components.
-
-    Cells within merge_radius_m (Chebyshev distance) of each other end up in the
-    same cluster, so isolated patches of under-density cells each get their own
-    small local supplemental pass instead of one pass spanning the whole survey.
-    """
-    if not cells:
-        return []
-
-    r = max(1, int(math.ceil(merge_radius_m / cell_size)))
-    grid_to_cell = {
-        (round(x / cell_size), round(y / cell_size)): (x, y)
-        for x, y in cells
-    }
-    remaining = set(grid_to_cell.keys())
-    clusters: List[List[Tuple[float, float]]] = []
-
-    while remaining:
-        seed = next(iter(remaining))
-        remaining.discard(seed)
-        stack = [seed]
-        component = [seed]
-        while stack:
-            gx, gy = stack.pop()
-            for dx in range(-r, r + 1):
-                for dy in range(-r, r + 1):
-                    neighbor = (gx + dx, gy + dy)
-                    if neighbor in remaining:
-                        remaining.discard(neighbor)
-                        stack.append(neighbor)
-                        component.append(neighbor)
-        clusters.append([grid_to_cell[g] for g in component])
-
-    return clusters
-
-
-def _boustrophedon(
-    x_min: float, x_max: float, y_min: float, y_max: float,
-    target_z: float, altitude_m: float, spacing_m: float, step_m: float,
-    dtm: Optional[object] = None,
-    is_geo: bool = True,
-    ref_lon: float = 0.0,
-    ref_lat: float = 0.0,
-) -> List[Dict]:
-    """
-    Generate a lawnmower grid of waypoints over [x_min,x_max] x [y_min,y_max].
-
-    For valid LiDAR strip registration each pass must hold a single, constant
-    altitude along its full length. When `dtm` is supplied, each pass's
-    altitude is set to (max terrain elevation under that pass) + altitude_m;
-    otherwise every pass falls back to the single `target_z`.
-    """
-    waypoints: List[Dict] = []
-    y = y_min
-    flip = False
-
-    while y <= y_max:
-        x_start = x_min if not flip else x_max
-        x_end   = x_max if not flip else x_min
-        dist = abs(x_end - x_start)
-        n_steps = max(1, int(math.ceil(dist / step_m)))
-        sign = 1 if x_end > x_start else -1
-
-        row_z = target_z
-        if dtm is not None:
-            elevs = []
-            for i in range(n_steps + 1):
-                x = x_start + sign * i * step_m
-                if is_geo:
-                    gx, gy = _cells_to_geo([(x, y)], ref_lon, ref_lat, True)[0]
-                else:
-                    gx, gy = x, y
-                e = dtm.elevation_at(gx, gy)
-                if not math.isnan(e):
-                    elevs.append(e)
-            if elevs:
-                row_z = max(elevs) + altitude_m
-
-        for i in range(n_steps + 1):
-            x = x_start + sign * i * step_m
-            waypoints.append({
-                "x": x, "y": y, "z": row_z,
-                "target_distance": altitude_m, "error_tol": 2.0,
-            })
-
-        y += spacing_m
-        flip = not flip
-
-    return waypoints
-
-
-def _group_passes(metric_route: List[Dict]) -> List[Dict]:
-    """Group consecutive waypoints into passes.
-
-    Uses the planner's `pass_id` tag when present; falls back to splitting on
-    y-jumps > 0.5 m for routes produced before the tag existed. Returns dicts
-    with route indices (start/end half-open), mean y, altitude z, x extent and
-    flight direction (+1 → x increasing, -1 → decreasing).
-    """
-    passes: List[Dict] = []
-    for idx, wp in enumerate(metric_route):
-        pid = wp.get("pass_id")
-        x, y = float(wp["x"]), float(wp["y"])
-        start_new = True
-        if passes:
-            prev = passes[-1]
-            if pid is not None and prev["pid"] is not None:
-                start_new = pid != prev["pid"]
-            else:
-                start_new = abs(y - prev["y_sum"] / prev["n"]) > 0.5
-        if start_new:
-            passes.append({
-                "pid": pid, "start": idx, "end": idx + 1, "y_sum": y, "n": 1,
-                "x_min": x, "x_max": x, "x_first": x, "x_last": x,
-                "z": float(wp["z"]),
-            })
-        else:
-            p = passes[-1]
-            p["end"] = idx + 1
-            p["y_sum"] += y
-            p["n"] += 1
-            p["x_min"] = min(p["x_min"], x)
-            p["x_max"] = max(p["x_max"], x)
-            p["x_last"] = x
-    for p in passes:
-        p["y"] = p["y_sum"] / p["n"]
-        p["dir"] = 1 if p["x_last"] >= p["x_first"] else -1
-    return passes
-
-
-def _line_altitude_m(
-    x_min: float, x_max: float, y: float,
-    altitude_m: float, fallback_z: float,
-    dtm: Optional[object], is_geo: bool, ref_lon: float, ref_lat: float,
-    sample_step_m: float = 5.0,
-) -> float:
-    """Constant altitude for a pass line: (max terrain elevation under the
-    line) + altitude_m, matching plan_route()'s per-line rule. Falls back to
-    fallback_z when no DTM or no valid samples."""
-    if dtm is None:
-        return fallback_z
-    n = max(1, int(math.ceil((x_max - x_min) / sample_step_m)))
-    elevs = []
-    for i in range(n + 1):
-        x = x_min + (x_max - x_min) * i / n
-        gx, gy = _cells_to_geo([(x, y)], ref_lon, ref_lat, is_geo)[0]
-        e = dtm.elevation_at(gx, gy)
-        if not math.isnan(e):
-            elevs.append(e)
-    return (max(elevs) + altitude_m) if elevs else fallback_z
-
-
-def _parallel_fill_passes(
-    failing_cells_metric: List[Tuple[float, float]],
-    metric_route: List[Dict],
-    terrain_z_m: float,
-    altitude_m: float,
-    max_wps: int,
-    step_m: float = 3.0,
-    margin_m: float = 5.0,
-    cell_size: float = CELL_SIZE_M,
-    dtm: Optional[object] = None,
-    is_geo: bool = True,
-    ref_lon: float = 0.0,
-    ref_lat: float = 0.0,
-) -> Tuple[List[Tuple[int, List[Dict]]], List[Tuple[float, float]]]:
-    """Generate single parallel fill passes spliced between existing passes.
-
-    For each cluster of failing cells that lies between two adjacent survey
-    passes, one extra pass — parallel to its neighbours, at the gap midpoint,
-    spanning the cluster's x extent plus a margin — is generated. The result
-    stays a coherent serpentine survey (uniform strip pattern, no crossing
-    patch grids), which keeps strip registration and density preprocessing
-    simple downstream.
-
-    Returns (inserts, leftover_cells):
-      inserts        – list of (route_insert_index, waypoints) where the index
-                       refers to positions in `metric_route` BEFORE any
-                       insertion (caller must apply in descending order).
-      leftover_cells – failing cells with no flanking pass pair (survey edges,
-                       clusters outside the pass band); the caller should fall
-                       back to _supplemental_passes for these.
-    """
-    if not failing_cells_metric:
-        return [], []
-
-    merge_radius = _CLUSTER_MERGE_RADIUS_M
-    clusters = _cluster_cells(failing_cells_metric, cell_size, merge_radius)
-    while len(clusters) * 2 > max_wps and merge_radius < 500.0:
-        merge_radius *= 2.0
-        clusters = _cluster_cells(failing_cells_metric, cell_size, merge_radius)
-
-    passes = [p for p in _group_passes(metric_route) if not math.isnan(p["z"])]
-    by_y = sorted(passes, key=lambda p: p["y"])
-
-    inserts: List[Tuple[int, List[Dict]]] = []
-    leftover: List[Tuple[float, float]] = []
-    budget = max_wps
-
-    for cluster in clusters:
-        xs, ys = zip(*cluster)
-        y_c = sum(ys) / len(ys)
-        below = [p for p in by_y if p["y"] <= y_c]
-        above = [p for p in by_y if p["y"] > y_c]
-        if not below or not above:
-            leftover.extend(cluster)
-            continue
-        p_lo, p_hi = below[-1], above[0]
-
-        y_new = 0.5 * (p_lo["y"] + p_hi["y"])
-        x_min = min(xs) - margin_m
-        x_max = max(xs) + margin_m
-        n = max(1, int(math.ceil((x_max - x_min) / step_m)))
-        if n + 1 > budget:
-            step_scaled = (x_max - x_min) / max(budget - 1, 1)
-            n = max(1, int(math.ceil((x_max - x_min) / step_scaled)))
-        if n + 1 > budget:
-            leftover.extend(cluster)
-            continue
-        budget -= n + 1
-
-        anchor = p_lo if p_lo["start"] < p_hi["start"] else p_hi
-        z = _line_altitude_m(x_min, x_max, y_new, altitude_m,
-                             terrain_z_m + altitude_m, dtm, is_geo, ref_lon, ref_lat)
-
-        direction = -anchor["dir"]
-        xs_line = [x_min + (x_max - x_min) * i / n for i in range(n + 1)]
-        if direction < 0:
-            xs_line.reverse()
-        wps = [{
-            "x": x, "y": y_new, "z": z,
-            "target_distance": altitude_m, "error_tol": 2.0,
-            "pass_id": f"fill_{len(inserts)}_{y_new:.1f}",
-        } for x in xs_line]
-        inserts.append((anchor["end"], wps))
-
-    return inserts, leftover
-
-
-def _supplemental_passes(
-    failing_cells_metric: List[Tuple[float, float]],
-    terrain_z_m: float,
-    altitude_m: float,
-    max_wps: int,
-    spacing_m: float = 3.0,
-    step_m: float = 3.0,
-    cell_size: float = CELL_SIZE_M,
-    dtm: Optional[object] = None,
-    is_geo: bool = True,
-    ref_lon: float = 0.0,
-    ref_lat: float = 0.0,
-) -> List[Dict]:
-    """
-    Generate a boustrophedon grid over each spatial cluster of under-density cells.
-
-    Returns waypoints in the same metric coordinate system as the input cells.
-    The caller is responsible for converting back to the original CRS if needed.
-
-    Failing cells are first grouped into clusters (see _cluster_cells) so that
-    isolated gaps each get a small, tightly-spaced local pass at full quality
-    instead of one giant pass over the bounding box of the whole survey.
-    Spacing is only scaled up — uniformly across all clusters — if the combined
-    waypoint count would exceed max_wps.
-
-    max_wps: Per-iteration waypoint budget. The caller scales this with the size
-             of the original survey so a tiny survey doesn't get swamped by a
-             huge supplemental pass, and a large survey isn't over-restricted.
-
-    dtm/is_geo/ref_lon/ref_lat: When `dtm` is given, each generated pass holds
-    a constant altitude derived from the terrain under that specific pass
-    (max elevation + altitude_m), matching plan_route()'s per-line altitude
-    rule. Without a DTM, every pass falls back to the single
-    terrain_z_m + altitude_m estimate.
-    """
-    if not failing_cells_metric:
-        return []
-
-    target_z = terrain_z_m + altitude_m
-
-    # Each cluster contributes a minimum of ~2 waypoints (one short pass line)
-    # no matter how much spacing is scaled up, so too many tiny clusters can
-    # blow the budget on their own. Grow the merge radius until the cluster
-    # count itself fits, before considering spacing scale-down.
-    merge_radius = _CLUSTER_MERGE_RADIUS_M
-    clusters = _cluster_cells(failing_cells_metric, cell_size, merge_radius)
-    while len(clusters) * 2 > max_wps and merge_radius < 500.0:
-        merge_radius *= 2.0
-        clusters = _cluster_cells(failing_cells_metric, cell_size, merge_radius)
-
-    bboxes: List[Tuple[float, float, float, float]] = []
-    total_estimated = 0
-    for cluster in clusters:
-        xs, ys = zip(*cluster)
-        x_min, x_max = min(xs) - 2.0, max(xs) + 2.0
-        y_min, y_max = min(ys) - 2.0, max(ys) + 2.0
-        bboxes.append((x_min, x_max, y_min, y_max))
-        span_x = max(x_max - x_min, step_m)
-        span_y = max(y_max - y_min, spacing_m)
-        total_estimated += (math.ceil(span_x / step_m) + 1) * (math.ceil(span_y / spacing_m) + 1)
-
-    # Scale up spacing — uniformly across all clusters — only if the combined
-    # waypoint count would exceed the budget.
-    scale = 1.0
-    if total_estimated > max_wps:
-        scale = math.sqrt(total_estimated / max_wps)
-
-    waypoints: List[Dict] = []
-    for x_min, x_max, y_min, y_max in bboxes:
-        waypoints.extend(_boustrophedon(
-            x_min, x_max, y_min, y_max, target_z, altitude_m,
-            spacing_m=spacing_m * scale, step_m=step_m * scale,
-            dtm=dtm, is_geo=is_geo, ref_lon=ref_lon, ref_lat=ref_lat,
-        ))
-
-    return waypoints
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Feedback Loop Orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1088,7 +763,6 @@ def run_feedback_loop(
     altitude_m: float = 80.0,
     min_points: int = MIN_POINTS_PER_SQM,
     speed_ms: float = DRONE_SPEED_MS,
-    max_iterations: int = MAX_ITERATIONS,
     pulse_freq_hz: int = PULSE_FREQ_HZ,
     scan_freq_hz: float = SCAN_FREQ_HZ,
     scan_angle_deg: float = SCAN_ANGLE_DEG,
@@ -1100,12 +774,11 @@ def run_feedback_loop(
     stop_event: Optional["threading.Event"] = None,
 ) -> Dict:
     """
-    Full HELIOS++ validation pipeline with automatic density refinement.
+    HELIOS++ validation pipeline — a single simulation pass (no refinement).
 
-    Runs: export_trajectory → build_survey_xml → run_helios → verify_point_density.
-    On failure, supplemental lawnmower passes are injected over low-density zones
-    and the simulation repeats (up to max_iterations).  The pathfinding algorithm
-    is never touched — all adjustments are additive passes appended to the route.
+    Runs: export_trajectory → build_survey_xml → run_helios → verify_point_density,
+    and reports whether the route's point density meets the threshold across the
+    AOI. The route is never modified.
 
     Args:
         route:          Waypoints from plan_route() in the DTM's CRS.
@@ -1115,15 +788,13 @@ def run_feedback_loop(
         is_geo:         True when route x=longitude, y=latitude (degrees).
         ref_lon:        Projection-origin longitude. MUST equal the ref_lon
                         passed to dtm_to_obj() when the terrain OBJ was built —
-                        a mismatch silently shifts the mesh away from the
-                        flight path, producing an empty point cloud. When
-                        omitted, the route's centroid is used (and reused for
-                        every refinement iteration).
+                        a mismatch silently shifts the mesh away from the flight
+                        path, producing an empty point cloud. When omitted, the
+                        route's centroid is used.
         ref_lat:        Projection-origin latitude — see ref_lon.
-        altitude_m:     AGL altitude used for supplemental passes.
+        altitude_m:     AGL altitude (recorded for reference).
         min_points:     Minimum points/m² threshold.
         speed_ms:       Drone speed (m/s).
-        max_iterations: Maximum simulation-refine cycles.
         pulse_freq_hz:  LiDAR pulse repetition frequency (Hz).
         scan_freq_hz:   Scanner rotation frequency (Hz).
         scan_angle_deg: Half-FOV from nadir (degrees).
@@ -1132,24 +803,18 @@ def run_feedback_loop(
         region_polygon: Optional survey-polygon vertices [(x, y), ...] in the
                         same CRS as `route`. The density check is restricted to
                         cells inside it, so swath overhang scanned beyond the
-                        polygon doesn't count as a failure or trigger refinement.
-        dtm:            Optional DTM (with .elevation_at(x, y)) in the same CRS
-                         as `route`. When given, supplemental passes each hold
-                         a constant altitude derived from the terrain under
-                         that pass (max elevation + altitude_m), matching
-                         plan_route()'s per-line altitude rule. Without a DTM,
-                         supplemental passes fall back to a single altitude
-                         estimate for the whole iteration.
+                        polygon doesn't count as a failure.
+        dtm:            Unused (kept for call-site compatibility).
 
     Returns:
         {
             "passed":            bool,
-            "iterations":        int,
+            "iterations":        int,   # always 1
             "trajectory_path":   str,
             "survey_xml_path":   str,
-            "las_path":          List[str],   # one per-iteration LAS output dir
+            "las_path":          List[str],
             "failing_cells_geo": List[Tuple[float, float]],  # original CRS
-            "final_route":       List[Dict],    # original + any supplemental wps
+            "density_stats":     dict,
             "error":             str | None,
         }
     """
@@ -1163,182 +828,75 @@ def run_feedback_loop(
         "survey_xml_path": None,
         "las_path": [],
         "failing_cells_geo": [],
-        "final_route": list(route),
+        "density_stats": {},
         "error": None,
     }
 
-    current_route = list(route)
-
     # Survey polygon in metric coords, derived once the projection origin is
-    # known (first iteration). Restricts the density check to the area of
-    # interest so swath overhang beyond the polygon isn't refined.
+    # known. Restricts the density check to the area of interest so swath
+    # overhang beyond the polygon doesn't count as a failure.
     region_metric: Optional[List[Tuple[float, float]]] = None
-
-    # Per-iteration supplemental waypoint budget, scaled to the size of the
-    # ORIGINAL survey (computed once, so it doesn't grow as supplemental
-    # passes accumulate into current_route across iterations).
-    supplemental_cap = max(_MIN_SUPPLEMENTAL_WPS, int(len(route) * _SUPPLEMENTAL_WPS_RATIO))
-
-    # Incremental simulation: iteration 0 simulates the full route, but every
-    # later iteration simulates ONLY the newly-added supplemental waypoints
-    # (already-validated legs are never re-flown/re-traced). The per-iteration
-    # LAS outputs are merged for the density check so the grid still reflects
-    # the full accumulated point cloud.
-    sim_metric_route: Optional[List[Dict]] = None
-    las_dirs: List[str] = []
 
     try:
         scene_xml = work_dir / "scene.xml"
         _write_scene_xml(scene_obj_path, str(scene_xml))
 
-        for iteration in range(max_iterations):
-            if stop_event is not None and stop_event.is_set():
-                result["error"] = "Cancelled by user"
-                break
+        if stop_event is not None and stop_event.is_set():
+            result["error"] = "Cancelled by user"
+            return result
 
-            iter_dir = work_dir / f"iter_{iteration}"
-            iter_dir.mkdir(exist_ok=True)
+        # Stage 1 — export trajectory (geographic → metric internally)
+        traj_path = work_dir / "trajectory.txt"
+        export_trajectory(route, str(traj_path), speed_ms, is_geo)
+        result["trajectory_path"] = str(traj_path)
 
-            # Stage 1 — export trajectory of the full accumulated route so far
-            # (geographic → metric internally)
-            traj_path = iter_dir / "trajectory.txt"
-            export_trajectory(current_route, str(traj_path), speed_ms, is_geo)
-            result["trajectory_path"] = str(traj_path)
+        # Route → metric for the survey XML. The projection origin MUST match the
+        # terrain OBJ's origin (see _route_to_metric) or the mesh and flight legs
+        # drift apart and HELIOS records zero points.
+        metric_route, ref_lon, ref_lat = _route_to_metric(route, is_geo, ref_lon, ref_lat)
 
-            # Convert route to metric coordinates for the survey XML
-            # Reuse the same projection origin across all refinement iterations
-            # (and require it to match the terrain OBJ's origin — see docstring
-            # of _route_to_metric) so the mesh and the flight legs never drift
-            # apart from one run to the next.
-            metric_route, ref_lon, ref_lat = _route_to_metric(current_route, is_geo, ref_lon, ref_lat)
-
-            # Project the survey polygon into the same metric frame once.
-            if region_polygon is not None and region_metric is None:
-                if is_geo:
-                    lon_m = _LAT_M * math.cos(math.radians(ref_lat))
-                    region_metric = [
-                        ((lx - ref_lon) * lon_m, (ly - ref_lat) * _LAT_M)
-                        for lx, ly in region_polygon
-                    ]
-                else:
-                    region_metric = list(region_polygon)
-
-            # Iteration 0 simulates the full route; later iterations simulate
-            # only the supplemental waypoints added by the previous iteration.
-            survey_metric_route = metric_route if sim_metric_route is None else sim_metric_route
-
-            # Stage 2 — build survey XML and run HELIOS++
-            survey_xml = iter_dir / "survey.xml"
-            build_survey_xml(
-                metric_route=survey_metric_route,
-                scene_xml_path=str(scene_xml),
-                output_xml_path=str(survey_xml),
-                speed_ms=speed_ms,
-                pulse_freq_hz=pulse_freq_hz,
-                scan_freq_hz=scan_freq_hz,
-                scan_angle_deg=scan_angle_deg,
-                scanner_ref=scanner_ref,
-                platform_ref=platform_ref,
-            )
-            result["survey_xml_path"] = str(survey_xml)
-
-            las_output_dir = iter_dir / "output"
-            las_output_dir.mkdir(exist_ok=True)
-            las_dir = run_helios(
-                helios_bin, str(survey_xml), str(las_output_dir), log=log, stop_event=stop_event
-            )
-            las_dirs.append(str(las_dir))
-
-            # Stage 3 — verify density across all per-leg LAS files from every
-            # iteration so far (full accumulated point cloud)
-            result["las_path"] = list(las_dirs)
-            passed, failing_metric, density_stats = verify_point_density(
-                las_dirs, min_points, region=region_metric)
-            result["iterations"] = iteration + 1
-            result["passed"] = passed
-            result["density_stats"] = density_stats
-            result["failing_cells_geo"] = _cells_to_geo(
-                failing_metric, ref_lon, ref_lat, is_geo
-            )
-
-            if passed:
-                break
-
-            # Refinement — splice single parallel fill passes into the gaps
-            # between existing passes (keeps the route a coherent serpentine
-            # survey); fall back to local patch grids only for clusters with
-            # no flanking pass pair (survey edges).
-            if iteration < max_iterations - 1 and failing_metric:
-                valid_zs = [float(wp["z"]) for wp in survey_metric_route
-                            if not math.isnan(float(wp["z"]))]
-                avg_z = float(np.mean(valid_zs)) if valid_zs else altitude_m
-                terrain_z = avg_z - altitude_m
-
-                inserts, leftover_cells = _parallel_fill_passes(
-                    failing_cells_metric=failing_metric,
-                    metric_route=metric_route,
-                    terrain_z_m=terrain_z,
-                    altitude_m=altitude_m,
-                    max_wps=supplemental_cap,
-                    step_m=3.0,
-                    dtm=dtm,
-                    is_geo=is_geo,
-                    ref_lon=ref_lon,
-                    ref_lat=ref_lat,
-                )
-                spliced_wps = [wp for _, wps in inserts for wp in wps]
-
-                grid_extra: List[Dict] = []
-                remaining_budget = supplemental_cap - len(spliced_wps)
-                if leftover_cells and remaining_budget >= 10:
-                    grid_extra = _supplemental_passes(
-                        failing_cells_metric=leftover_cells,
-                        terrain_z_m=terrain_z,
-                        altitude_m=altitude_m,
-                        max_wps=remaining_budget,
-                        spacing_m=3.0,
-                        step_m=3.0,
-                        dtm=dtm,
-                        is_geo=is_geo,
-                        ref_lon=ref_lon,
-                        ref_lat=ref_lat,
-                    )
-
-                extra_metric = spliced_wps + grid_extra
-                if not extra_metric:
-                    # No further targeted passes can be generated — stop here
-                    # rather than re-simulating nothing next iteration.
-                    break
-
-                sim_metric_route = extra_metric
-
+        # Project the survey polygon into the same metric frame.
+        if region_polygon is not None:
+            if is_geo:
                 lon_m = _LAT_M * math.cos(math.radians(ref_lat))
+                region_metric = [
+                    ((lx - ref_lon) * lon_m, (ly - ref_lat) * _LAT_M)
+                    for lx, ly in region_polygon
+                ]
+            else:
+                region_metric = list(region_polygon)
 
-                def _to_route_crs(wps: List[Dict]) -> List[Dict]:
-                    if not is_geo:
-                        return [dict(wp) for wp in wps]
-                    return [{
-                        **wp,
-                        "x": ref_lon + wp["x"] / lon_m,
-                        "y": ref_lat + wp["y"] / _LAT_M,
-                    } for wp in wps]
+        # Stage 2 — build survey XML and run HELIOS++
+        survey_xml = work_dir / "survey.xml"
+        build_survey_xml(
+            metric_route=metric_route,
+            scene_xml_path=str(scene_xml),
+            output_xml_path=str(survey_xml),
+            speed_ms=speed_ms,
+            pulse_freq_hz=pulse_freq_hz,
+            scan_freq_hz=scan_freq_hz,
+            scan_angle_deg=scan_angle_deg,
+            scanner_ref=scanner_ref,
+            platform_ref=platform_ref,
+        )
+        result["survey_xml_path"] = str(survey_xml)
 
-                # metric_route is index-aligned with current_route, so insert
-                # positions computed on it apply directly — applying them in
-                # descending order keeps earlier positions valid.
-                for pos, wps in sorted(inserts, key=lambda t: t[0], reverse=True):
-                    current_route[pos:pos] = _to_route_crs(wps)
-                if grid_extra:
-                    current_route = current_route + _to_route_crs(grid_extra)
+        las_output_dir = work_dir / "output"
+        las_output_dir.mkdir(exist_ok=True)
+        las_dir = run_helios(
+            helios_bin, str(survey_xml), str(las_output_dir), log=log, stop_event=stop_event
+        )
+        result["las_path"] = [str(las_dir)]
 
-                if log:
-                    msg = (f"Refinement: spliced {len(inserts)} parallel fill "
-                           f"pass(es), {len(spliced_wps)} waypoints")
-                    if grid_extra:
-                        msg += f"; {len(grid_extra)} patch-grid waypoints appended"
-                    log(msg)
-
-        result["final_route"] = current_route
+        # Stage 3 — verify density inside the AOI
+        passed, failing_metric, density_stats = verify_point_density(
+            [str(las_dir)], min_points, region=region_metric)
+        result["iterations"] = 1
+        result["passed"] = passed
+        result["density_stats"] = density_stats
+        result["failing_cells_geo"] = _cells_to_geo(
+            failing_metric, ref_lon, ref_lat, is_geo
+        )
 
     except SimulationCancelled:
         result["error"] = "Cancelled by user"

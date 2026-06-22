@@ -611,15 +611,11 @@ with st.expander('HELIOS++ LiDAR Validation', expanded=bool(st.session_state.hel
         scanner_ref_input  = path_c1.text_input('Scanner XML ref',  value=DEFAULT_SCANNER_REF,  key='_hscan')
         platform_ref_input = path_c2.text_input('Platform XML ref', value=DEFAULT_PLATFORM_REF, key='_hplat')
 
-        # ── Refinement ────────────────────────────────────────────────────────
         # Density & scanner params (min points, speed, pulse/scan freq, and scan
         # half-angle = FOV/2) come from the sidebar — shared with the on-compute
         # estimate so validation matches what the route was planned/estimated for.
-        st.markdown('**Refinement**')
-        h_max_iter = st.number_input('Max refinement cycles', value=DEFAULT_MAX_ITERATIONS,
-                                     min_value=1, max_value=10)
         st.caption(
-            f'Density {int(min_points)} pts/m² · speed {speed_ms:.1f} m/s · '
+            f'Validation uses: density {int(min_points)} pts/m² · speed {speed_ms:.1f} m/s · '
             f'pulse {int(pulse_freq)} Hz · scan {scan_freq:.0f} Hz · '
             f'half-angle {fov / 2:.0f}° — set in the sidebar.'
         )
@@ -711,7 +707,7 @@ with st.expander('HELIOS++ LiDAR Validation', expanded=bool(st.session_state.hel
                     _work=_work, _is_geo=is_geo, _alt=altitude,
                     _ref_lon=st.session_state.helios_scene_ref_lon,
                     _ref_lat=st.session_state.helios_scene_ref_lat,
-                    _min_pts=int(min_points), _speed=float(speed_ms), _max_iter=int(h_max_iter),
+                    _min_pts=int(min_points), _speed=float(speed_ms),
                     _pulse=int(pulse_freq), _scan_freq=float(scan_freq), _scan_angle=float(fov / 2.0),
                     _scanner_ref=scanner_ref_input, _platform_ref=platform_ref_input,
                     _dtm=dtm, _region=_region,
@@ -729,7 +725,6 @@ with st.expander('HELIOS++ LiDAR Validation', expanded=bool(st.session_state.hel
                             altitude_m=_alt,
                             min_points=_min_pts,
                             speed_ms=_speed,
-                            max_iterations=_max_iter,
                             pulse_freq_hz=_pulse,
                             scan_freq_hz=_scan_freq,
                             scan_angle_deg=_scan_angle,
@@ -807,26 +802,18 @@ with st.expander('HELIOS++ LiDAR Validation', expanded=bool(st.session_state.hel
                 st.error(f"Simulation error: {_res['error']}")
             else:
                 _passed = _res['passed']
-                _iters  = _res['iterations']
                 _n_fail = len(_res.get('failing_cells_geo', []))
 
                 if _passed:
                     st.success(
-                        f'Density validated after {_iters} iteration(s). '
-                        f'All cells meet the ≥{int(min_points)} pts/m² threshold.'
+                        f'Density validated. '
+                        f'All AOI cells meet the ≥{int(min_points)} pts/m² threshold.'
                     )
                 else:
                     st.warning(
-                        f'Density validation failed after {_iters} iteration(s). '
-                        f'{_n_fail} under-density cell(s) remain '
+                        f'Density validation failed: {_n_fail} under-density cell(s) '
                         f'(shown as red circles on the map).'
                     )
-
-                res_c1, res_c2, res_c3 = st.columns(3)
-                res_c1.metric('Iterations', _iters)
-                res_c2.metric('Failing cells', _n_fail)
-                _extra_wps = len(_res.get('final_route', [])) - len(st.session_state.route or [])
-                res_c3.metric('Supplemental waypoints added', max(0, _extra_wps))
 
                 # ── Coverage / voids summary (HELIOS ground truth) ─────────────
                 _hs = _res.get('density_stats') or {}
@@ -837,12 +824,6 @@ with st.expander('HELIOS++ LiDAR Validation', expanded=bool(st.session_state.hel
                     hc1.metric('Coverage', f"{_hcov:.1f}%")
                     hc2.metric('Median density', f"{_hs['median_density']:.0f} pts/m²")
                     hc3.metric('Voids', f"{_hs['n_void']} ({_hvoid_pct:.1f}%)")
-
-                if _extra_wps > 0:
-                    if st.button('Apply densified route', use_container_width=True):
-                        st.session_state.route = _res['final_route']
-                        st.session_state.helios_result = None
-                        st.rerun()
 
                 _dl1, _dl2 = st.columns(2)
                 if _res.get('trajectory_path') and os.path.exists(_res['trajectory_path']):
