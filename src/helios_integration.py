@@ -331,20 +331,31 @@ def build_survey_xml(
         scanner=scanner_ref,
     )
 
-    # Write scanner settings inline on every leg — avoids template lookup issues
-    _scan_attrs = dict(
-        active="true",
+    # Scanner settings written inline on every leg (avoids template lookup issues).
+    # `active` is decided per leg below: the scanner fires only WHILE flying along
+    # a pass, and is OFF during the connector hop between passes (the side lines),
+    # which real post-processing discards. HELIOS' leg `active` governs the segment
+    # from this leg to the NEXT one, so a leg scans iff its next leg is in the same
+    # pass. (If a sim ever comes back near-empty on the passes, this is the flag to
+    # flip — it would mean HELIOS uses the previous→this convention instead.)
+    _scan_base = dict(
         pulseFreq_hz=str(pulse_freq_hz),   # HELIOS++ expects lowercase 'hz'
         scanFreq_hz=str(scan_freq_hz),
         scanAngle_deg=str(scan_angle_deg),
         headRotatePerSec_deg="0",
     )
 
-    for wp in metric_route:
+    n_legs = len(metric_route)
+    for i, wp in enumerate(metric_route):
         x = float(wp["x"])
         y = float(wp["y"])
         z_raw = wp["z"]
         z = float(z_raw) if not math.isnan(float(z_raw)) else 0.0
+
+        nxt = metric_route[i + 1] if i + 1 < n_legs else None
+        on_pass = (nxt is not None
+                   and wp.get("pass_id") is not None
+                   and wp.get("pass_id") == nxt.get("pass_id"))
 
         leg = ET.SubElement(survey, "leg")
         ET.SubElement(
@@ -353,7 +364,8 @@ def build_survey_xml(
             onGround="false",
             movePerSec_m=str(speed_ms),
         )
-        ET.SubElement(leg, "scannerSettings", **_scan_attrs)
+        ET.SubElement(leg, "scannerSettings",
+                      active=("true" if on_pass else "false"), **_scan_base)
 
     output_xml_path = os.path.abspath(output_xml_path)
     Path(output_xml_path).parent.mkdir(parents=True, exist_ok=True)

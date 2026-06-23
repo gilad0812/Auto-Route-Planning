@@ -27,6 +27,10 @@ RUN python -c "import sys; sys.path.insert(0, 'src'); import helios_setup; helio
 
 COPY . .
 
+# Correct the bundled RIEGL VUX-120-23 scanner to match the datasheet
+# (rotating polygon mirror, ±50° half-angle) — HELIOS ships it as oscillating/100°.
+RUN python src/patch_scanner.py
+
 EXPOSE 8501
 
 CMD ["streamlit", "run", "app.py", "--server.address=0.0.0.0", "--server.port=8501", "--server.headless=true"]
