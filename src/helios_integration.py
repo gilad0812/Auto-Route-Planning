@@ -609,11 +609,37 @@ def _points_in_polygon(
     return inside
 
 
+def _surface_stretch(dtm, gx, gy, ref_lon, ref_lat, is_geo):
+    """Per-cell tilted-surface / horizontal area ratio (= sec slope), from the DTM
+    at its NATIVE pixel resolution. Lets verify_point_density report density per
+    SURFACE m² (count / (cell² · stretch)) to match the estimator's convention.
+    Sampling the DTM's own pixels avoids the 1 m staircase a coarse DTM would make."""
+    arr = np.asarray(dtm.array, dtype=float)
+    t = dtm.src.transform
+    if is_geo:
+        lon_m = _LAT_M * math.cos(math.radians(ref_lat)); lat_m = _LAT_M
+        lon = ref_lon + gx / lon_m; lat = ref_lat + gy / lat_m
+    else:
+        lon, lat, lon_m, lat_m = gx, gy, 1.0, 1.0
+    af = np.where(arr == dtm.nodata, np.nan, arr) if dtm.nodata is not None else arr
+    af = np.where(np.isnan(af), np.nanmean(af), af)
+    gE = np.gradient(af, axis=1) / (t.a * lon_m)
+    gN = np.gradient(af, axis=0) / (t.e * lat_m)
+    ci = np.clip(((lon - t.c) / t.a).astype(int), 0, arr.shape[1] - 1)
+    ri = np.clip(((lat - t.f) / t.e).astype(int), 0, arr.shape[0] - 1)
+    ge, gn = gE[ri, ci], gN[ri, ci]
+    return np.sqrt(1.0 + ge * ge + gn * gn)
+
+
 def verify_point_density(
     las_path: Union[str, List[str]],
     min_points: int = MIN_POINTS_PER_SQM,
     cell_size: float = CELL_SIZE_M,
     region: Optional[List[Tuple[float, float]]] = None,
+    dtm=None,
+    ref_lon: Optional[float] = None,
+    ref_lat: Optional[float] = None,
+    is_geo: bool = True,
 ) -> Tuple[bool, List[Tuple[float, float]]]:
     """
     Verify that every cell in the survey area meets the point density threshold.
@@ -712,15 +738,28 @@ def verify_point_density(
             np.add.at(grid, (yi, xi), 1)
         del xs, ys
 
+    # Per-cell density in pts/m². By default the divisor is the flat cell area
+    # (cell_size²). When a DTM is supplied, divide instead by the TILTED SURFACE
+    # area (cell_size² · sec slope) so density is reported per SURFACE m² — the
+    # survey-quality metric, matching the estimator's convention. Computed as a
+    # full grid so the pass/fail test and the stats use the same definition.
+    all_cx = x_min + (np.arange(nx) + 0.5) * cell_size
+    all_cy = y_min + (np.arange(ny) + 0.5) * cell_size
+    gx, gy = np.meshgrid(all_cx, all_cy)
+    cell_area = float(cell_size * cell_size)
+    if dtm is not None:
+        cell_area = cell_area * _surface_stretch(dtm, gx, gy, ref_lon, ref_lat, is_geo)
+    dens_grid = grid.astype(float) / cell_area     # pts per (surface) m²
+
     # With an AOI polygon, count EVERY in-region cell below the threshold —
     # including empty ones (occlusion voids are real coverage gaps); the polygon
     # mask below excludes the rectangular grid's empty margin. Without a polygon
     # we can't tell "outside the survey" from "void inside it", so we fall back to
     # only judging populated cells (grid > 0) to avoid flagging the empty margin.
     if region is not None:
-        fail_mask = (grid < min_points)
+        fail_mask = (dens_grid < min_points)
     else:
-        fail_mask = (grid > 0) & (grid < min_points)
+        fail_mask = (grid > 0) & (dens_grid < min_points)
     rows, cols = np.where(fail_mask)
 
     cx = x_min + (cols + 0.5) * cell_size
@@ -735,17 +774,13 @@ def verify_point_density(
     failing_cells: List[Tuple[float, float]] = list(zip(cx.tolist(), cy.tolist()))
 
     # ── AOI density statistics (coverage %, voids, median/min) ───────────────
-    # Per-cell density in pts/m² over every AOI cell INCLUDING empty ones, so
-    # coverage reflects the whole surveyed area (the pass/fail logic above only
-    # flags populated-but-thin cells; here voids = empty cells are counted too).
-    all_cx = x_min + (np.arange(nx) + 0.5) * cell_size
-    all_cy = y_min + (np.arange(ny) + 0.5) * cell_size
-    gx, gy = np.meshgrid(all_cx, all_cy)
+    # Over every AOI cell INCLUDING empty ones, so coverage reflects the whole
+    # surveyed area (voids = empty cells are counted too).
     if region is not None:
         in_region = _points_in_polygon(gx.ravel(), gy.ravel(), region).reshape(grid.shape)
     else:
         in_region = np.ones_like(grid, dtype=bool)
-    dens = grid[in_region].astype(float) / (cell_size * cell_size)   # pts/m²
+    dens = dens_grid[in_region]
     n_cells = int(dens.size)
     stats = {
         "n_cells": n_cells,
@@ -902,7 +937,8 @@ def run_feedback_loop(
 
         # Stage 3 — verify density inside the AOI
         passed, failing_metric, density_stats = verify_point_density(
-            [str(las_dir)], min_points, region=region_metric)
+            [str(las_dir)], min_points, region=region_metric,
+            dtm=dtm, ref_lon=ref_lon, ref_lat=ref_lat, is_geo=is_geo)
         result["iterations"] = 1
         result["passed"] = passed
         result["density_stats"] = density_stats

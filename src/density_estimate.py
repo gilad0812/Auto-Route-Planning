@@ -174,15 +174,15 @@ def estimate_density_grid(
             cos_i = (h + ox * g_e + oy * g_n) / (np.maximum(R, 1e-6) * nrm)
             covered = (np.isfinite(h) & (h > 1.0)
                        & (d <= h * tan_half) & (cos_i > 0.0))
-            # cos_i / R is density per unit of TILTED surface, but HELIOS bins
-            # points into a HORIZONTAL grid (pts per horizontal m²). A horizontal
-            # cell sits under `nrm` m² of slanted ground, so ×nrm converts surface-
-            # density → horizontal-projected density and matches HELIOS. (Flat
-            # ground: nrm=1, no-op. The 1/nrm in cos_i cancels, leaving the slope
-            # in only through the real (ray·slope) term.)
+            # cos_i / R gives density per unit of the actual (tilted) terrain
+            # surface — points per SURFACE m². That is the survey-quality metric we
+            # want: how densely the real hillside is sampled, regardless of how
+            # steep it is. HELIOS's verify_point_density normalises by the same
+            # tilted surface area, so the estimate and the simulation are directly
+            # comparable. (`nrm` is still used above, in cos_i, for the incidence.)
             contrib = np.where(
                 covered,
-                pulse_freq_hz * cos_i * nrm / (speed_ms * np.maximum(R, 1.0) * fov),
+                pulse_freq_hz * cos_i / (speed_ms * np.maximum(R, 1.0) * fov),
                 0.0,
             )
         # Occlusion: march from the aircraft (foot of the pass, at z_pass) down to
