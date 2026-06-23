@@ -124,13 +124,20 @@ def estimate_density_grid(
     if dtm.nodata is not None:
         terr = np.where(terr == dtm.nodata, np.nan, terr)
 
-    # Terrain surface normal per cell, from the local slope (∂z/∂east, ∂z/∂north),
-    # so we can charge the TRUE laser incidence onto the tilted ground — not just
-    # the nadir scan angle. A face tilted away from the flight line is hit at a
-    # grazing angle (footprint stretches → density drops); a back-facing surface
-    # isn't hit at all. This is what makes the estimate catch steep-slope thinning.
-    terr_f = np.where(np.isnan(terr), np.nanmean(terr), terr)
-    g_n, g_e = np.gradient(terr_f, cell, cell)     # ∂z/∂north (rows), ∂z/∂east (cols)
+    # Terrain surface normal per cell, from the local slope (∂z/∂east, ∂z/∂north).
+    # Used below for (1) the back-facing test (cos_i ≤ 0 → never hit) and (2) the
+    # `nrm` factor that projects per-surface density onto HELIOS's horizontal grid.
+    #
+    # Differentiate the DTM at its NATIVE pixel resolution, then sample per cell —
+    # NOT np.gradient on the fine per-cell grid. A coarse DTM (e.g. 20 m pixels)
+    # sampled onto a 1 m grid is a staircase: its 1 m gradient is 0 on a pixel's
+    # flat interior and near-vertical at the pixel riser, inventing cliffs that
+    # exist neither in the terrain nor in HELIOS's smoothed mesh. The native
+    # gradient is the real slope. (t.a>0 east per col, t.e<0 north per row.)
+    arr_f = np.where(arr == dtm.nodata, np.nan, arr) if dtm.nodata is not None else arr
+    arr_f = np.where(np.isnan(arr_f), np.nanmean(arr_f), arr_f)
+    g_e = (np.gradient(arr_f, axis=1) / (t.a * lon_m))[row, col]   # ∂z/∂east  per m
+    g_n = (np.gradient(arr_f, axis=0) / (t.e * lat_m))[row, col]   # ∂z/∂north per m
     nrm = np.sqrt(1.0 + g_e * g_e + g_n * g_n)
 
     cu = (minlon + maxlon) / 2.0
@@ -167,9 +174,15 @@ def estimate_density_grid(
             cos_i = (h + ox * g_e + oy * g_n) / (np.maximum(R, 1e-6) * nrm)
             covered = (np.isfinite(h) & (h > 1.0)
                        & (d <= h * tan_half) & (cos_i > 0.0))
+            # cos_i / R is density per unit of TILTED surface, but HELIOS bins
+            # points into a HORIZONTAL grid (pts per horizontal m²). A horizontal
+            # cell sits under `nrm` m² of slanted ground, so ×nrm converts surface-
+            # density → horizontal-projected density and matches HELIOS. (Flat
+            # ground: nrm=1, no-op. The 1/nrm in cos_i cancels, leaving the slope
+            # in only through the real (ray·slope) term.)
             contrib = np.where(
                 covered,
-                pulse_freq_hz * cos_i / (speed_ms * np.maximum(R, 1.0) * fov),
+                pulse_freq_hz * cos_i * nrm / (speed_ms * np.maximum(R, 1.0) * fov),
                 0.0,
             )
         # Occlusion: march from the aircraft (foot of the pass, at z_pass) down to
