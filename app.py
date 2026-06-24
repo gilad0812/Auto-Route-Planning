@@ -848,6 +848,7 @@ with st.expander('HELIOS++ LiDAR Validation', expanded=bool(st.session_state.hel
                     _pulse=int(pulse_freq), _scan_freq=float(scan_freq), _scan_angle=float(fov / 2.0),
                     _scanner_ref=scanner_ref_input, _platform_ref=platform_ref_input,
                     _dtm=dtm, _region=_region,
+                    _chm=chm, _veg_pen=float(veg_penetration),
                     _q=_q, _stop_event=_stop_event,
                 ):
                     try:
@@ -869,6 +870,8 @@ with st.expander('HELIOS++ LiDAR Validation', expanded=bool(st.session_state.hel
                             platform_ref=_platform_ref,
                             dtm=_dtm,
                             region_polygon=_region,
+                            chm=_chm,
+                            veg_penetration=_veg_pen,
                             log=lambda msg: _q.put(('log', msg)),
                             stop_event=_stop_event,
                         )

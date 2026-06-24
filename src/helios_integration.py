@@ -640,6 +640,8 @@ def verify_point_density(
     ref_lon: Optional[float] = None,
     ref_lat: Optional[float] = None,
     is_geo: bool = True,
+    chm=None,
+    veg_penetration: float = 0.4,
 ) -> Tuple[bool, List[Tuple[float, float]]]:
     """
     Verify that every cell in the survey area meets the point density threshold.
@@ -751,6 +753,27 @@ def verify_point_density(
         cell_area = cell_area * _surface_stretch(dtm, gx, gy, ref_lon, ref_lat, is_geo)
     dens_grid = grid.astype(float) / cell_area     # pts per (surface) m²
 
+    # Canopy thinning: where a binary vegetation mask (chm > 0) marks vegetation,
+    # multiply the ground density by `veg_penetration` (thumb rule 0.4) — the SAME
+    # planning factor the estimator applies, so the two agree over vegetated
+    # cells. HELIOS itself sims bare earth; this is a post-process factor, not
+    # ray-traced canopy occlusion. Sample the mask by location (metric→lon/lat).
+    if chm is not None:
+        ca = np.asarray(chm.array, dtype=float)
+        ct = chm.src.transform
+        if is_geo:
+            lon_m = _LAT_M * math.cos(math.radians(ref_lat)); lat_m = _LAT_M
+            lon = ref_lon + gx / lon_m; lat = ref_lat + gy / lat_m
+        else:
+            lon, lat = gx, gy
+        cc = np.clip(((lon - ct.c) / ct.a).astype(int), 0, ca.shape[1] - 1)
+        rr = np.clip(((lat - ct.f) / ct.e).astype(int), 0, ca.shape[0] - 1)
+        mask = ca[rr, cc]
+        if chm.nodata is not None:
+            mask = np.where(mask == chm.nodata, 0.0, mask)
+        veg = np.isfinite(mask) & (mask > 0)
+        dens_grid = np.where(veg, dens_grid * float(veg_penetration), dens_grid)
+
     # With an AOI polygon, count EVERY in-region cell below the threshold —
     # including empty ones (occlusion voids are real coverage gaps); the polygon
     # mask below excludes the rectangular grid's empty margin. Without a polygon
@@ -817,6 +840,8 @@ def run_feedback_loop(
     platform_ref: str = DEFAULT_PLATFORM_REF,
     dtm: Optional[object] = None,
     region_polygon: Optional[List[Tuple[float, float]]] = None,
+    chm: Optional[object] = None,
+    veg_penetration: float = 0.4,
     log: Optional[Callable[[str], None]] = None,
     stop_event: Optional["threading.Event"] = None,
 ) -> Dict:
@@ -938,7 +963,8 @@ def run_feedback_loop(
         # Stage 3 — verify density inside the AOI
         passed, failing_metric, density_stats = verify_point_density(
             [str(las_dir)], min_points, region=region_metric,
-            dtm=dtm, ref_lon=ref_lon, ref_lat=ref_lat, is_geo=is_geo)
+            dtm=dtm, ref_lon=ref_lon, ref_lat=ref_lat, is_geo=is_geo,
+            chm=chm, veg_penetration=veg_penetration)
         result["iterations"] = 1
         result["passed"] = passed
         result["density_stats"] = density_stats
