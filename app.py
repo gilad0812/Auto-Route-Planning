@@ -276,7 +276,7 @@ with st.sidebar:
     st.divider()
 
     altitude  = st.number_input('Altitude AGL (m)',      value=100.0,  min_value=1.0,    step=5.0)
-    fov       = st.number_input('LiDAR FOV (°)',         value=100.0,  min_value=1.0,    max_value=179.0, step=5.0)
+    fov       = 100.0   # LiDAR FOV fixed at 100° (RIEGL VUX-120-23, ±50°)
     overlap   = st.number_input('Overlap (%)',           value=20.0,  min_value=0.0,    max_value=99.0,  step=5.0)
     adaptive_spacing = st.checkbox(
         'Terrain-adaptive spacing', value=True,
@@ -292,7 +292,6 @@ with st.sidebar:
              '0 disables splitting.',
     )
     step_m    = st.number_input('Along-track step (m)',  value=50.0,  min_value=1.0,    step=5.0)
-    error_tol = st.number_input('Error tolerance (m)',   value=2.0,   min_value=0.1,    step=0.5)
 
     st.markdown('**Scanner & density**')
     st.caption('Drives the density estimate run on Compute, and HELIOS++ '
@@ -399,7 +398,7 @@ if compute_btn and st.session_state.polygon is not None:
     with st.spinner('Computing route…'):
         if adaptive_spacing:
             st.session_state.route = plan_route_adaptive(
-                dtm, poly, altitude, error_tol,
+                dtm, poly, altitude,
                 scan_half_angle_deg=fov / 2.0, step=step_map,
                 overlap_frac=overlap / 100.0, is_geo=is_geo,
                 elev_sample_step=elev_step_map,
@@ -407,7 +406,7 @@ if compute_btn and st.session_state.polygon is not None:
             )
         else:
             st.session_state.route = plan_route(
-                dtm, poly, altitude, error_tol, spacing_map, step_map,
+                dtm, poly, altitude, spacing_map, step_map,
                 elev_sample_step=elev_step_map,
             )
     # Auto density estimate (analytical, ~1 s) so Compute immediately shows
@@ -661,7 +660,6 @@ if st.session_state.route:
                 'properties': {
                     'altitude_m':   wp['z'],
                     'target_agl_m': wp['target_distance'],
-                    'error_tol_m':  wp['error_tol'],
                 },
             }
             for wp in wps
@@ -674,11 +672,11 @@ if st.session_state.route:
         )
 
         buf = io.StringIO()
-        w = csv.DictWriter(buf, fieldnames=['index', 'x', 'y', 'z', 'target_agl_m', 'error_tol_m'])
+        w = csv.DictWriter(buf, fieldnames=['index', 'x', 'y', 'z', 'target_agl_m'])
         w.writeheader()
         for i, wp in enumerate(wps):
             w.writerow({'index': i, 'x': wp['x'], 'y': wp['y'], 'z': wp['z'],
-                        'target_agl_m': wp['target_distance'], 'error_tol_m': wp['error_tol']})
+                        'target_agl_m': wp['target_distance']})
         dl2.download_button(
             'Download CSV', buf.getvalue(),
             file_name='route.csv', mime='text/csv',
@@ -754,7 +752,7 @@ with st.expander('HELIOS++ LiDAR Validation', expanded=bool(st.session_state.hel
         st.caption(
             f'Validation uses: density {int(min_points)} pts/m² · speed {speed_ms:.1f} m/s · '
             f'pulse {int(pulse_freq)} Hz · scan {scan_freq:.0f} Hz · '
-            f'half-angle {fov / 2:.0f}° — set in the sidebar.'
+            f'half-angle {fov / 2:.0f}° (FOV fixed at {fov:.0f}°).'
         )
 
         # ── Terrain mesh ──────────────────────────────────────────────────────

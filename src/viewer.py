@@ -16,7 +16,7 @@ from route_planner import plan_route
 class InteractiveDTMViewer:
     """Top-down DTM viewer. Click to draw a polygon, then auto-generates a drone route."""
 
-    def __init__(self, dtm_path, distance_above=30, spacing=20, step=10, error_tol=2):
+    def __init__(self, dtm_path, distance_above=30, spacing=20, step=10):
         self.dtm = DTM(dtm_path)
         self.dtm_path = dtm_path
 
@@ -24,7 +24,6 @@ class InteractiveDTMViewer:
         self._default_altitude = distance_above
         self._default_spacing  = spacing
         self._default_step     = step
-        self._default_tol      = error_tol
 
         self._pts = []
         self._closed = False
@@ -93,7 +92,6 @@ class InteractiveDTMViewer:
             ('Altitude (m)',  str(self._default_altitude), 0.05,  0.13),
             ('Spacing',       str(self._default_spacing),  0.235, 0.13),
             ('Step',          str(self._default_step),     0.415, 0.10),
-            ('Error tol (m)', str(self._default_tol),      0.565, 0.13),
         ]
 
         self._textboxes = {}
@@ -143,7 +141,7 @@ class InteractiveDTMViewer:
     # ------------------------------------------------------------------
 
     def _read_params(self):
-        """Parse text boxes. Returns (altitude, spacing, step, tol) or raises ValueError."""
+        """Parse text boxes. Returns (altitude, spacing, step) or raises ValueError."""
         vals = {}
         for label, tb in self._textboxes.items():
             try:
@@ -154,7 +152,6 @@ class InteractiveDTMViewer:
             vals['Altitude (m)'],
             vals['Spacing'],
             vals['Step'],
-            vals['Error tol (m)'],
         )
 
     # ------------------------------------------------------------------
@@ -241,7 +238,7 @@ class InteractiveDTMViewer:
 
     def _compute_route(self):
         try:
-            altitude, spacing, step, tol = self._read_params()
+            altitude, spacing, step = self._read_params()
         except ValueError as e:
             self._set_status(str(e))
             return
@@ -250,7 +247,7 @@ class InteractiveDTMViewer:
         if not poly.is_valid:
             poly = poly.buffer(0)
 
-        self._route = plan_route(self.dtm, poly, altitude, tol, spacing, step)
+        self._route = plan_route(self.dtm, poly, altitude, spacing, step)
 
         valid = [
             (wp['x'], wp['y'], wp['z']) for wp in self._route
@@ -325,7 +322,6 @@ class InteractiveDTMViewer:
                 'properties': {
                     'altitude_m':    wp['z'],
                     'target_agl_m':  wp['target_distance'],
-                    'error_tol_m':   wp['error_tol'],
                 },
             })
 
@@ -333,7 +329,7 @@ class InteractiveDTMViewer:
             json.dump({'type': 'FeatureCollection', 'features': features}, f, indent=2)
 
         with open(csv_path, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=['index', 'x', 'y', 'z', 'target_agl_m', 'error_tol_m'])
+            writer = csv.DictWriter(f, fieldnames=['index', 'x', 'y', 'z', 'target_agl_m'])
             writer.writeheader()
             for i, feat in enumerate(features):
                 x, y, z = feat['geometry']['coordinates']
@@ -343,7 +339,6 @@ class InteractiveDTMViewer:
                     'y':            y,
                     'z':            z,
                     'target_agl_m': feat['properties']['target_agl_m'],
-                    'error_tol_m':  feat['properties']['error_tol_m'],
                 })
 
         self._set_status(

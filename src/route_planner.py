@@ -84,7 +84,7 @@ def _pass_altitude(dtm, pts, agl, step, elev_sample_step=None):
     return (max(valid) + agl) if valid else float('nan')
 
 
-def plan_route(dtm, polygon, distance_above_surface, error_tolerance,
+def plan_route(dtm, polygon, distance_above_surface,
                spacing=10, step=5, elev_sample_step=None):
     """Plan a route that keeps `distance_above_surface` above the highest
     terrain point along each pass.
@@ -110,7 +110,7 @@ def plan_route(dtm, polygon, distance_above_surface, error_tolerance,
         z = _pass_altitude(dtm, pts, distance_above_surface, step, elev_sample_step)
         for x, y in pts:
             route.append({'x': x, 'y': y, 'z': z, 'target_distance': distance_above_surface,
-                          'error_tol': error_tolerance, 'pass_id': pass_id})
+                          'pass_id': pass_id})
     return route
 
 
@@ -235,7 +235,7 @@ def _split_by_relief(points, elevs, max_relief):
     return [c for c in chunks if len(c) >= 1]
 
 
-def plan_route_adaptive(dtm, polygon, distance_above_surface, error_tolerance,
+def plan_route_adaptive(dtm, polygon, distance_above_surface,
                         scan_half_angle_deg, step,
                         overlap_frac=0.2, is_geo=True, min_spacing_m=2.0,
                         elev_sample_step=None, orientation='auto',
@@ -273,7 +273,7 @@ def plan_route_adaptive(dtm, polygon, distance_above_surface, error_tolerance,
     horizontal; terrain is sampled by mapping back to the DTM CRS, and waypoints
     are emitted back in that CRS (x, y).
 
-    Returns list of dicts: {x, y, z, target_distance, error_tol, pass_id}.
+    Returns list of dicts: {x, y, z, target_distance, pass_id}.
     """
     agl = distance_above_surface
     tan_t = math.tan(math.radians(scan_half_angle_deg))
@@ -366,8 +366,7 @@ def plan_route_adaptive(dtm, polygon, distance_above_surface, error_tolerance,
                 for pu, pv in chunk:
                     gx, gy = uv2g(pu, pv)
                     route.append({'x': gx, 'y': gy, 'z': cz,
-                                  'target_distance': agl, 'error_tol': error_tolerance,
-                                  'pass_id': pass_id})
+                                  'target_distance': agl, 'pass_id': pass_id})
                 pass_id += 1
             toggle = not toggle
 
