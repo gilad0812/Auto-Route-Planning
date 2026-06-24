@@ -26,8 +26,15 @@ controls:
   • coverage gaps                  (no pass covers the cell → 0)
   • scan FOV limits                (θ cut-off)
 
-It does NOT model occlusion/shadowing, multiple returns or vegetation — so it is
+It models occlusion/shadowing (line-of-sight march) and a canopy-penetration
+thinning when a CHM is supplied; it does NOT model multiple returns — so it is
 an estimator for ITERATING, confirmed by a single HELIOS++ run.
+
+Vegetation
+----------
+When a binary vegetation mask (`chm`, value > 0 = vegetated) is passed, those
+cells get their density multiplied by `veg_penetration` (default 0.4): the
+thumb-rule fraction of pulses that reach the GROUND through the canopy.
 """
 
 import math
@@ -54,6 +61,7 @@ def estimate_density_grid(
     pulse_freq_hz, scan_freq_hz, scan_half_angle_deg, speed_ms, min_points,
     is_geo=True, cell_size_m=1.0, max_cells=3_000_000,
     occlusion=True, occ_margin_m=2.0,
+    chm=None, veg_penetration=0.4,
 ):
     """Estimate per-cell point density for `route` over `dtm`.
 
@@ -63,6 +71,9 @@ def estimate_density_grid(
         region:      AOI as a list of (lon, lat) vertices, or None (whole bbox).
         scan_freq_hz: accepted for signature symmetry; cancels out of the model.
         cell_size_m: grid resolution (auto-coarsened to stay under max_cells).
+        chm:         optional binary vegetation mask (same interface as `dtm`);
+                     cells with value > 0 are thinned by `veg_penetration`.
+        veg_penetration: ground-return fraction through canopy (thumb rule 0.4).
 
     Returns a dict mirroring the HELIOS result shape so the same map overlay/
     summary can render it:
@@ -200,6 +211,21 @@ def estimate_density_grid(
                     blocked |= covered & (_terr_EN(Em, Nm) > los + occ_margin_m)
             contrib = np.where(blocked, 0.0, contrib)
         density += contrib
+
+    # ── Canopy penetration: thin vegetated cells to the ground-return fraction ─
+    # A binary mask marks where vegetation stands; pulses that hit canopy mostly
+    # do not reach the ground, so the ground point density there is a fraction
+    # (`veg_penetration`, thumb rule 0.4) of the bare-earth estimate.
+    if chm is not None:
+        ca = np.asarray(chm.array, dtype=float)
+        ct = chm.src.transform
+        ccol = np.clip(((LON - ct.c) / ct.a).astype(int), 0, ca.shape[1] - 1)
+        crow = np.clip(((LAT - ct.f) / ct.e).astype(int), 0, ca.shape[0] - 1)
+        mask = ca[crow, ccol]
+        if chm.nodata is not None:
+            mask = np.where(mask == chm.nodata, 0.0, mask)
+        veg = np.isfinite(mask) & (mask > 0)
+        density = np.where(veg, density * float(veg_penetration), density)
 
     # ── Region mask + failure detection ──────────────────────────────────────
     if region and _MPL_OK:

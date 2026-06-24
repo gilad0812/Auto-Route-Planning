@@ -69,9 +69,45 @@ def dtm_to_png(dtm_path: str) -> bytes:
     return buf.getvalue()
 
 
+def chm_to_png(chm_path: str) -> bytes:
+    """Render the CHM as a green overlay; bare/zero/nodata cells are transparent
+    so only vegetated areas are tinted."""
+    chm = DTM(chm_path)
+    arr = chm.array.astype(float)
+    if chm.nodata is not None:
+        arr[arr == chm.nodata] = np.nan
+    veg = np.isfinite(arr) & (arr > 0)
+    vmax = np.nanmax(np.where(veg, arr, np.nan)) if veg.any() else 1.0
+    normed = np.clip(arr / max(vmax, 1e-9), 0, 1)        # height shading (flat for binary)
+    rgba = (plt.get_cmap('Greens')(0.35 + 0.6 * np.nan_to_num(normed)) * 255).astype(np.uint8)
+    rgba[~veg, 3] = 0                                     # transparent where not vegetated
+    buf = io.BytesIO()
+    Image.fromarray(rgba, 'RGBA').save(buf, format='PNG')
+    return buf.getvalue()
+
+
 @st.cache_resource
 def load_dtm(path: str) -> DTM:
     return DTM(path)
+
+
+def chm_fits_dtm(dtm: DTM, chm_path: str):
+    """Check an uploaded CHM is usable with the DTM: same CRS and covering the
+    DTM's extent. Returns (ok: bool, reason: str)."""
+    try:
+        chm = load_dtm(chm_path)
+    except Exception as exc:
+        return False, f'could not read raster ({exc})'
+    dc, cc = dtm.src.crs, chm.src.crs
+    if (dc is None) != (cc is None) or (dc is not None and cc is not None and dc != cc):
+        return False, f'CRS mismatch (DTM {dc}, CHM {cc})'
+    db, cb = dtm.src.bounds, chm.src.bounds
+    ex, ey = abs(dtm.src.res[0]), abs(dtm.src.res[1])
+    covers = (cb.left <= db.left + ex and cb.bottom <= db.bottom + ey and
+              cb.right >= db.right - ex and cb.top >= db.top - ey)
+    if not covers:
+        return False, 'CHM does not cover the DTM extent'
+    return True, ''
 
 
 def swath_and_spacing(altitude_m: float, fov_deg: float, overlap_pct: float, is_geo: bool):
@@ -101,7 +137,9 @@ def z_to_hex(z: float, zmin: float, zmax: float) -> str:
 
 for _k, _v in [
     ('polygon', None), ('route', None), ('dtm_tmp_path', None),
-    ('dtm_upload_name', None), ('helios_result', None),
+    ('dtm_upload_name', None), ('chm_tmp_path', None),
+    ('chm_upload_name', None), ('upload_sig', None),
+    ('upload_error', None), ('helios_result', None),
     ('helios_bin', ''), ('helios_scene_obj', ''),
     ('helios_installing', False), ('helios_expander_open', False),
     ('helios_running', False), ('helios_stop_event', None),
@@ -123,32 +161,83 @@ if _HELIOS_AVAILABLE and not st.session_state.helios_bin:
 with st.sidebar:
     st.title('Flight Parameters')
 
-    uploaded = st.file_uploader(
-        'Upload DTM/DEM',
+    uploaded_files = st.file_uploader(
+        'Upload DTM (+ optional CHM)',
         type=['tif', 'tiff', 'img', 'dem', 'asc', 'hgt'],
-        help='GeoTIFF or other GDAL-supported raster',
+        accept_multiple_files=True,
+        help='Drop the DTM/DEM here, and — optionally — a canopy-height model in '
+             'the SAME selection. Name the canopy file with "chm" (or "canopy") so '
+             'it is recognised. The CHM must share the DTM\'s CRS and cover its '
+             'extent, or it is rejected.',
     )
-    if uploaded is not None and uploaded.name != st.session_state.dtm_upload_name:
-        if st.session_state.dtm_tmp_path:        # drop the previous upload's temp file
-            try:
-                os.remove(st.session_state.dtm_tmp_path)
-            except OSError:
-                pass
-        suffix = os.path.splitext(uploaded.name)[1]
+
+    def _save_upload(f):
+        suffix = os.path.splitext(f.name)[1]
         tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
-        tmp.write(uploaded.read())
-        tmp.flush()
-        tmp.close()
-        st.session_state.dtm_tmp_path = tmp.name
-        st.session_state.dtm_upload_name = uploaded.name
-        st.session_state.polygon = None
-        st.session_state.route = None
+        tmp.write(f.read()); tmp.flush(); tmp.close()
+        return tmp.name
+
+    if uploaded_files:
+        sig = tuple(sorted(f.name for f in uploaded_files))
+        if sig != st.session_state.get('upload_sig'):
+            st.session_state.upload_sig = sig
+            st.session_state.upload_error = None
+            # Classify by filename: "chm"/"canopy" → CHM, otherwise DTM.
+            dtm_f = chm_f = None
+            for f in uploaded_files:
+                nm = f.name.lower()
+                if 'chm' in nm or 'canopy' in nm:
+                    chm_f = f
+                else:
+                    dtm_f = f
+            if dtm_f is None:
+                st.session_state.upload_error = (
+                    'No DTM found — name the terrain file without "chm"/"canopy".')
+            elif len(uploaded_files) > 2:
+                st.session_state.upload_error = (
+                    'Upload at most two files: one DTM and one CHM.')
+            else:
+                # Drop any previous temp files, then save the new ones.
+                for _k in ('dtm_tmp_path', 'chm_tmp_path'):
+                    if st.session_state[_k]:
+                        try:
+                            os.remove(st.session_state[_k])
+                        except OSError:
+                            pass
+                    st.session_state[_k] = None
+                st.session_state.dtm_tmp_path = _save_upload(dtm_f)
+                st.session_state.dtm_upload_name = dtm_f.name
+                st.session_state.chm_upload_name = None
+                if chm_f is not None:
+                    cpath = _save_upload(chm_f)
+                    ok, why = chm_fits_dtm(load_dtm(st.session_state.dtm_tmp_path), cpath)
+                    if ok:
+                        st.session_state.chm_tmp_path = cpath
+                        st.session_state.chm_upload_name = chm_f.name
+                    else:
+                        try:
+                            os.remove(cpath)
+                        except OSError:
+                            pass
+                        st.session_state.upload_error = (
+                            f'CHM "{chm_f.name}" rejected — {why}.')
+                st.session_state.polygon = None
+                st.session_state.route = None
+
+    if st.session_state.get('upload_error'):
+        st.error(st.session_state.upload_error)
 
     if st.session_state.dtm_tmp_path:
         dtm_path = st.session_state.dtm_tmp_path
-        st.caption(f'Using uploaded file: **{st.session_state.dtm_upload_name}**')
+        st.caption(f'DTM: **{st.session_state.dtm_upload_name}**')
     else:
-        dtm_path = st.text_input('or enter local file path', value='') or None
+        dtm_path = st.text_input('or enter local DTM path', value='') or None
+
+    if st.session_state.chm_tmp_path:
+        chm_path = st.session_state.chm_tmp_path
+        st.caption(f'CHM: **{st.session_state.chm_upload_name}**  ✓ fits DTM')
+    else:
+        chm_path = None
 
     st.divider()
 
@@ -219,6 +308,16 @@ with st.sidebar:
              'accepts these, so the estimate stays in lockstep with the sim.',
     )
     scan_freq  = st.number_input('Scan frequency (Hz)',  value=DEFAULT_SCAN_FREQ_HZ,       min_value=1.0, step=10.0)
+
+    st.markdown('**Vegetation / canopy**')
+    st.caption('Applies when a CHM is uploaded above.' if not chm_path
+               else 'Thinning the density estimate over vegetated cells.')
+    veg_penetration = st.number_input(
+        'Ground-return fraction in canopy', value=0.4,
+        min_value=0.01, max_value=1.0, step=0.05,
+        help='Thumb rule: fraction of pulses that reach the ground through vegetation. '
+             'Applied to cells the binary CHM marks as vegetated (value > 0).',
+    )
     st.divider()
 
     compute_btn = st.button(
@@ -245,6 +344,31 @@ if not os.path.exists(dtm_path):
     st.stop()
 
 dtm = load_dtm(dtm_path)
+
+# Local-path DTM: auto-pick a sibling CHM (dtm_*.tif → chm_*.tif) if present.
+if chm_path is None and not st.session_state.dtm_tmp_path and os.path.exists(dtm_path):
+    _cand = os.path.join(os.path.dirname(dtm_path),
+                         os.path.basename(dtm_path).replace('dtm', 'chm', 1))
+    if _cand != dtm_path and os.path.exists(_cand):
+        chm_path = _cand
+
+# Load the CHM only if it actually fits the DTM (CRS + extent); else ignore it.
+chm = None
+if chm_path and os.path.exists(chm_path):
+    _ok, _why = chm_fits_dtm(dtm, chm_path)
+    if _ok:
+        chm = load_dtm(chm_path)
+        # Accepted, but flag when it isn't on the exact DTM grid: sampling then
+        # crosses grids (by nearest pixel at each location — still anchored).
+        _same_grid = (chm.src.shape == dtm.src.shape and all(
+            abs(a - b) <= 1e-12 for a, b in zip(chm.src.transform[:6], dtm.src.transform[:6])))
+        if not _same_grid:
+            st.sidebar.info(
+                'CHM is on a different grid than the DTM — it\'s anchored by '
+                'location, but sampled across grids (nearest pixel), not 1:1.')
+    else:
+        st.sidebar.warning(f'CHM ignored — does not fit DTM: {_why}')
+
 bounds = dtm.src.bounds
 is_geo = dtm.src.crs.is_geographic if dtm.src.crs else True
 elev_min, elev_max = float(np.nanmin(dtm.array)), float(np.nanmax(dtm.array))
@@ -295,6 +419,7 @@ if compute_btn and st.session_state.polygon is not None:
                 pulse_freq_hz=int(pulse_freq), scan_freq_hz=float(scan_freq),
                 scan_half_angle_deg=fov / 2.0, speed_ms=float(speed_ms),
                 min_points=int(min_points), is_geo=is_geo,
+                chm=chm, veg_penetration=float(veg_penetration),
             )
 
 # ------------------------------------------------------------------ build map
@@ -310,6 +435,18 @@ folium.raster_layers.ImageOverlay(
     opacity=0.75,
     name='DTM elevation',
 ).add_to(m)
+
+# CHM (vegetation) overlay — off by default, toggle via the layer control.
+if chm is not None:
+    cb = chm.src.bounds
+    chm_b64 = base64.b64encode(chm_to_png(chm_path)).decode()
+    folium.raster_layers.ImageOverlay(
+        image=f'data:image/png;base64,{chm_b64}',
+        bounds=[[cb.bottom, cb.left], [cb.top, cb.right]],
+        opacity=0.6,
+        name='CHM (vegetation)',
+        show=False,
+    ).add_to(m)
 
 # Draw tool
 Draw(
