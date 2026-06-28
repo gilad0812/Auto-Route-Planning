@@ -463,7 +463,23 @@ def run_helios(
                 str(_conda_root / "Scripts"),
                 str(_conda_root / "DLLs"),
             ]
-            run_env["PATH"] = os.pathsep.join(_dll_dirs) + os.pathsep + run_env.get("PATH", "")
+            # Build a CLEAN PATH (conda dirs + Windows system dirs only) instead
+            # of inheriting ours. The parent process's PATH — the project venv's
+            # rasterio/GDAL DLLs in dev, or the PyInstaller bundle's DLLs in the
+            # frozen .exe — otherwise shadows HELIOS's own libraries and it dies
+            # at startup with a wrong-version DLL (STATUS_ENTRYPOINT_NOT_FOUND,
+            # 0xC0000139). A clean PATH makes HELIOS load only its own DLLs.
+            _winroot = os.environ.get("SystemRoot", r"C:\Windows")
+            _sys_dirs = [
+                os.path.join(_winroot, "System32"),
+                _winroot,
+                os.path.join(_winroot, "System32", "Wbem"),
+            ]
+            run_env["PATH"] = os.pathsep.join(_dll_dirs + _sys_dirs)
+            # Drop our GDAL/PROJ data pointers so HELIOS uses its own (a stray
+            # PROJ_LIB/GDAL_DATA from rasterio can mismatch HELIOS's GDAL).
+            for _v in ("GDAL_DATA", "PROJ_LIB", "PROJ_DATA", "GDAL_DRIVER_PATH"):
+                run_env.pop(_v, None)
     else:
         # Walk up from the binary to find the Conda env root (has conda-meta/)
         _candidate = helios_bin.parent
