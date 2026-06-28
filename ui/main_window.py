@@ -16,6 +16,13 @@ from PySide6.QtWidgets import (
 
 from .planning import PlanParams, compute_plan, load_dtm, centered_box
 
+try:
+    from .view3d import View3D
+    _VIEW3D_ERR = None
+except Exception as _e:                       # pyvista/pyvistaqt missing or no GL
+    View3D = None
+    _VIEW3D_ERR = str(_e)
+
 PULSE_FREQS = (150_000, 300_000, 600_000, 1_200_000, 1_800_000, 2_400_000)
 
 
@@ -152,9 +159,18 @@ class MainWindow(QMainWindow):
         self.lbl_summary.setWordWrap(True)
         sv.addWidget(self.lbl_summary); sv.addStretch(1)
         self.tabs.addTab(summ, 'Summary')
-        # stubs
+        # Map stub (lands in step 3)
         self.tabs.addTab(self._stub('🗺  Map view — Leaflet via QWebEngineView (next)'), 'Map')
-        self.tabs.addTab(self._stub('⛰  3D view — PyVista terrain + draped route (next)'), '3D')
+        # 3D view (PyVista) — live, or a hint if the deps are missing
+        if View3D is not None:
+            self.view3d = View3D()
+            self.tabs.addTab(self.view3d, '3D')
+        else:
+            self.view3d = None
+            self.tabs.addTab(
+                self._stub('⛰  3D view needs PyVista.\n'
+                           'pip install pyvista pyvistaqt\n\n' + (_VIEW3D_ERR or '')),
+                '3D')
         return self.tabs
 
     def _stub(self, text):
@@ -231,8 +247,25 @@ class MainWindow(QMainWindow):
             return
         self.setEnabled(True)
         self._render_summary(self.result)
+        self._render_3d(self.result)
         self.tabs.setCurrentIndex(0)
         self.statusBar().showMessage('Done.')
+
+    def _render_3d(self, r):
+        if self.view3d is None or not r.route:
+            return
+        wps = [w for w in r.route
+               if not (isinstance(w['z'], float) and math.isnan(w['z']))]
+        per = (r.safety or {}).get('profile', {}).get('per_wp', [])
+        clear = [c for *_xyz, c in per] if per else [0.0] * len(wps)
+        if len(clear) != len(wps):            # safety not run (e.g. <2 wp)
+            clear = [0.0] * len(wps)
+        try:
+            self.view3d.update_scene(
+                self.dtm, wps, clear, is_geo=self.is_geo,
+                floor_m=self.sp_floor.value(), ceiling_m=self.sp_ceiling.value())
+        except Exception as e:
+            self.statusBar().showMessage(f'3D render failed: {e}')
 
     # ---------------------------------------------------------------- render
     def _render_summary(self, r):
