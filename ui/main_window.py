@@ -23,6 +23,15 @@ except Exception as _e:                       # pyvista/pyvistaqt missing or no 
     View3D = None
     _VIEW3D_ERR = str(_e)
 
+try:
+    from .mapview import MapView
+    _MAPVIEW_ERR = None
+except Exception as _e:                       # QtWebEngine missing
+    MapView = None
+    _MAPVIEW_ERR = str(_e)
+
+from shapely.geometry import shape as shapely_shape
+
 PULSE_FREQS = (150_000, 300_000, 600_000, 1_200_000, 1_800_000, 2_400_000)
 
 
@@ -45,6 +54,7 @@ class MainWindow(QMainWindow):
         self.chm_path = None
         self.is_geo = True
         self.result = None
+        self.drawn_polygon = None        # shapely Polygon drawn on the map
 
         self._build_menu()
         self._build_body()
@@ -85,12 +95,19 @@ class MainWindow(QMainWindow):
         dl.addWidget(self.lbl_chm); dl.addLayout(chm_row)
         v.addWidget(gb_data)
 
-        # ── AOI (map stub) ──
-        gb_aoi = QGroupBox('AOI (map view lands next)')
+        # ── AOI ──
+        gb_aoi = QGroupBox('AOI')
         al = QFormLayout(gb_aoi)
         self.sp_aoi = QDoubleSpinBox(); self.sp_aoi.setRange(5, 100)
         self.sp_aoi.setValue(50); self.sp_aoi.setSuffix(' %')
         al.addRow('Centered box', self.sp_aoi)
+        self.lbl_aoi = QLabel('Using centered box. Draw a polygon on the Map '
+                              'tab to override.')
+        self.lbl_aoi.setWordWrap(True); self.lbl_aoi.setStyleSheet('color:#888;')
+        b_clear_aoi = QPushButton('Clear drawn AOI')
+        b_clear_aoi.clicked.connect(self._clear_aoi)
+        al.addRow(self.lbl_aoi)
+        al.addRow(b_clear_aoi)
         v.addWidget(gb_aoi)
 
         # ── Flight ──
@@ -159,8 +176,16 @@ class MainWindow(QMainWindow):
         self.lbl_summary.setWordWrap(True)
         sv.addWidget(self.lbl_summary); sv.addStretch(1)
         self.tabs.addTab(summ, 'Summary')
-        # Map stub (lands in step 3)
-        self.tabs.addTab(self._stub('🗺  Map view — Leaflet via QWebEngineView (next)'), 'Map')
+        # Map view (Leaflet in QWebEngineView) — draw the AOI here
+        if MapView is not None:
+            self.mapview = MapView()
+            self.mapview.polygonDrawn.connect(self._on_polygon_drawn)
+            self.tabs.addTab(self.mapview, 'Map')
+        else:
+            self.mapview = None
+            self.tabs.addTab(
+                self._stub('🗺  Map view needs QtWebEngine.\n' + (_MAPVIEW_ERR or '')),
+                'Map')
         # 3D view (PyVista) — live, or a hint if the deps are missing
         if View3D is not None:
             self.view3d = View3D()
@@ -196,7 +221,10 @@ class MainWindow(QMainWindow):
         h, w = self.dtm.array.shape
         self.lbl_dtm.setText(f'DTM: {path}\n{w}×{h} px · CRS {crs}')
         self.btn_compute.setEnabled(True)
-        self.statusBar().showMessage('DTM loaded. Set params and Compute.')
+        self.drawn_polygon = None
+        self._refresh_map()
+        self.statusBar().showMessage('DTM loaded. Draw an AOI on the Map tab '
+                                     'or use the centered box, then Compute.')
 
     def _open_chm(self):
         if self.dtm is None:
@@ -211,10 +239,33 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, 'CHM error', str(e)); return
         self.chm_path = path
         self.lbl_chm.setText(f'CHM: {path}')
+        self._refresh_map()
 
     def _clear_chm(self):
         self.chm = None; self.chm_path = None
         self.lbl_chm.setText('CHM: (none)')
+        self._refresh_map()
+
+    def _refresh_map(self):
+        if self.mapview is not None and self.dtm is not None:
+            self.mapview.set_dtm(self.dtm, self.dtm_path, self.chm, self.chm_path)
+
+    def _on_polygon_drawn(self, geom):
+        try:
+            poly = shapely_shape(geom)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+        except Exception as e:
+            self.statusBar().showMessage(f'Bad polygon: {e}'); return
+        self.drawn_polygon = poly
+        self.lbl_aoi.setText('✓ Using the polygon drawn on the Map tab.')
+        self.statusBar().showMessage('AOI set from drawn polygon. Click Compute.')
+
+    def _clear_aoi(self):
+        self.drawn_polygon = None
+        self.lbl_aoi.setText('Using centered box. Draw a polygon on the Map '
+                             'tab to override.')
+        self._refresh_map()
 
     def _params(self):
         return PlanParams(
@@ -234,7 +285,8 @@ class MainWindow(QMainWindow):
     def _compute(self):
         if self.dtm is None:
             return
-        poly = centered_box(self.dtm, frac=self.sp_aoi.value() / 100.0)
+        poly = (self.drawn_polygon if self.drawn_polygon is not None
+                else centered_box(self.dtm, frac=self.sp_aoi.value() / 100.0))
         self.statusBar().showMessage('Computing…')
         self.setEnabled(False)
         try:
