@@ -300,8 +300,17 @@ class MainWindow(QMainWindow):
         self.setEnabled(True)
         self._render_summary(self.result)
         self._render_3d(self.result)
+        self._render_map_overlays(self.result)
         self.tabs.setCurrentIndex(0)
         self.statusBar().showMessage('Done.')
+
+    def _render_map_overlays(self, r):
+        if self.mapview is None:
+            return
+        wps = [w for w in r.route
+               if not (isinstance(w['z'], float) and math.isnan(w['z']))]
+        cells = (r.estimate or {}).get('failing_cells_geo', [])
+        self.mapview.show_plan(wps, cells, density_color='#ff9900')
 
     def _render_3d(self, r):
         if self.view3d is None or not r.route:
