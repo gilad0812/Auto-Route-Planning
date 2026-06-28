@@ -8,3 +8,4 @@ folium
 streamlit-folium
 Pillow
 laspy[lazrs]
+plotly

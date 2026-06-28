@@ -24,6 +24,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 from dtm import DTM
 from route_planner import plan_route, plan_route_adaptive
 from density_estimate import estimate_density_grid
+from safety import mission_safety
+from viz3d import route_3d_figure
 
 try:
     from helios_integration import run_feedback_loop, export_trajectory
@@ -285,6 +287,19 @@ with st.sidebar:
              'Reduces HELIOS++ refinement iterations and keeps point density uniform.',
     )
     step_m    = st.number_input('Along-track step (m)',  value=50.0,  min_value=1.0,    step=5.0)
+
+    st.markdown('**Safety limits**')
+    clearance_floor = st.number_input(
+        'Min terrain clearance (m)', value=30.0, min_value=0.0, step=5.0,
+        help='Minimum height the flight path must keep above terrain ANYWHERE, '
+             'including the climb/descent on turns between passes. Flagged red below this.',
+    )
+    agl_ceiling = st.number_input(
+        'Max AGL ceiling (m)', value=120.0, min_value=1.0, step=5.0,
+        help='Regulatory / density ceiling (e.g. the 120 m rule). Constant-altitude '
+             'passes fly high above the low end of sloped terrain; waypoints over this '
+             'are flagged.',
+    )
 
     st.markdown('**Scanner & density**')
     st.caption('Drives the density estimate run on Compute, and HELIOS++ '
@@ -674,6 +689,52 @@ if st.session_state.route:
             file_name='route.csv', mime='text/csv',
             use_container_width=True,
         )
+
+# ------------------------------------------------------------------ safety & 3D view
+
+if st.session_state.route:
+    _swps = [wp for wp in st.session_state.route
+             if not (isinstance(wp['z'], float) and math.isnan(wp['z']))]
+    if len(_swps) >= 2:
+        st.divider()
+        st.markdown('### Safety & 3D view')
+        _safe = mission_safety(_swps, dtm, is_geo=is_geo,
+                               clearance_floor_m=float(clearance_floor),
+                               agl_ceiling_m=float(agl_ceiling))
+        sc1, sc2, sc3 = st.columns(3)
+        _mc = _safe['min_clear']
+        sc1.metric('Min clearance', f"{_mc:.0f} m",
+                   delta=f"{_mc - _safe['floor']:+.0f} vs floor",
+                   delta_color='normal' if _safe['floor_ok'] else 'inverse')
+        sc2.metric('Max AGL', f"{_safe['max_agl']:.0f} m",
+                   delta=f"{_safe['max_agl'] - _safe['ceiling']:+.0f} vs ceiling",
+                   delta_color='normal' if _safe['ceiling_ok'] else 'inverse')
+        sc3.metric('Over ceiling', f"{_safe['n_over_ceiling']} / {_safe['n_wp']} wp")
+        if _safe['floor_ok'] and _safe['ceiling_ok']:
+            st.success(f"✓ Path stays ≥{_safe['floor']:.0f} m clear and "
+                       f"≤{_safe['ceiling']:.0f} m AGL.")
+        else:
+            _msgs = []
+            if not _safe['floor_ok']:
+                _msgs.append(f"dips to {_mc:.0f} m clearance "
+                             f"(< {_safe['floor']:.0f} m floor)")
+            if not _safe['ceiling_ok']:
+                _msgs.append(f"{_safe['n_over_ceiling']} waypoint(s) above the "
+                             f"{_safe['ceiling']:.0f} m AGL ceiling "
+                             f"(max {_safe['max_agl']:.0f} m)")
+            st.warning("⚠ " + "; ".join(_msgs) + ".")
+        _cl = [c for *_xyz, c in _safe['profile']['per_wp']]
+        try:
+            _fig = route_3d_figure(dtm, _swps, _cl, is_geo=is_geo,
+                                   ceiling_m=float(agl_ceiling),
+                                   floor_m=float(clearance_floor))
+            st.plotly_chart(_fig, use_container_width=True)
+            st.caption('Drag to rotate · scroll to zoom. Path colour = terrain '
+                       'clearance (red = near the floor, green = ample). Surface '
+                       'is the DTM around the route.')
+        except ModuleNotFoundError:
+            st.info('Install `plotly` for the interactive 3D terrain view '
+                    '(`pip install plotly`).')
 
 # ------------------------------------------------------------------ HELIOS++ validation
 
