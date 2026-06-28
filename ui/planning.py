@@ -1,8 +1,8 @@
 """UI-agnostic glue between the Qt views and the model in ``src/``.
 
 Keeps the widget code thin: load a DTM/CHM, build an AOI polygon, run the route
-plan + density estimate + safety check, and return a plain result object. No Qt
-imports here on purpose — this is testable without a display.
+plan + density estimate, and return a plain result object. No Qt imports here on
+purpose — this is testable without a display.
 """
 import math
 import os
@@ -17,7 +17,6 @@ from shapely.geometry import Polygon                     # noqa: E402
 from dtm import DTM                                      # noqa: E402
 from route_planner import plan_route_adaptive, plan_route  # noqa: E402
 from density_estimate import estimate_density_grid       # noqa: E402
-from safety import mission_safety                        # noqa: E402
 
 _LAT_M = 111139.0
 
@@ -30,12 +29,10 @@ class PlanParams:
     overlap_pct: float = 20.0
     adaptive_spacing: bool = True
     step_m: float = 50.0
-    min_clearance_m: float = 30.0
-    agl_ceiling_m: float = 120.0
     min_points: int = 100
-    speed_ms: float = 8.0
-    pulse_freq_hz: int = 1_200_000
-    scan_freq_hz: float = 200.0
+    speed_ms: float = 6.0
+    pulse_freq_hz: int = 600_000
+    scan_freq_hz: float = 224.4
     veg_penetration: float = 0.4
 
 
@@ -43,7 +40,6 @@ class PlanParams:
 class PlanResult:
     route: list = field(default_factory=list)
     estimate: dict = field(default_factory=dict)
-    safety: dict = field(default_factory=dict)
     polygon: object = None
     area_m2: float = 0.0
     path_len_m: float = 0.0
@@ -85,7 +81,7 @@ def _path_length_m(route, is_geo):
 
 
 def compute_plan(dtm, polygon, params: PlanParams, chm=None, is_geo=True):
-    """Run plan + estimate + safety for one AOI. Returns a PlanResult."""
+    """Run plan + density estimate for one AOI. Returns a PlanResult."""
     to_m = _LAT_M if is_geo else 1.0
     step_map = params.step_m / to_m
     dtm_res_map = min(abs(dtm.src.res[0]), abs(dtm.src.res[1]))
@@ -121,12 +117,6 @@ def compute_plan(dtm, polygon, params: PlanParams, chm=None, is_geo=True):
 
     wps = [w for w in route
            if not (isinstance(w['z'], float) and math.isnan(w['z']))]
-    if len(wps) >= 2:
-        res.safety = mission_safety(
-            wps, dtm, is_geo=is_geo,
-            clearance_floor_m=float(params.min_clearance_m),
-            agl_ceiling_m=float(params.agl_ceiling_m),
-        )
     res.n_waypoints = len(wps)
     res.path_len_m = _path_length_m(route, is_geo)
     if wps:

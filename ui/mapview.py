@@ -161,18 +161,15 @@ window.showRoute=function(segs,start,end){
     fillOpacity:1,weight:1}).bindTooltip('End').addTo(routeLayer);
 };
 window.clearRoute=function(){routeLayer.clearLayers();};
-window.showDensity=function(pts,color,heat){
+window.showDensity=function(pts,color,radiusM){
   densityLayer.clearLayers();
   if(!pts.length)return;
-  if(heat){
-    L.heatLayer(pts.map(function(p){return [p[0],p[1],1];}),
-      {radius:8,blur:6,minOpacity:0.4}).addTo(densityLayer);
-  }else{
-    pts.forEach(function(p){
-      L.circleMarker([p[0],p[1]],{radius:2.5,color:color,fillColor:color,
-        fillOpacity:0.6,weight:0}).addTo(densityLayer);
-    });
-  }
+  // Ground-sized circles (metres): tiny when zoomed out so they don't flood
+  // the map, real-size when zoomed in. Low opacity keeps it a hint, not a wall.
+  pts.forEach(function(p){
+    L.circle([p[0],p[1]],{radius:radiusM,color:color,fillColor:color,
+      fillOpacity:0.30,weight:0,stroke:false}).addTo(densityLayer);
+  });
 };
 window.clearDensity=function(){densityLayer.clearLayers();};
 </script></body></html>"""
@@ -225,9 +222,12 @@ class MapView(QWidget):
             return
         self.polygonDrawn.emit(geom)
 
-    def show_plan(self, route_wps, density_cells, density_color='#ff9900'):
+    def show_plan(self, route_wps, density_cells, density_color='#ff9900',
+                  density_radius_m=2.0, max_density_pts=6000):
         """Draw the route (altitude-coloured) and under-density cells on the map.
-        density_cells is a list of (lon, lat); many cells switch to a heatmap."""
+        density_cells is a list of (lon, lat). Cells are drawn as ground-sized
+        circles (density_radius_m), capped/subsampled so they stay a hint rather
+        than flooding the map when zoomed out."""
         if route_wps and len(route_wps) >= 2:
             segs, start, end = route_segments(route_wps)
             self._run_js(f'showRoute({json.dumps(segs)},'
@@ -236,9 +236,11 @@ class MapView(QWidget):
             self._run_js('clearRoute();')
         pts = [[lat, lon] for lon, lat in (density_cells or [])]
         if pts:
-            heat = 'true' if len(pts) > 800 else 'false'
+            if len(pts) > max_density_pts:
+                step = len(pts) / max_density_pts
+                pts = [pts[int(i * step)] for i in range(max_density_pts)]
             self._run_js(f'showDensity({json.dumps(pts)},'
-                         f'{json.dumps(density_color)},{heat});')
+                         f'{json.dumps(density_color)},{float(density_radius_m)});')
         else:
             self._run_js('clearDensity();')
 

@@ -11,10 +11,10 @@ from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QFormLayout, QDoubleSpinBox, QSpinBox, QCheckBox, QComboBox, QGroupBox,
-    QSplitter, QTabWidget, QScrollArea, QFileDialog, QMessageBox, QFrame,
+    QSplitter, QScrollArea, QFileDialog, QMessageBox, QFrame,
 )
 
-from .planning import PlanParams, compute_plan, load_dtm, centered_box
+from .planning import PlanParams, compute_plan, load_dtm
 
 try:
     from .mapview import MapView
@@ -63,11 +63,13 @@ class MainWindow(QMainWindow):
 
     def _build_body(self):
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(self._build_sidebar())
-        splitter.addWidget(self._build_views())
+        splitter.addWidget(self._build_sidebar())      # params (left)
+        splitter.addWidget(self._build_map())          # map (center)
+        splitter.addWidget(self._build_summary())      # results (right)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([360, 920])
+        splitter.setStretchFactor(2, 0)
+        splitter.setSizes([340, 760, 300])
         self.setCentralWidget(splitter)
 
     def _build_sidebar(self):
@@ -90,17 +92,12 @@ class MainWindow(QMainWindow):
 
         # ── AOI ──
         gb_aoi = QGroupBox('AOI')
-        al = QFormLayout(gb_aoi)
-        self.sp_aoi = QDoubleSpinBox(); self.sp_aoi.setRange(5, 100)
-        self.sp_aoi.setValue(50); self.sp_aoi.setSuffix(' %')
-        al.addRow('Centered box', self.sp_aoi)
-        self.lbl_aoi = QLabel('Using centered box. Draw a polygon on the Map '
-                              'tab to override.')
+        al = QVBoxLayout(gb_aoi)
+        self.lbl_aoi = QLabel('Draw a polygon on the map to set the AOI.')
         self.lbl_aoi.setWordWrap(True); self.lbl_aoi.setStyleSheet('color:#888;')
         b_clear_aoi = QPushButton('Clear drawn AOI')
         b_clear_aoi.clicked.connect(self._clear_aoi)
-        al.addRow(self.lbl_aoi)
-        al.addRow(b_clear_aoi)
+        al.addWidget(self.lbl_aoi); al.addWidget(b_clear_aoi)
         v.addWidget(gb_aoi)
 
         # ── Flight ──
@@ -116,25 +113,16 @@ class MainWindow(QMainWindow):
         fl.addRow('Along-track step', self.sp_step)
         v.addWidget(gb_flight)
 
-        # ── Safety ──
-        gb_safe = QGroupBox('Safety limits')
-        sl = QFormLayout(gb_safe)
-        self.sp_floor = self._dspin(0, 1000, 30, ' m', 5)
-        self.sp_ceiling = self._dspin(1, 1000, 120, ' m', 5)
-        sl.addRow('Min clearance', self.sp_floor)
-        sl.addRow('Max AGL ceiling', self.sp_ceiling)
-        v.addWidget(gb_safe)
-
         # ── Scanner & density ──
         gb_scan = QGroupBox('Scanner & density')
         scl = QFormLayout(gb_scan)
         self.sp_minpts = QSpinBox(); self.sp_minpts.setRange(1, 100000); self.sp_minpts.setValue(100)
-        self.sp_speed = self._dspin(0.1, 50, 8.0, ' m/s', 0.5)
+        self.sp_speed = self._dspin(0.1, 50, 6.0, ' m/s', 0.5)
         self.cmb_pulse = QComboBox()
         for f in PULSE_FREQS:
             self.cmb_pulse.addItem(f'{f:,}', f)
-        self.cmb_pulse.setCurrentText('1,200,000')
-        self.sp_scanfreq = self._dspin(1, 5000, 200, ' Hz', 10)
+        self.cmb_pulse.setCurrentText('600,000')
+        self.sp_scanfreq = self._dspin(1, 5000, 224.4, ' Hz', 10)
         self.sp_veg = self._dspin(0, 1, 0.4, '', 0.05); self.sp_veg.setDecimals(2)
         scl.addRow('Min points / m²', self.sp_minpts)
         scl.addRow('Drone speed', self.sp_speed)
@@ -159,27 +147,26 @@ class MainWindow(QMainWindow):
         s.setSuffix(suffix); s.setSingleStep(step)
         return s
 
-    def _build_views(self):
-        self.tabs = QTabWidget()
-        # Summary tab
-        summ = QWidget(); sv = QVBoxLayout(summ)
+    def _build_map(self):
+        # Map view (Leaflet in QWebEngineView) — draw the AOI here.
+        if MapView is not None:
+            self.mapview = MapView()
+            self.mapview.polygonDrawn.connect(self._on_polygon_drawn)
+            return self.mapview
+        self.mapview = None
+        return self._stub('🗺  Map view needs QtWebEngine.\n' + (_MAPVIEW_ERR or ''))
+
+    def _build_summary(self):
+        panel = QWidget(); sv = QVBoxLayout(panel)
+        title = QLabel('<b>Results</b>')
         self.lbl_summary = QLabel('Compute a route to see results.')
         self.lbl_summary.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.lbl_summary.setTextFormat(Qt.RichText)
         self.lbl_summary.setWordWrap(True)
-        sv.addWidget(self.lbl_summary); sv.addStretch(1)
-        self.tabs.addTab(summ, 'Summary')
-        # Map view (Leaflet in QWebEngineView) — draw the AOI here
-        if MapView is not None:
-            self.mapview = MapView()
-            self.mapview.polygonDrawn.connect(self._on_polygon_drawn)
-            self.tabs.addTab(self.mapview, 'Map')
-        else:
-            self.mapview = None
-            self.tabs.addTab(
-                self._stub('🗺  Map view needs QtWebEngine.\n' + (_MAPVIEW_ERR or '')),
-                'Map')
-        return self.tabs
+        sv.addWidget(title); sv.addWidget(self.lbl_summary); sv.addStretch(1)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(panel)
+        scroll.setMinimumWidth(260)
+        return scroll
 
     def _stub(self, text):
         w = QWidget(); l = QVBoxLayout(w)
@@ -203,11 +190,12 @@ class MainWindow(QMainWindow):
         self.is_geo = crs.is_geographic if crs else True
         h, w = self.dtm.array.shape
         self.lbl_dtm.setText(f'DTM: {path}\n{w}×{h} px · CRS {crs}')
-        self.btn_compute.setEnabled(True)
         self.drawn_polygon = None
+        self.btn_compute.setEnabled(False)
+        self.lbl_aoi.setText('Draw a polygon on the map to set the AOI.')
         self._refresh_map()
-        self.statusBar().showMessage('DTM loaded. Draw an AOI on the Map tab '
-                                     'or use the centered box, then Compute.')
+        self.statusBar().showMessage('DTM loaded. Draw an AOI on the map, '
+                                     'then Compute.')
 
     def _open_chm(self):
         if self.dtm is None:
@@ -241,13 +229,14 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.statusBar().showMessage(f'Bad polygon: {e}'); return
         self.drawn_polygon = poly
-        self.lbl_aoi.setText('✓ Using the polygon drawn on the Map tab.')
+        self.lbl_aoi.setText('✓ AOI set from the drawn polygon.')
+        self.btn_compute.setEnabled(True)
         self.statusBar().showMessage('AOI set from drawn polygon. Click Compute.')
 
     def _clear_aoi(self):
         self.drawn_polygon = None
-        self.lbl_aoi.setText('Using centered box. Draw a polygon on the Map '
-                             'tab to override.')
+        self.btn_compute.setEnabled(False)
+        self.lbl_aoi.setText('Draw a polygon on the map to set the AOI.')
         self._refresh_map()
 
     def _params(self):
@@ -256,8 +245,6 @@ class MainWindow(QMainWindow):
             overlap_pct=self.sp_overlap.value(),
             adaptive_spacing=self.cb_adaptive.isChecked(),
             step_m=self.sp_step.value(),
-            min_clearance_m=self.sp_floor.value(),
-            agl_ceiling_m=self.sp_ceiling.value(),
             min_points=self.sp_minpts.value(),
             speed_ms=self.sp_speed.value(),
             pulse_freq_hz=self.cmb_pulse.currentData(),
@@ -268,8 +255,10 @@ class MainWindow(QMainWindow):
     def _compute(self):
         if self.dtm is None:
             return
-        poly = (self.drawn_polygon if self.drawn_polygon is not None
-                else centered_box(self.dtm, frac=self.sp_aoi.value() / 100.0))
+        if self.drawn_polygon is None:
+            QMessageBox.information(self, 'AOI', 'Draw a polygon on the map first.')
+            return
+        poly = self.drawn_polygon
         self.statusBar().showMessage('Computing…')
         self.setEnabled(False)
         try:
@@ -283,7 +272,6 @@ class MainWindow(QMainWindow):
         self.setEnabled(True)
         self._render_summary(self.result)
         self._render_map_overlays(self.result)
-        self.tabs.setCurrentIndex(0)
         self.statusBar().showMessage('Done.')
 
     def _render_map_overlays(self, r):
@@ -291,8 +279,11 @@ class MainWindow(QMainWindow):
             return
         wps = [w for w in r.route
                if not (isinstance(w['z'], float) and math.isnan(w['z']))]
-        cells = (r.estimate or {}).get('failing_cells_geo', [])
-        self.mapview.show_plan(wps, cells, density_color='#ff9900')
+        est = r.estimate or {}
+        cells = est.get('failing_cells_geo', [])
+        rad = max(float(est.get('cell_size_m', 2.0)), 3.0)
+        self.mapview.show_plan(wps, cells, density_color='#ff9900',
+                               density_radius_m=rad)
 
     # ---------------------------------------------------------------- render
     def _render_summary(self, r):
@@ -300,16 +291,12 @@ class MainWindow(QMainWindow):
             self.lbl_summary.setText('No route produced (AOI too small or off the DTM).')
             return
         est = r.estimate or {}
-        saf = r.safety or {}
         area = (f'{r.area_m2 / 1e6:.3f} km²' if r.area_m2 >= 1e6
                 else f'{r.area_m2:,.0f} m²')
         plen = (f'{r.path_len_m / 1000:.2f} km' if r.path_len_m >= 1000
                 else f'{r.path_len_m:.0f} m')
         ncell = max(est.get('n_cells', 0), 1)
         cov = 100.0 * (est.get('n_cells', 0) - est.get('n_fail', 0)) / ncell
-
-        def color(ok):
-            return '#1a7f37' if ok else '#cf222e'
 
         rows = [
             ('<b>Polygon</b>', ''),
@@ -327,22 +314,4 @@ class MainWindow(QMainWindow):
         for k, val in rows:
             html.append(f'<tr><td>{k}</td><td><b>{val}</b></td></tr>')
         html.append('</table>')
-
-        if saf:
-            mc = saf['min_clear']
-            html.append('<br><b>Safety</b><table cellspacing=6>')
-            html.append(f'<tr><td>Min clearance</td>'
-                        f'<td style="color:{color(saf["floor_ok"])}"><b>{mc:.0f} m</b> '
-                        f'(floor {saf["floor"]:.0f})</td></tr>')
-            html.append(f'<tr><td>Max AGL</td>'
-                        f'<td style="color:{color(saf["ceiling_ok"])}"><b>{saf["max_agl"]:.0f} m</b> '
-                        f'(ceiling {saf["ceiling"]:.0f})</td></tr>')
-            html.append(f'<tr><td>Over ceiling</td>'
-                        f'<td><b>{saf["n_over_ceiling"]} / {saf["n_wp"]}</b> wp</td></tr>')
-            html.append('</table>')
-            ok = saf['floor_ok'] and saf['ceiling_ok']
-            msg = ('✓ Path within safety limits.' if ok
-                   else '⚠ Path violates a safety limit (see red above).')
-            html.append(f'<p style="color:{color(ok)}"><b>{msg}</b></p>')
-
         self.lbl_summary.setText(''.join(html))
