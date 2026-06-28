@@ -3,6 +3,4 @@
 # Docker image stays lean.
 -r requirements.txt
 PySide6
-pyvista          # 3D terrain view (step 2)
-pyvistaqt        # embeds the PyVista render window in Qt (step 2)
-PySide6-WebEngine ; platform_system != "Linux"   # map view (step 3); on Linux it ships in PySide6
+PySide6-WebEngine ; platform_system != "Linux"   # map view; on Linux it ships in PySide6
