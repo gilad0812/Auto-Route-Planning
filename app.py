@@ -284,13 +284,6 @@ with st.sidebar:
              'narrows the effective swath, instead of one constant spacing everywhere. '
              'Reduces HELIOS++ refinement iterations and keeps point density uniform.',
     )
-    max_relief_line = st.number_input(
-        'Max climb per line (m, 0 = off)', value=0.0, min_value=0.0, step=10.0,
-        help='When a straight pass would climb/descend more than this, split it '
-             'into separate straight lines, each held at its own constant altitude '
-             '(registration-safe) so the drone stays low above steep terrain. '
-             '0 disables splitting.',
-    )
     step_m    = st.number_input('Along-track step (m)',  value=50.0,  min_value=1.0,    step=5.0)
 
     st.markdown('**Scanner & density**')
@@ -402,7 +395,6 @@ if compute_btn and st.session_state.polygon is not None:
                 scan_half_angle_deg=fov / 2.0, step=step_map,
                 overlap_frac=overlap / 100.0, is_geo=is_geo,
                 elev_sample_step=elev_step_map,
-                max_relief_per_line_m=(max_relief_line if max_relief_line > 0 else None),
             )
         else:
             st.session_state.route = plan_route(
