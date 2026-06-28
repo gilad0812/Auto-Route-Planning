@@ -17,10 +17,10 @@ from PySide6.QtWidgets import (
 from .planning import PlanParams, compute_plan, load_dtm
 
 try:
-    from .mapview import MapView
+    from .canvasmap import CanvasMap
     _MAPVIEW_ERR = None
-except Exception as _e:                       # QtWebEngine missing
-    MapView = None
+except Exception as _e:
+    CanvasMap = None
     _MAPVIEW_ERR = str(_e)
 
 from shapely.geometry import shape as shapely_shape
@@ -148,13 +148,13 @@ class MainWindow(QMainWindow):
         return s
 
     def _build_map(self):
-        # Map view (Leaflet in QWebEngineView) — draw the AOI here.
-        if MapView is not None:
-            self.mapview = MapView()
+        # Native Qt map canvas (offline) — DTM relief, draw the AOI here.
+        if CanvasMap is not None:
+            self.mapview = CanvasMap()
             self.mapview.polygonDrawn.connect(self._on_polygon_drawn)
             return self.mapview
         self.mapview = None
-        return self._stub('🗺  Map view needs QtWebEngine.\n' + (_MAPVIEW_ERR or ''))
+        return self._stub('🗺  Map canvas failed to load.\n' + (_MAPVIEW_ERR or ''))
 
     def _build_summary(self):
         panel = QWidget(); sv = QVBoxLayout(panel)

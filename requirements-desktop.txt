@@ -3,4 +3,4 @@
 # Docker image stays lean.
 -r requirements.txt
 PySide6
-PySide6-WebEngine ; platform_system != "Linux"   # map view; on Linux it ships in PySide6
+# Map is a native QGraphicsView canvas (offline) — no QtWebEngine needed.
