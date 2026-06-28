@@ -1,0 +1,288 @@
+"""Main window for the desktop planner (step-1 skeleton).
+
+Left: parameter sidebar + Compute. Right: tabbed views — Summary (live now),
+Map and 3D (stubs, landing next). Compute runs the existing model and fills the
+Summary + Safety panels, proving the desktop loop end to end.
+"""
+import math
+
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QAction
+from PySide6.QtWidgets import (
+    QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
+    QFormLayout, QDoubleSpinBox, QSpinBox, QCheckBox, QComboBox, QGroupBox,
+    QSplitter, QTabWidget, QScrollArea, QFileDialog, QMessageBox, QFrame,
+)
+
+from .planning import PlanParams, compute_plan, load_dtm, centered_box
+
+PULSE_FREQS = (150_000, 300_000, 600_000, 1_200_000, 1_800_000, 2_400_000)
+
+
+def _hr():
+    line = QFrame()
+    line.setFrameShape(QFrame.HLine)
+    line.setFrameShadow(QFrame.Sunken)
+    return line
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle('LiDAR Drone Route Planner — desktop')
+        self.resize(1280, 820)
+
+        self.dtm = None
+        self.dtm_path = None
+        self.chm = None
+        self.chm_path = None
+        self.is_geo = True
+        self.result = None
+
+        self._build_menu()
+        self._build_body()
+        self.statusBar().showMessage('Open a DTM to begin.')
+
+    # ---------------------------------------------------------------- UI build
+    def _build_menu(self):
+        m = self.menuBar().addMenu('&File')
+        a_dtm = QAction('Open DTM…', self); a_dtm.triggered.connect(self._open_dtm)
+        a_chm = QAction('Open CHM…', self); a_chm.triggered.connect(self._open_chm)
+        a_quit = QAction('Quit', self); a_quit.triggered.connect(self.close)
+        m.addAction(a_dtm); m.addAction(a_chm); m.addSeparator(); m.addAction(a_quit)
+
+    def _build_body(self):
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(self._build_sidebar())
+        splitter.addWidget(self._build_views())
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([360, 920])
+        self.setCentralWidget(splitter)
+
+    def _build_sidebar(self):
+        panel = QWidget()
+        v = QVBoxLayout(panel)
+
+        # ── Data ──
+        gb_data = QGroupBox('Data')
+        dl = QVBoxLayout(gb_data)
+        self.lbl_dtm = QLabel('DTM: (none)'); self.lbl_dtm.setWordWrap(True)
+        self.lbl_chm = QLabel('CHM: (none)'); self.lbl_chm.setWordWrap(True)
+        b_dtm = QPushButton('Open DTM…'); b_dtm.clicked.connect(self._open_dtm)
+        chm_row = QHBoxLayout()
+        b_chm = QPushButton('Open CHM…'); b_chm.clicked.connect(self._open_chm)
+        b_chm_clear = QPushButton('Clear'); b_chm_clear.clicked.connect(self._clear_chm)
+        chm_row.addWidget(b_chm); chm_row.addWidget(b_chm_clear)
+        dl.addWidget(self.lbl_dtm); dl.addWidget(b_dtm)
+        dl.addWidget(self.lbl_chm); dl.addLayout(chm_row)
+        v.addWidget(gb_data)
+
+        # ── AOI (map stub) ──
+        gb_aoi = QGroupBox('AOI (map view lands next)')
+        al = QFormLayout(gb_aoi)
+        self.sp_aoi = QDoubleSpinBox(); self.sp_aoi.setRange(5, 100)
+        self.sp_aoi.setValue(50); self.sp_aoi.setSuffix(' %')
+        al.addRow('Centered box', self.sp_aoi)
+        v.addWidget(gb_aoi)
+
+        # ── Flight ──
+        gb_flight = QGroupBox('Flight')
+        fl = QFormLayout(gb_flight)
+        self.sp_alt = self._dspin(1, 1000, 100, ' m', 5)
+        self.sp_overlap = self._dspin(0, 99, 20, ' %', 5)
+        self.cb_adaptive = QCheckBox('Terrain-adaptive spacing'); self.cb_adaptive.setChecked(True)
+        self.sp_step = self._dspin(1, 500, 50, ' m', 5)
+        fl.addRow('Altitude AGL', self.sp_alt)
+        fl.addRow('Overlap', self.sp_overlap)
+        fl.addRow('', self.cb_adaptive)
+        fl.addRow('Along-track step', self.sp_step)
+        v.addWidget(gb_flight)
+
+        # ── Safety ──
+        gb_safe = QGroupBox('Safety limits')
+        sl = QFormLayout(gb_safe)
+        self.sp_floor = self._dspin(0, 1000, 30, ' m', 5)
+        self.sp_ceiling = self._dspin(1, 1000, 120, ' m', 5)
+        sl.addRow('Min clearance', self.sp_floor)
+        sl.addRow('Max AGL ceiling', self.sp_ceiling)
+        v.addWidget(gb_safe)
+
+        # ── Scanner & density ──
+        gb_scan = QGroupBox('Scanner & density')
+        scl = QFormLayout(gb_scan)
+        self.sp_minpts = QSpinBox(); self.sp_minpts.setRange(1, 100000); self.sp_minpts.setValue(100)
+        self.sp_speed = self._dspin(0.1, 50, 8.0, ' m/s', 0.5)
+        self.cmb_pulse = QComboBox()
+        for f in PULSE_FREQS:
+            self.cmb_pulse.addItem(f'{f:,}', f)
+        self.cmb_pulse.setCurrentText('1,200,000')
+        self.sp_scanfreq = self._dspin(1, 5000, 200, ' Hz', 10)
+        self.sp_veg = self._dspin(0, 1, 0.4, '', 0.05); self.sp_veg.setDecimals(2)
+        scl.addRow('Min points / m²', self.sp_minpts)
+        scl.addRow('Drone speed', self.sp_speed)
+        scl.addRow('Pulse freq', self.cmb_pulse)
+        scl.addRow('Scan freq', self.sp_scanfreq)
+        scl.addRow('Canopy ground-return frac', self.sp_veg)
+        scl.addRow(QLabel('FOV fixed at 100° (±50°)'))
+        v.addWidget(gb_scan)
+
+        self.btn_compute = QPushButton('Compute Route')
+        self.btn_compute.setEnabled(False)
+        self.btn_compute.clicked.connect(self._compute)
+        v.addWidget(self.btn_compute)
+        v.addStretch(1)
+
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(panel)
+        scroll.setMinimumWidth(340)
+        return scroll
+
+    def _dspin(self, lo, hi, val, suffix, step):
+        s = QDoubleSpinBox(); s.setRange(lo, hi); s.setValue(val)
+        s.setSuffix(suffix); s.setSingleStep(step)
+        return s
+
+    def _build_views(self):
+        self.tabs = QTabWidget()
+        # Summary tab
+        summ = QWidget(); sv = QVBoxLayout(summ)
+        self.lbl_summary = QLabel('Compute a route to see results.')
+        self.lbl_summary.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.lbl_summary.setTextFormat(Qt.RichText)
+        self.lbl_summary.setWordWrap(True)
+        sv.addWidget(self.lbl_summary); sv.addStretch(1)
+        self.tabs.addTab(summ, 'Summary')
+        # stubs
+        self.tabs.addTab(self._stub('🗺  Map view — Leaflet via QWebEngineView (next)'), 'Map')
+        self.tabs.addTab(self._stub('⛰  3D view — PyVista terrain + draped route (next)'), '3D')
+        return self.tabs
+
+    def _stub(self, text):
+        w = QWidget(); l = QVBoxLayout(w)
+        lab = QLabel(text); lab.setAlignment(Qt.AlignCenter)
+        lab.setStyleSheet('color:#888; font-size:15px;')
+        l.addStretch(1); l.addWidget(lab); l.addStretch(1)
+        return w
+
+    # ---------------------------------------------------------------- actions
+    def _open_dtm(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, 'Open DTM', '', 'GeoTIFF (*.tif *.tiff);;All files (*)')
+        if not path:
+            return
+        try:
+            self.dtm = load_dtm(path)
+        except Exception as e:
+            QMessageBox.critical(self, 'DTM error', str(e)); return
+        self.dtm_path = path
+        crs = self.dtm.src.crs
+        self.is_geo = crs.is_geographic if crs else True
+        h, w = self.dtm.array.shape
+        self.lbl_dtm.setText(f'DTM: {path}\n{w}×{h} px · CRS {crs}')
+        self.btn_compute.setEnabled(True)
+        self.statusBar().showMessage('DTM loaded. Set params and Compute.')
+
+    def _open_chm(self):
+        if self.dtm is None:
+            QMessageBox.information(self, 'CHM', 'Open a DTM first.'); return
+        path, _ = QFileDialog.getOpenFileName(
+            self, 'Open CHM', '', 'GeoTIFF (*.tif *.tiff);;All files (*)')
+        if not path:
+            return
+        try:
+            self.chm = load_dtm(path)
+        except Exception as e:
+            QMessageBox.critical(self, 'CHM error', str(e)); return
+        self.chm_path = path
+        self.lbl_chm.setText(f'CHM: {path}')
+
+    def _clear_chm(self):
+        self.chm = None; self.chm_path = None
+        self.lbl_chm.setText('CHM: (none)')
+
+    def _params(self):
+        return PlanParams(
+            altitude_m=self.sp_alt.value(),
+            overlap_pct=self.sp_overlap.value(),
+            adaptive_spacing=self.cb_adaptive.isChecked(),
+            step_m=self.sp_step.value(),
+            min_clearance_m=self.sp_floor.value(),
+            agl_ceiling_m=self.sp_ceiling.value(),
+            min_points=self.sp_minpts.value(),
+            speed_ms=self.sp_speed.value(),
+            pulse_freq_hz=self.cmb_pulse.currentData(),
+            scan_freq_hz=self.sp_scanfreq.value(),
+            veg_penetration=self.sp_veg.value(),
+        )
+
+    def _compute(self):
+        if self.dtm is None:
+            return
+        poly = centered_box(self.dtm, frac=self.sp_aoi.value() / 100.0)
+        self.statusBar().showMessage('Computing…')
+        self.setEnabled(False)
+        try:
+            self.result = compute_plan(self.dtm, poly, self._params(),
+                                       chm=self.chm, is_geo=self.is_geo)
+        except Exception as e:
+            self.setEnabled(True)
+            QMessageBox.critical(self, 'Compute error', str(e))
+            self.statusBar().showMessage('Compute failed.')
+            return
+        self.setEnabled(True)
+        self._render_summary(self.result)
+        self.tabs.setCurrentIndex(0)
+        self.statusBar().showMessage('Done.')
+
+    # ---------------------------------------------------------------- render
+    def _render_summary(self, r):
+        if not r.route:
+            self.lbl_summary.setText('No route produced (AOI too small or off the DTM).')
+            return
+        est = r.estimate or {}
+        saf = r.safety or {}
+        area = (f'{r.area_m2 / 1e6:.3f} km²' if r.area_m2 >= 1e6
+                else f'{r.area_m2:,.0f} m²')
+        plen = (f'{r.path_len_m / 1000:.2f} km' if r.path_len_m >= 1000
+                else f'{r.path_len_m:.0f} m')
+        ncell = max(est.get('n_cells', 0), 1)
+        cov = 100.0 * (est.get('n_cells', 0) - est.get('n_fail', 0)) / ncell
+
+        def color(ok):
+            return '#1a7f37' if ok else '#cf222e'
+
+        rows = [
+            ('<b>Polygon</b>', ''),
+            ('Area', area),
+            ('<b>Route</b>', ''),
+            ('Waypoints', f'{r.n_waypoints}'),
+            ('Path length', plen),
+            ('Alt range', f'{r.alt_min:.0f} – {r.alt_max:.0f} m'),
+            ('<b>Density estimate</b>', ''),
+            ('Coverage', f'{cov:.1f}%'),
+            ('Median density', f"{est.get('median_density', 0):.0f} pts/m²"),
+            ('Min density', f"{est.get('min_density', 0):.0f} pts/m²"),
+        ]
+        html = ['<table cellspacing=6>']
+        for k, val in rows:
+            html.append(f'<tr><td>{k}</td><td><b>{val}</b></td></tr>')
+        html.append('</table>')
+
+        if saf:
+            mc = saf['min_clear']
+            html.append('<br><b>Safety</b><table cellspacing=6>')
+            html.append(f'<tr><td>Min clearance</td>'
+                        f'<td style="color:{color(saf["floor_ok"])}"><b>{mc:.0f} m</b> '
+                        f'(floor {saf["floor"]:.0f})</td></tr>')
+            html.append(f'<tr><td>Max AGL</td>'
+                        f'<td style="color:{color(saf["ceiling_ok"])}"><b>{saf["max_agl"]:.0f} m</b> '
+                        f'(ceiling {saf["ceiling"]:.0f})</td></tr>')
+            html.append(f'<tr><td>Over ceiling</td>'
+                        f'<td><b>{saf["n_over_ceiling"]} / {saf["n_wp"]}</b> wp</td></tr>')
+            html.append('</table>')
+            ok = saf['floor_ok'] and saf['ceiling_ok']
+            msg = ('✓ Path within safety limits.' if ok
+                   else '⚠ Path violates a safety limit (see red above).')
+            html.append(f'<p style="color:{color(ok)}"><b>{msg}</b></p>')
+
+        self.lbl_summary.setText(''.join(html))
