@@ -4,6 +4,8 @@ Left: parameter sidebar + Compute. Right: tabbed views — Summary and the 2D
 Leaflet Map (draw the AOI, see the route + under-density overlay). Compute runs
 the existing model and fills the Summary panel.
 """
+import csv
+import json
 import math
 
 from PySide6.QtCore import Qt
@@ -136,6 +138,19 @@ class MainWindow(QMainWindow):
         self.btn_compute.setEnabled(False)
         self.btn_compute.clicked.connect(self._compute)
         v.addWidget(self.btn_compute)
+
+        self.btn_helios = QPushButton('Validate (HELIOS++)…')
+        self.btn_helios.setEnabled(False)
+        self.btn_helios.clicked.connect(self._open_helios)
+        v.addWidget(self.btn_helios)
+
+        gb_exp = QGroupBox('Export'); el = QHBoxLayout(gb_exp)
+        self.btn_geojson = QPushButton('GeoJSON'); self.btn_geojson.setEnabled(False)
+        self.btn_geojson.clicked.connect(self._export_geojson)
+        self.btn_csv = QPushButton('CSV'); self.btn_csv.setEnabled(False)
+        self.btn_csv.clicked.connect(self._export_csv)
+        el.addWidget(self.btn_geojson); el.addWidget(self.btn_csv)
+        v.addWidget(gb_exp)
         v.addStretch(1)
 
         scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(panel)
@@ -272,7 +287,67 @@ class MainWindow(QMainWindow):
         self.setEnabled(True)
         self._render_summary(self.result)
         self._render_map_overlays(self.result)
+        has_route = bool(self.result.route)
+        self.btn_helios.setEnabled(has_route)
+        self.btn_geojson.setEnabled(has_route)
+        self.btn_csv.setEnabled(has_route)
         self.statusBar().showMessage('Done.')
+
+    # ---------------------------------------------------------------- HELIOS
+    def _open_helios(self):
+        if not (self.result and self.result.route and self.drawn_polygon is not None):
+            return
+        from .helios import HeliosDialog
+        dlg = HeliosDialog(self, dtm=self.dtm, dtm_path=self.dtm_path,
+                           route=self.result.route, polygon=self.drawn_polygon,
+                           params=self._params(), chm=self.chm, is_geo=self.is_geo)
+        dlg.resultReady.connect(self._on_helios_result)
+        self._helios_dlg = dlg          # keep a ref so it isn't GC'd
+        dlg.show()
+
+    def _on_helios_result(self, res):
+        if self.mapview is None or res.get('error'):
+            return
+        cells = res.get('failing_cells_geo', [])
+        rad = max(float((self.result.estimate or {}).get('cell_size_m', 2.0)), 3.0)
+        self.mapview.show_helios(cells, radius_m=rad)
+
+    # ---------------------------------------------------------------- export
+    def _export_geojson(self):
+        if not (self.result and self.result.route):
+            return
+        path, _ = QFileDialog.getSaveFileName(self, 'Export route GeoJSON',
+                                              'route.geojson', 'GeoJSON (*.geojson)')
+        if not path:
+            return
+        feats = [{
+            'type': 'Feature',
+            'geometry': {'type': 'Point', 'coordinates': [w['x'], w['y'], w['z']]},
+            'properties': {'altitude_m': w['z'],
+                           'target_agl_m': w.get('target_distance'),
+                           'pass_id': w.get('pass_id')},
+        } for w in self.result.route
+            if not (isinstance(w['z'], float) and math.isnan(w['z']))]
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({'type': 'FeatureCollection', 'features': feats}, f, indent=2)
+        self.statusBar().showMessage(f'Wrote {len(feats)} waypoints → {path}')
+
+    def _export_csv(self):
+        if not (self.result and self.result.route):
+            return
+        path, _ = QFileDialog.getSaveFileName(self, 'Export route CSV',
+                                              'route.csv', 'CSV (*.csv)')
+        if not path:
+            return
+        wps = [w for w in self.result.route
+               if not (isinstance(w['z'], float) and math.isnan(w['z']))]
+        with open(path, 'w', newline='', encoding='utf-8') as f:
+            wr = csv.writer(f)
+            wr.writerow(['index', 'x', 'y', 'z', 'target_agl_m', 'pass_id'])
+            for i, w in enumerate(wps):
+                wr.writerow([i, w['x'], w['y'], w['z'],
+                             w.get('target_distance'), w.get('pass_id')])
+        self.statusBar().showMessage(f'Wrote {len(wps)} waypoints → {path}')
 
     def _render_map_overlays(self, r):
         if self.mapview is None:

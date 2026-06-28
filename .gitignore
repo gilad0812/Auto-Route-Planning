@@ -6,3 +6,7 @@ __pycache__/
 .env
 .claude/
 ./idea
+build/
+dist/
+helios_bin/
+*.las

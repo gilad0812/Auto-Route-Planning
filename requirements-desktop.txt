@@ -1,6 +1,5 @@
-# Desktop (PySide6) build — install alongside requirements.txt.
-# The Streamlit web app does NOT need these; keep them separate so the
-# Docker image stays lean.
+# Desktop (PySide6) build. Install: pip install -r requirements-desktop.txt
 -r requirements.txt
 PySide6
 # Map is a native QGraphicsView canvas (offline) — no QtWebEngine needed.
+pyinstaller   # packaging into a standalone .exe

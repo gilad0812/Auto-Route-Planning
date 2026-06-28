@@ -3,9 +3,5 @@ shapely
 numpy
 pandas
 matplotlib
-streamlit
-folium
-streamlit-folium
 Pillow
 laspy[lazrs]
-plotly

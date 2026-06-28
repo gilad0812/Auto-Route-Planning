@@ -102,6 +102,7 @@ class CanvasMap(QWidget):
         self._aoi_item = None
         self._route_group = None
         self._density_item = None
+        self._helios_item = None
         self._chm_item = None
 
         v = QVBoxLayout(self); v.setContentsMargins(0, 0, 0, 0); v.setSpacing(0)
@@ -133,7 +134,8 @@ class CanvasMap(QWidget):
         self.dtm = dtm; self.chm = chm
         self._inv = ~dtm.transform
         self.scene.clear()
-        self._aoi_item = self._route_group = self._density_item = self._chm_item = None
+        self._aoi_item = self._route_group = self._density_item = None
+        self._helios_item = self._chm_item = None
         self._verts = []; self._draw_items = []
 
         self._relief = _shaded_relief(dtm.array, dtm.nodata)
@@ -248,24 +250,10 @@ class CanvasMap(QWidget):
         if self._density_item is not None:
             self.scene.removeItem(self._density_item); self._density_item = None
 
-        # ── under-density: paint to a transparent overlay image (scales w/ zoom) ──
-        cells = density_cells or []
-        if cells:
-            if len(cells) > max_density_pts:
-                step = len(cells) / max_density_pts
-                cells = [cells[int(i * step)] for i in range(max_density_pts)]
-            h, w, _ = self._relief.shape
-            ov = QImage(w, h, QImage.Format_RGBA8888); ov.fill(0)
-            p = QPainter(ov)
-            col = QColor(density_color); col.setAlpha(90)
-            p.setBrush(QBrush(col)); p.setPen(QPen(Qt.NoPen))
-            rad_px = max(1.0, density_radius_m / self._pixel_m())
-            for lon, lat in cells:
-                c, r = self._inv * (lon, lat)
-                p.drawEllipse(QPointF(c, r), rad_px, rad_px)
-            p.end()
-            self._density_item = QGraphicsPixmapItem(QPixmap.fromImage(ov))
-            self.scene.addItem(self._density_item)
+        # ── under-density: overlay image of ground-sized dots (scales w/ zoom) ──
+        if density_cells:
+            self._density_item = self._paint_cells(
+                density_cells, density_color, 90, density_radius_m, max_density_pts)
 
         # ── route: altitude-coloured cosmetic polylines + start/end markers ──
         wps = [w for w in (route_wps or [])
@@ -284,6 +272,33 @@ class CanvasMap(QWidget):
             self._marker(grp, self._scene(wps[0]['x'], wps[0]['y']), '#1a7f37')
             self._marker(grp, self._scene(wps[-1]['x'], wps[-1]['y']), '#cf222e')
             self._route_group = grp
+
+    def _paint_cells(self, cells, color_hex, alpha, radius_m, max_pts=20000):
+        """Paint cells (lon,lat) as ground-sized dots onto a transparent overlay
+        image at DTM resolution, returned as a scene item (scales with zoom)."""
+        if len(cells) > max_pts:
+            step = len(cells) / max_pts
+            cells = [cells[int(i * step)] for i in range(max_pts)]
+        h, w, _ = self._relief.shape
+        ov = QImage(w, h, QImage.Format_RGBA8888); ov.fill(0)
+        p = QPainter(ov)
+        col = QColor(color_hex); col.setAlpha(alpha)
+        p.setBrush(QBrush(col)); p.setPen(QPen(Qt.NoPen))
+        rad_px = max(1.0, radius_m / self._pixel_m())
+        for lon, lat in cells:
+            c, r = self._inv * (lon, lat)
+            p.drawEllipse(QPointF(c, r), rad_px, rad_px)
+        p.end()
+        item = QGraphicsPixmapItem(QPixmap.fromImage(ov))
+        self.scene.addItem(item)
+        return item
+
+    def show_helios(self, cells, radius_m=3.0):
+        """Paint HELIOS++ under-density cells (red), separate from the estimate."""
+        if self._helios_item is not None:
+            self.scene.removeItem(self._helios_item); self._helios_item = None
+        if cells:
+            self._helios_item = self._paint_cells(cells, '#e5484d', 130, radius_m)
 
     def _marker(self, grp, sp, hexcolor):
         m = QGraphicsEllipseItem(-5, -5, 10, 10)

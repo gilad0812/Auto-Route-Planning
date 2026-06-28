@@ -1,141 +1,86 @@
 # Auto-Route-Planning
 
-A drone LiDAR survey route planner that generates optimal lawnmower-pattern flight paths from Digital Terrain Model (DTM) data, maintaining a constant altitude above ground level (AGL) across complex terrain.
+A drone LiDAR survey route planner that generates lawnmower-pattern flight paths
+from Digital Terrain Model (DTM) data, holding a constant altitude above ground
+level (AGL) across complex terrain, and predicts/validates per-m² point density.
+
+It is a **native Qt desktop application** designed to run offline on a standalone
+machine — no web server, no browser, no internet.
 
 ## Features
 
-- Draw a survey polygon on an interactive map
-- Automatic lawnmower path generation with configurable pass spacing and waypoint density
-- Per-waypoint elevation lookup via bilinear interpolation of DTM raster data
-- Swath width calculation from LiDAR FOV and altitude
-- Color-coded route visualization by elevation
-- Export waypoints as GeoJSON or CSV for drone autopilots
-- Two interfaces: Streamlit web app (primary) and matplotlib desktop viewer
+- Native offline map canvas: DTM shaded-relief with pan/zoom; draw the survey AOI directly on the terrain
+- Terrain-adaptive lawnmower path generation (constant AGL per pass, contour-aligned)
+- Analytical point-density estimate with optional CHM vegetation thinning
+- HELIOS++ LiDAR simulation to validate density (runs off the UI thread)
+- Under-density overlay (estimate in orange, HELIOS in red)
+- Export waypoints as GeoJSON or CSV; save HELIOS trajectory / survey XML
 
 ## Installation
 
 ```bash
 python -m venv .venv
-.venv\Scripts\activate        # Windows
-# source .venv/bin/activate   # Linux/macOS
-pip install -r requirements.txt
+.venv\Scripts\activate          # Windows
+# source .venv/bin/activate     # Linux/macOS
+pip install -r requirements-desktop.txt
 ```
-
-Requires a GeoTIFF DTM file at `data/dtm.tif`.
-
-### Docker (recommended for portability)
-
-Builds a self-contained image with the app, its Python dependencies, and a Linux HELIOS++ install baked in — no manual setup needed on the target machine.
-
-```bash
-docker compose up --build
-```
-
-Opens at `http://localhost:8501`. Place your DTM at `data/dtm.tif` on the host — it's mounted into the container at `/app/data`.
-
-To build/run without compose:
-
-```bash
-docker build -t auto-route-planning .
-docker run -p 8501:8501 -v "$(pwd)/data:/app/data" auto-route-planning
-```
-
-On Windows PowerShell, replace `$(pwd)` with `${PWD}`:
-
-```powershell
-docker run -p 8501:8501 -v "${PWD}/data:/app/data" auto-route-planning
-```
-
-The HELIOS++ download during `docker build` requires network access. The resulting image is portable — copy it (`docker save`/`docker load`) or rebuild from this repo on any Docker-capable machine.
 
 ## Usage
 
-### Web app (recommended)
+```bash
+python desktop.py
+```
+
+1. **Open DTM** (toolbar / File menu) — optionally **Open CHM** for vegetation.
+2. **Draw AOI** on the map → click vertices → **Finish** (or double-click).
+3. **Compute Route** — the route and under-density estimate render on the map; stats appear in the Results panel.
+4. **Validate (HELIOS++)…** — point at a pre-installed HELIOS++ binary (auto-detected if present) to run the simulation.
+5. **Export** the route as GeoJSON / CSV.
+
+HELIOS++ must already be installed on the machine (offline). `setup_helios.py`
+can install it on a connected machine if needed.
+
+## Packaging (standalone .exe)
 
 ```bash
-python main.py
-# or: streamlit run app.py
+pip install -r requirements-desktop.txt
+pyinstaller desktop.spec
 ```
 
-Opens at `http://localhost:8501`. Draw a polygon on the map, adjust flight parameters in the sidebar, and download the generated route.
-
-### Desktop viewer (matplotlib)
-
-```python
-from src.viewer import InteractiveDTMViewer
-InteractiveDTMViewer('data/dtm.tif').show()
-```
-
-Click to place polygon vertices, press **Enter** to close, **S** to save, **R** to reset.
-
-### Command line
-
-```bash
-python -m src.main \
-  --dtm data/dtm.tif \
-  --polygon examples/polygon.geojson \
-  --distance 30 \
-  --error 2.0 \
-  --spacing 20 \
-  --step 5 \
-  --out route.csv
-```
-
-| Argument | Description |
-|----------|-------------|
-| `--dtm` | Path to GeoTIFF elevation raster |
-| `--polygon` | GeoJSON file defining the survey area |
-| `--distance` | Target AGL altitude in meters |
-| `--error` | Allowed AGL deviation in meters |
-| `--spacing` | Distance between lawnmower passes (meters) |
-| `--step` | Waypoint interval along each pass (meters) |
-| `--out` | Output CSV path |
-
-## Output Format
-
-**CSV** — one waypoint per row:
-
-| x | y | z | target_distance | error_tolerance |
-|---|---|---|-----------------|-----------------|
-| easting | northing | absolute altitude (m) | AGL target | allowed deviation |
-
-**GeoJSON** — 3D `MultiLineString` with one feature per pass.
-
-## How It Works
-
-1. The survey polygon is sliced into parallel horizontal passes separated by the configured spacing.
-2. Passes alternate direction (snake/boustrophedon) to minimize repositioning.
-3. Each pass is sampled at the configured step interval to produce candidate waypoints.
-4. The DTM is queried at each waypoint position using bilinear interpolation.
-5. Absolute altitude is computed as `z = terrain_elevation + AGL_distance`.
+The build lands in `dist/`. See `desktop.spec` for the bundled data files
+(scanner/platform XML under `data/`).
 
 ## Project Structure
 
 ```
 Auto-Route-Planning/
-├── app.py                # Streamlit web interface
-├── main.py               # Launcher (runs app.py via streamlit)
-├── requirements.txt
-├── data/
-│   └── dtm.tif           # Input Digital Terrain Model (GeoTIFF)
-├── examples/
-│   └── polygon.geojson   # Example survey polygon
+├── desktop.py            # Entry point (PySide6)
+├── requirements-desktop.txt
+├── desktop.spec          # PyInstaller build spec
+├── data/                 # DTM/CHM + HELIOS scanner/platform XML
+├── ui/
+│   ├── main_window.py    # Window: params sidebar · map · results
+│   ├── canvasmap.py      # Native offline DTM map (QGraphicsView)
+│   ├── planning.py       # Qt-free glue to the src/ model
+│   └── helios.py         # HELIOS++ validation worker + dialog
 └── src/
-    ├── dtm.py            # DTM raster reader with bilinear interpolation
-    ├── route_planner.py  # Lawnmower path generation and AGL computation
-    ├── viewer.py         # Interactive matplotlib desktop viewer
-    └── main.py           # CLI argument parser
+    ├── dtm.py            # DTM raster reader (bilinear interpolation)
+    ├── route_planner.py  # Lawnmower path generation + AGL computation
+    ├── density_estimate.py
+    ├── helios_integration.py / helios_setup.py / helios_config.py
+    ├── terrain_converter.py  # DTM → OBJ mesh for HELIOS
+    ├── viewer.py         # Standalone matplotlib viewer (optional)
+    └── main.py           # CLI route generator (optional)
 ```
 
 ## Dependencies
 
 | Package | Purpose |
 |---------|---------|
+| `PySide6` | Qt desktop UI |
 | `rasterio` | GeoTIFF raster I/O |
-| `shapely` | Polygon geometry and clipping |
-| `numpy` | Numerical operations |
-| `pandas` | Waypoint data handling |
-| `streamlit` | Web UI framework |
-| `folium` / `streamlit-folium` | Interactive map |
-| `matplotlib` | Desktop viewer |
-| `Pillow` | Elevation visualization |
+| `shapely` | Polygon geometry |
+| `numpy` / `pandas` | Numerics |
+| `matplotlib` | Relief colormaps / optional viewer |
+| `Pillow` | Image handling |
+| `laspy` | HELIOS++ LAS point-cloud readback |
