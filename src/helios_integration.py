@@ -16,7 +16,10 @@ from __future__ import annotations
 import math
 import os
 import queue
+import re
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -384,6 +387,86 @@ class SimulationCancelled(Exception):
     """Raised when a caller requests early termination via a stop event."""
 
 
+def _wmi_execute(cmd, cwd, path_value, log=None, stop_event=None):
+    """Launch HELIOS via WMI Win32_Process.Create so it is parented to the WMI
+    service, NOT this process. When we run inside a PyInstaller-frozen .exe, every
+    child/grandchild inherits process state that crashes HELIOS at startup
+    (0xC0000139) — env scrubbing, clean PATH, std handles and activation contexts
+    all fail to prevent it; only re-parenting via WMI does. A wrapper .bat sets a
+    clean PATH and the working dir, runs HELIOS with output redirected to a file
+    (which we tail for progress), and writes its exit code to a marker file.
+    Raises RuntimeError on non-zero exit, SimulationCancelled on stop.
+    """
+    work = Path(tempfile.mkdtemp(prefix="helios_wmi_"))
+    out_file = work / "helios_out.txt"
+    exit_file = work / "helios_exit.txt"
+    bat = work / "run_helios.bat"
+    argline = " ".join('"' + str(a) + '"' for a in cmd)
+    with open(bat, "w", encoding="utf-8") as f:
+        f.write("@echo off\r\n")
+        f.write("set PATH=" + path_value + "\r\n")
+        f.write('cd /d "' + str(cwd) + '"\r\n')
+        f.write(argline + ' > "' + str(out_file) + '" 2>&1\r\n')
+        f.write('echo %ERRORLEVEL% > "' + str(exit_file) + '"\r\n')
+
+    ps = (
+        "$r=Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+        "-Arguments @{CommandLine='\"" + str(bat) + "\"'};"
+        "Write-Output ('PID='+[string]$r.ProcessId+' RET='+[string]$r.ReturnValue)"
+    )
+    res = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                         capture_output=True, text=True, timeout=60)
+    info = (res.stdout or "") + (res.stderr or "")
+    m = re.search(r"PID=(\d+)\s+RET=(\d+)", info)
+    if not m or m.group(2) != "0":
+        raise RuntimeError("Failed to launch HELIOS++ via WMI: " + info.strip())
+    pid = int(m.group(1))
+    if log:
+        log(f"[diag] launched HELIOS via WMI, pid={pid}")
+
+    pos = 0
+    start = last = time.monotonic()
+
+    def _drain():
+        nonlocal pos, last
+        if not out_file.exists():
+            return
+        try:
+            with open(out_file, "r", encoding="utf-8", errors="replace") as of:
+                of.seek(pos)
+                chunk = of.read()
+                pos = of.tell()
+        except Exception:
+            return
+        for ln in chunk.splitlines():
+            if ln.strip():
+                last = time.monotonic()
+                if log:
+                    log(ln.rstrip())
+
+    while not exit_file.exists():
+        if stop_event is not None and stop_event.is_set():
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                           capture_output=True)
+            raise SimulationCancelled("Simulation cancelled by user")
+        _drain()
+        now = time.monotonic()
+        if log and now - last >= 20.0:
+            log(f"… still running ({now - start:.0f}s elapsed)")
+            last = now
+        time.sleep(1.0)
+
+    time.sleep(0.3)          # let the redirect flush
+    _drain()
+    try:
+        code = int((exit_file.read_text(encoding="utf-8", errors="replace")
+                    or "1").strip() or "1")
+    except Exception:
+        code = 1
+    if code != 0:
+        raise RuntimeError(f"HELIOS++ exited with code {code} (WMI launch).")
+
+
 def run_helios(
     helios_bin: str,
     survey_xml: str,
@@ -446,15 +529,38 @@ def run_helios(
     # directory at its root.
     import platform as _platform
     run_env = os.environ.copy()
+    # Always drop our GDAL/PROJ data pointers so HELIOS uses its own — a stray
+    # PROJ_LIB/GDAL_DATA from rasterio (dev) or the frozen bundle can mismatch
+    # HELIOS's GDAL.
+    for _v in ("GDAL_DATA", "PROJ_LIB", "PROJ_DATA", "GDAL_DRIVER_PATH"):
+        run_env.pop(_v, None)
+    # helios++.exe embeds its OWN Python. When we run inside a PyInstaller-frozen
+    # .exe, the parent leaks PYTHON*/PyInstaller vars (PYTHONHOME, PYTHONPATH,
+    # _PYI_*, _MEIPASS*) into the child, so HELIOS's embedded interpreter tries to
+    # initialise against OUR bundled runtime and dies at startup (0xC0000139).
+    # Strip them so HELIOS uses its own interpreter home.
+    _stripped = []
+    for _k in list(run_env.keys()):
+        _ku = _k.upper()
+        if (_ku.startswith("PYTHON") or _ku.startswith("_PYI")
+                or _ku.startswith("_MEIPASS")):
+            run_env.pop(_k, None)
+            _stripped.append(_k)
+    _conda_root = None
     if _platform.system() == "Windows":
         # Walk up from the binary to find the Conda env root (has Library\bin\)
         _candidate = helios_bin.parent
-        _conda_root = None
         for _ in range(8):
             if (_candidate / "Library" / "bin").is_dir():
                 _conda_root = _candidate
                 break
             _candidate = _candidate.parent
+        _winroot = os.environ.get("SystemRoot", r"C:\Windows")
+        _sys_dirs = [
+            os.path.join(_winroot, "System32"),
+            _winroot,
+            os.path.join(_winroot, "System32", "Wbem"),
+        ]
         if _conda_root:
             _dll_dirs = [
                 str(_conda_root),
@@ -469,17 +575,37 @@ def run_helios(
             # frozen .exe — otherwise shadows HELIOS's own libraries and it dies
             # at startup with a wrong-version DLL (STATUS_ENTRYPOINT_NOT_FOUND,
             # 0xC0000139). A clean PATH makes HELIOS load only its own DLLs.
-            _winroot = os.environ.get("SystemRoot", r"C:\Windows")
-            _sys_dirs = [
-                os.path.join(_winroot, "System32"),
-                _winroot,
-                os.path.join(_winroot, "System32", "Wbem"),
-            ]
             run_env["PATH"] = os.pathsep.join(_dll_dirs + _sys_dirs)
-            # Drop our GDAL/PROJ data pointers so HELIOS uses its own (a stray
-            # PROJ_LIB/GDAL_DATA from rasterio can mismatch HELIOS's GDAL).
-            for _v in ("GDAL_DATA", "PROJ_LIB", "PROJ_DATA", "GDAL_DRIVER_PATH"):
-                run_env.pop(_v, None)
+            # Bulletproofing for the frozen (.exe) case: a PyInstaller parent can
+            # force its own VC-runtime onto this child via the inherited
+            # activation context, which a clean PATH can't override and which
+            # crashes HELIOS with a wrong-version DLL (0xC0000139). Copy HELIOS's
+            # OWN runtime DLLs next to helios++.exe — the executable's own
+            # directory is the FIRST place Windows looks, so these always win.
+            import shutil as _shutil
+            _bindir = helios_bin.parent
+            for _name in (
+                "vcruntime140.dll", "vcruntime140_1.dll", "vcruntime140_threads.dll",
+                "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
+                "msvcp140_atomic_wait.dll", "msvcp140_codecvt_ids.dll",
+                "concrt140.dll", "vcomp140.dll", "vcamp140.dll",
+            ):
+                _src = _conda_root / _name
+                _dst = _bindir / _name
+                if _src.is_file() and not _dst.exists():
+                    try:
+                        _shutil.copy2(_src, _dst)
+                    except Exception:
+                        pass
+        else:
+            # Fallback: couldn't locate the conda root, but still scrub the
+            # PyInstaller bundle dir from PATH so it can't shadow HELIOS DLLs.
+            _meipass = getattr(sys, "_MEIPASS", None)
+            entries = run_env.get("PATH", "").split(os.pathsep)
+            if _meipass:
+                entries = [e for e in entries
+                           if _meipass.lower() not in e.lower()]
+            run_env["PATH"] = os.pathsep.join([str(helios_bin.parent)] + entries)
     else:
         # Walk up from the binary to find the Conda env root (has conda-meta/)
         _candidate = helios_bin.parent
@@ -495,6 +621,30 @@ def run_helios(
                 run_env["LD_LIBRARY_PATH"] = (
                     str(_lib_dir) + os.pathsep + run_env.get("LD_LIBRARY_PATH", "")
                 )
+
+    # Inside a PyInstaller-frozen .exe, every descendant process inherits state
+    # that makes HELIOS crash at startup (0xC0000139) — clean PATH, scrubbed env,
+    # std handles and activation contexts all fail to prevent it. Re-parenting
+    # HELIOS via WMI is the only thing that avoids it, so in a frozen build we
+    # launch it that way; in dev we use a normal subprocess (which works).
+    _use_wmi = _platform.system() == "Windows" and getattr(sys, "frozen", False)
+    if log:
+        log(f"[diag] use_wmi={_use_wmi} conda_root={_conda_root} cwd={helios_cwd}")
+        log(f"[diag] PATH[0:4]={run_env.get('PATH', '').split(os.pathsep)[:4]}")
+        log(f"[diag] stripped_env={_stripped}")
+    if _use_wmi:
+        # Frozen .exe: launch HELIOS re-parented via WMI (see _wmi_execute).
+        _wmi_execute(cmd, helios_cwd, run_env.get("PATH", ""),
+                     log=log, stop_event=stop_event)
+        search_root = Path(output_dir) if output_dir else helios_bin.parent / "output"
+        if not search_root.exists():
+            raise RuntimeError(
+                f"HELIOS++ completed but output directory not found: {search_root}")
+        las_files = sorted(search_root.rglob("*.las"), key=lambda p: p.stat().st_mtime)
+        las_files += sorted(search_root.rglob("*.laz"), key=lambda p: p.stat().st_mtime)
+        if not las_files:
+            raise RuntimeError(f"HELIOS++ produced no LAS/LAZ files under: {search_root}")
+        return max(las_files, key=lambda p: p.stat().st_mtime).parent
 
     proc = subprocess.Popen(
         cmd,
