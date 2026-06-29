@@ -32,6 +32,9 @@ pip install -r requirements-desktop.txt
 python desktop.py
 ```
 
+> For a full step-by-step walkthrough (parameters, reading results, HELIOS
+> validation, exports, troubleshooting) see **[USER_GUIDE.md](USER_GUIDE.md)**.
+
 1. **Open DTM** (toolbar / File menu) — optionally **Open CHM** for vegetation (checked for CRS/extent compatibility with the DTM first). **Clear** removes either.
 2. Set the AOI: **Draw AOI** on the map (click vertices → **Finish** / double-click), or **Enter coordinates…** to type the vertices.
 3. Set flight/scanner parameters — scan frequency is derived from the pulse rate and shown locked.
