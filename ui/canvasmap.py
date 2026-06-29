@@ -240,6 +240,33 @@ class CanvasMap(QWidget):
             self.scene.removeItem(self._aoi_item); self._aoi_item = None
         self._verts = []
 
+    def set_aoi_polygon(self, coords):
+        """Draw an AOI from externally-supplied [lon, lat] vertices (manual entry),
+        replacing any current AOI. Requires a loaded DTM for the coordinate frame."""
+        if self.dtm is None or not coords:
+            return
+        self.clear_aoi()
+        pts = [self._scene(lon, lat) for lon, lat in coords]
+        self._aoi_item = QGraphicsPolygonItem(QPolygonF(pts))
+        pen = QPen(QColor('#ff3333'), 2); pen.setCosmetic(True)
+        self._aoi_item.setPen(pen)
+        self._aoi_item.setBrush(QBrush(QColor(255, 51, 51, 30)))
+        self.scene.addItem(self._aoi_item)
+
+    def clear(self):
+        """Full reset to the empty state (used when the DTM is cleared)."""
+        self.scene.clear()
+        self.dtm = None; self.chm = None; self._inv = None
+        self._aoi_item = self._route_group = self._density_item = None
+        self._helios_item = self._chm_item = None
+        self._verts = []; self._draw_items = []
+        self.drawing = False
+        self.btn_draw.setChecked(False)
+        self.view.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.view.setCursor(Qt.ArrowCursor)
+        self.btn_chm.setChecked(False); self.btn_chm.setEnabled(False)
+        self.lbl_coord.setText('')
+
     def _toggle_chm(self, on):
         if self._chm_item is not None:
             self._chm_item.setVisible(on)

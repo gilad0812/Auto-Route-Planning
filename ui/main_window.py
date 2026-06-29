@@ -103,12 +103,15 @@ class MainWindow(QMainWindow):
         dl = QVBoxLayout(gb_data)
         self.lbl_dtm = QLabel('DTM: (none)'); self.lbl_dtm.setWordWrap(True)
         self.lbl_chm = QLabel('CHM: (none)'); self.lbl_chm.setWordWrap(True)
+        dtm_row = QHBoxLayout()
         b_dtm = QPushButton('Open DTM…'); b_dtm.clicked.connect(self._open_dtm)
+        b_dtm_clear = QPushButton('Clear'); b_dtm_clear.clicked.connect(self._clear_dtm)
+        dtm_row.addWidget(b_dtm); dtm_row.addWidget(b_dtm_clear)
         chm_row = QHBoxLayout()
         b_chm = QPushButton('Open CHM…'); b_chm.clicked.connect(self._open_chm)
         b_chm_clear = QPushButton('Clear'); b_chm_clear.clicked.connect(self._clear_chm)
         chm_row.addWidget(b_chm); chm_row.addWidget(b_chm_clear)
-        dl.addWidget(self.lbl_dtm); dl.addWidget(b_dtm)
+        dl.addWidget(self.lbl_dtm); dl.addLayout(dtm_row)
         dl.addWidget(self.lbl_chm); dl.addLayout(chm_row)
         v.addWidget(gb_data)
 
@@ -117,9 +120,11 @@ class MainWindow(QMainWindow):
         al = QVBoxLayout(gb_aoi)
         self.lbl_aoi = QLabel('Draw a polygon on the map to set the AOI.')
         self.lbl_aoi.setWordWrap(True); self.lbl_aoi.setStyleSheet('color:#888;')
+        b_enter_aoi = QPushButton('Enter coordinates…')
+        b_enter_aoi.clicked.connect(self._enter_aoi_coords)
         b_clear_aoi = QPushButton('Clear drawn AOI')
         b_clear_aoi.clicked.connect(self._clear_aoi)
-        al.addWidget(self.lbl_aoi); al.addWidget(b_clear_aoi)
+        al.addWidget(self.lbl_aoi); al.addWidget(b_enter_aoi); al.addWidget(b_clear_aoi)
         v.addWidget(gb_aoi)
 
         # ── Flight ──
@@ -233,6 +238,71 @@ class MainWindow(QMainWindow):
         self._refresh_map()
         self.statusBar().showMessage('DTM loaded. Draw an AOI on the map, '
                                      'then Compute.')
+
+    def _clear_dtm(self):
+        """Drop the loaded DTM (and the CHM/AOI/results that depend on it) and
+        blank the map — mirrors the CHM Clear."""
+        self.dtm = None; self.dtm_path = None
+        self.chm = None; self.chm_path = None
+        self.is_geo = True
+        self.drawn_polygon = None
+        self.lbl_dtm.setText('DTM: (none)')
+        self.lbl_chm.setText('CHM: (none)')
+        self.lbl_aoi.setText('Draw a polygon on the map to set the AOI.')
+        self.btn_compute.setEnabled(False)
+        self._clear_results()
+        if self.mapview is not None:
+            self.mapview.clear()
+        self.statusBar().showMessage('Open a DTM to begin.')
+
+    def _enter_aoi_coords(self):
+        """Set the AOI from manually-typed vertices instead of drawing on the map."""
+        if self.dtm is None:
+            QMessageBox.information(self, 'AOI', 'Open a DTM first.'); return
+        from PySide6.QtWidgets import QDialog, QPlainTextEdit, QDialogButtonBox
+        dlg = QDialog(self); dlg.setWindowTitle('Enter AOI polygon')
+        lay = QVBoxLayout(dlg)
+        info = QLabel('One vertex per line as  <b>lat, lon</b>  (matching the map '
+                      'readout). At least 3 vertices; the polygon is closed '
+                      'automatically.')
+        info.setWordWrap(True); info.setTextFormat(Qt.RichText)
+        txt = QPlainTextEdit()
+        txt.setPlaceholderText('47.10, 8.30\n47.10, 8.40\n47.20, 8.40\n47.20, 8.30')
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
+        lay.addWidget(info); lay.addWidget(txt); lay.addWidget(bb)
+        dlg.resize(360, 320)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        coords = self._parse_coords(txt.toPlainText())
+        if coords is None:
+            return
+        geom = {'type': 'Polygon', 'coordinates': [coords + [coords[0]]]}
+        self.mapview.set_aoi_polygon(coords)
+        self._on_polygon_drawn(geom)
+        self.lbl_aoi.setText('✓ AOI set from entered coordinates.')
+
+    def _parse_coords(self, text):
+        """Parse 'lat, lon' lines into a list of [lon, lat] vertices, or None."""
+        coords = []
+        for ln in text.splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            parts = ln.replace(',', ' ').split()
+            if len(parts) < 2:
+                QMessageBox.warning(self, 'AOI', f'Bad line: "{ln}"\nUse: lat, lon')
+                return None
+            try:
+                lat, lon = float(parts[0]), float(parts[1])
+            except ValueError:
+                QMessageBox.warning(self, 'AOI', f'Not numbers: "{ln}"')
+                return None
+            coords.append([lon, lat])
+        if len(coords) < 3:
+            QMessageBox.warning(self, 'AOI', 'Enter at least 3 vertices.')
+            return None
+        return coords
 
     def _open_chm(self):
         if self.dtm is None:
