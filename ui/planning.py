@@ -48,6 +48,39 @@ class PlanResult:
     alt_max: float = float('nan')
 
 
+def chm_compatible(dtm, chm):
+    """Whether `chm` can be used as a vegetation mask over `dtm`.
+
+    The density estimator samples the CHM through the CHM's OWN raster transform at
+    the DTM-frame lon/lat of each cell, so the CHM must share the DTM's CRS and
+    actually overlap its extent — otherwise the mask lands on the wrong ground and
+    the result is silently wrong. Resolution may differ (nearest-pixel lookup).
+
+    Returns (ok, reason): ok False blocks applying it (reason = why); ok True with a
+    non-empty reason is a soft note (e.g. partial overlap) the caller may surface.
+    """
+    dcrs, ccrs = dtm.src.crs, chm.src.crs
+    de = dcrs.to_epsg() if dcrs else None
+    ce = ccrs.to_epsg() if ccrs else None
+    if de is not None and ce is not None:
+        if de != ce:
+            return False, f'CRS mismatch: DTM is EPSG:{de}, CHM is EPSG:{ce}.'
+    elif dcrs != ccrs:
+        return False, f'CRS mismatch: DTM {dcrs}, CHM {ccrs}.'
+
+    db, cb = dtm.src.bounds, chm.src.bounds
+    ox = min(db.right, cb.right) - max(db.left, cb.left)
+    oy = min(db.top, cb.top) - max(db.bottom, cb.bottom)
+    if ox <= 0 or oy <= 0:
+        return False, 'CHM does not overlap the DTM extent (different area).'
+
+    d_area = (db.right - db.left) * (db.top - db.bottom)
+    o_area = ox * oy
+    if d_area > 0 and o_area < 0.5 * d_area:
+        return True, f'CHM covers only {100 * o_area / d_area:.0f}% of the DTM extent.'
+    return True, ''
+
+
 def centered_box(dtm, frac=0.5):
     """A polygon covering the central `frac` of the DTM extent — the stand-in for
     map-drawn AOIs until the map view lands."""

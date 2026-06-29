@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QApplication,
 )
 
-from .planning import PlanParams, compute_plan, load_dtm
+from .planning import PlanParams, compute_plan, load_dtm, chm_compatible
 
 try:
     from .canvasmap import CanvasMap
@@ -312,13 +312,22 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            self.chm = load_dtm(path)
+            chm = load_dtm(path)
         except Exception as e:
             QMessageBox.critical(self, 'CHM error', str(e)); return
+        ok, reason = chm_compatible(self.dtm, chm)
+        if not ok:
+            QMessageBox.warning(self, 'CHM incompatible',
+                                f'{reason}\n\nThe CHM was not applied.')
+            return
+        self.chm = chm
         self.chm_path = path
         self.lbl_chm.setText(f'CHM: {path}')
         self._clear_results()          # density estimate is now stale
         self._refresh_map()
+        if reason:                     # soft note (e.g. partial overlap)
+            QMessageBox.information(self, 'CHM applied', reason)
+            self.statusBar().showMessage(reason)
 
     def _clear_chm(self):
         self.chm = None; self.chm_path = None
