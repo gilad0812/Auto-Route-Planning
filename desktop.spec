@@ -4,7 +4,13 @@
 # The geo stack (rasterio/GDAL, pyproj/PROJ, shapely/GEOS) ships native data
 # files that must be bundled; collect_all grabs them. src/ is on pathex so the
 # `from dtm import ...` style imports in ui/ resolve at analysis time.
+import os
 from PyInstaller.utils.hooks import collect_all, collect_submodules
+
+# App/exe icon. Drop a .ico at assets/app.ico to brand the executable; if it's
+# absent the build still works (PyInstaller treats icon=None as the default icon).
+ICON = os.path.join('assets', 'app.ico')
+ICON = ICON if os.path.exists(ICON) else None
 
 datas, binaries, hiddenimports = [], [], []
 for pkg in ('rasterio', 'pyproj', 'shapely', 'laspy', 'lazrs', 'matplotlib'):
@@ -39,5 +45,6 @@ exe = EXE(
     exclude_binaries=True,
     name='LidarRoutePlanner',
     console=False,
+    icon=ICON,
 )
 coll = COLLECT(exe, a.binaries, a.datas, name='LidarRoutePlanner')
