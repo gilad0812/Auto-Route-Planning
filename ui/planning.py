@@ -20,6 +20,18 @@ from density_estimate import estimate_density_grid       # noqa: E402
 
 _LAT_M = 111139.0
 
+# Scan (mirror-oscillation) frequency is derived from the pulse rate: across-track
+# resolution f_scan = Δθ·PRR/(2·FOV) is linear in PRR with Δθ and the FOV fixed, so
+# anchor to the scanner's nominal setting (600 kHz → 224.4 Hz) and scale.
+_REF_PRR_HZ = 600_000.0
+_REF_SCAN_HZ = 224.4
+
+
+def scan_freq_for_prr(pulse_freq_hz):
+    """Scan frequency (Hz) for a given pulse rate, scaled from the 600 kHz → 224.4 Hz
+    nominal point so the across-track resolution stays fixed."""
+    return _REF_SCAN_HZ * (float(pulse_freq_hz) / _REF_PRR_HZ)
+
 
 @dataclass
 class PlanParams:

@@ -14,10 +14,11 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QFormLayout, QDoubleSpinBox, QSpinBox, QCheckBox, QComboBox, QGroupBox,
     QSplitter, QScrollArea, QFileDialog, QMessageBox, QFrame, QProgressBar,
-    QApplication,
+    QApplication, QAbstractSpinBox,
 )
 
-from .planning import PlanParams, compute_plan, load_dtm, chm_compatible
+from .planning import (PlanParams, compute_plan, load_dtm, chm_compatible,
+                       scan_freq_for_prr)
 
 try:
     from .canvasmap import CanvasMap
@@ -54,6 +55,7 @@ class MainWindow(QMainWindow):
 
         self._build_menu()
         self._build_body()
+        self._update_scan_freq()                 # derive the initial scan freq
         self._progress = QProgressBar()
         self._progress.setRange(0, 0)            # indeterminate "busy" bar
         self._progress.setMaximumWidth(170)
@@ -149,12 +151,17 @@ class MainWindow(QMainWindow):
         for f in PULSE_FREQS:
             self.cmb_pulse.addItem(f'{f:,}', f)
         self.cmb_pulse.setCurrentText('600,000')
+        # Scan freq is derived from the pulse rate, not entered: read-only + locked.
         self.sp_scanfreq = self._dspin(1, 5000, 224.4, ' Hz', 10)
+        self.sp_scanfreq.setReadOnly(True)
+        self.sp_scanfreq.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self.sp_scanfreq.setToolTip('Auto-derived from the pulse frequency (locked).')
+        self.cmb_pulse.currentIndexChanged.connect(self._update_scan_freq)
         self.sp_veg = self._dspin(0, 1, 0.4, '', 0.05); self.sp_veg.setDecimals(2)
         scl.addRow('Min points / m²', self.sp_minpts)
         scl.addRow('Drone speed', self.sp_speed)
         scl.addRow('Pulse freq', self.cmb_pulse)
-        scl.addRow('Scan freq', self.sp_scanfreq)
+        scl.addRow('Scan freq (auto)', self.sp_scanfreq)
         scl.addRow('Canopy ground-return frac', self.sp_veg)
         scl.addRow(QLabel('FOV fixed at 100° (±50°)'))
         v.addWidget(gb_scan)
@@ -187,6 +194,10 @@ class MainWindow(QMainWindow):
         s = QDoubleSpinBox(); s.setRange(lo, hi); s.setValue(val)
         s.setSuffix(suffix); s.setSingleStep(step)
         return s
+
+    def _update_scan_freq(self):
+        """Lock scan freq to the value derived from the selected pulse rate."""
+        self.sp_scanfreq.setValue(scan_freq_for_prr(self.cmb_pulse.currentData()))
 
     def _build_map(self):
         # Native Qt map canvas (offline) — DTM relief, draw the AOI here.
