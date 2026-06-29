@@ -13,7 +13,8 @@ from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QFormLayout, QDoubleSpinBox, QSpinBox, QCheckBox, QComboBox, QGroupBox,
-    QSplitter, QScrollArea, QFileDialog, QMessageBox, QFrame,
+    QSplitter, QScrollArea, QFileDialog, QMessageBox, QFrame, QProgressBar,
+    QApplication,
 )
 
 from .planning import PlanParams, compute_plan, load_dtm
@@ -53,7 +54,24 @@ class MainWindow(QMainWindow):
 
         self._build_menu()
         self._build_body()
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 0)            # indeterminate "busy" bar
+        self._progress.setMaximumWidth(170)
+        self._progress.hide()
+        self.statusBar().addPermanentWidget(self._progress)
         self.statusBar().showMessage('Open a DTM to begin.')
+
+    def _set_busy(self, on, msg=None):
+        """Show/hide the busy bar + wait cursor and repaint so it's visible
+        before a blocking call."""
+        self._progress.setVisible(on)
+        if msg:
+            self.statusBar().showMessage(msg)
+        if on:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+        else:
+            QApplication.restoreOverrideCursor()
+        QApplication.processEvents()
 
     # ---------------------------------------------------------------- UI build
     def _build_menu(self):
@@ -77,6 +95,8 @@ class MainWindow(QMainWindow):
     def _build_sidebar(self):
         panel = QWidget()
         v = QVBoxLayout(panel)
+        v.setSpacing(10)
+        v.setContentsMargins(12, 12, 12, 12)
 
         # ── Data ──
         gb_data = QGroupBox('Data')
@@ -135,6 +155,7 @@ class MainWindow(QMainWindow):
         v.addWidget(gb_scan)
 
         self.btn_compute = QPushButton('Compute Route')
+        self.btn_compute.setObjectName('primary')
         self.btn_compute.setEnabled(False)
         self.btn_compute.clicked.connect(self._compute)
         v.addWidget(self.btn_compute)
@@ -208,6 +229,7 @@ class MainWindow(QMainWindow):
         self.drawn_polygon = None
         self.btn_compute.setEnabled(False)
         self.lbl_aoi.setText('Draw a polygon on the map to set the AOI.')
+        self._clear_results()
         self._refresh_map()
         self.statusBar().showMessage('DTM loaded. Draw an AOI on the map, '
                                      'then Compute.')
@@ -225,16 +247,33 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, 'CHM error', str(e)); return
         self.chm_path = path
         self.lbl_chm.setText(f'CHM: {path}')
+        self._clear_results()          # density estimate is now stale
         self._refresh_map()
 
     def _clear_chm(self):
         self.chm = None; self.chm_path = None
         self.lbl_chm.setText('CHM: (none)')
+        self._clear_results()          # density estimate is now stale
         self._refresh_map()
 
     def _refresh_map(self):
         if self.mapview is not None and self.dtm is not None:
-            self.mapview.set_dtm(self.dtm, self.dtm_path, self.chm, self.chm_path)
+            self._set_busy(True, 'Rendering terrain…')
+            try:
+                self.mapview.set_dtm(self.dtm, self.dtm_path, self.chm, self.chm_path)
+            finally:
+                self._set_busy(False)
+
+    def _clear_results(self):
+        """Drop the computed route/estimate and its on-screen traces, so stale
+        results never linger next to a changed (or absent) route."""
+        self.result = None
+        self.lbl_summary.setText('Compute a route to see results.')
+        if self.mapview is not None:
+            self.mapview.clear_overlays()
+        self.btn_helios.setEnabled(False)
+        self.btn_geojson.setEnabled(False)
+        self.btn_csv.setEnabled(False)
 
     def _on_polygon_drawn(self, geom):
         try:
@@ -244,6 +283,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.statusBar().showMessage(f'Bad polygon: {e}'); return
         self.drawn_polygon = poly
+        self._clear_results()                 # previous route no longer matches AOI
         self.lbl_aoi.setText('✓ AOI set from the drawn polygon.')
         self.btn_compute.setEnabled(True)
         self.statusBar().showMessage('AOI set from drawn polygon. Click Compute.')
@@ -252,6 +292,7 @@ class MainWindow(QMainWindow):
         self.drawn_polygon = None
         self.btn_compute.setEnabled(False)
         self.lbl_aoi.setText('Draw a polygon on the map to set the AOI.')
+        self._clear_results()
         self._refresh_map()
 
     def _params(self):
@@ -274,13 +315,14 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, 'AOI', 'Draw a polygon on the map first.')
             return
         poly = self.drawn_polygon
-        self.statusBar().showMessage('Computing…')
+        self._set_busy(True, 'Computing route + density estimate…')
         self.setEnabled(False)
         try:
             self.result = compute_plan(self.dtm, poly, self._params(),
                                        chm=self.chm, is_geo=self.is_geo)
         except Exception as e:
             self.setEnabled(True)
+            self._set_busy(False)
             QMessageBox.critical(self, 'Compute error', str(e))
             self.statusBar().showMessage('Compute failed.')
             return
@@ -291,7 +333,10 @@ class MainWindow(QMainWindow):
         self.btn_helios.setEnabled(has_route)
         self.btn_geojson.setEnabled(has_route)
         self.btn_csv.setEnabled(has_route)
-        self.statusBar().showMessage('Done.')
+        self._set_busy(False)
+        self.statusBar().showMessage(
+            f'Done — {self.result.n_waypoints} waypoints' if has_route
+            else 'Done — no route produced')
 
     # ---------------------------------------------------------------- HELIOS
     def _open_helios(self):

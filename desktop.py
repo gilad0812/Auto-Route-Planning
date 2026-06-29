@@ -76,7 +76,10 @@ def main():
         return
     from PySide6.QtWidgets import QApplication
     from ui.main_window import MainWindow
+    from ui.style import apply_dark_theme
     app = QApplication(sys.argv)
+    app.setApplicationName('LiDAR Route Planner')
+    apply_dark_theme(app)
     win = MainWindow()
     win.show()
     sys.exit(app.exec())

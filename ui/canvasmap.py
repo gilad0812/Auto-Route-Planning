@@ -106,14 +106,17 @@ class CanvasMap(QWidget):
         self._chm_item = None
 
         v = QVBoxLayout(self); v.setContentsMargins(0, 0, 0, 0); v.setSpacing(0)
-        bar = QHBoxLayout(); bar.setContentsMargins(6, 4, 6, 4)
-        self.btn_draw = QToolButton(); self.btn_draw.setText('Draw AOI')
+        barw = QWidget(); barw.setObjectName('mapbar')
+        barw.setStyleSheet('#mapbar { background:#232629; '
+                           'border-bottom:1px solid #383c42; }')
+        bar = QHBoxLayout(barw); bar.setContentsMargins(8, 6, 8, 6); bar.setSpacing(6)
+        self.btn_draw = QToolButton(); self.btn_draw.setText('✎ Draw AOI')
         self.btn_draw.setCheckable(True); self.btn_draw.clicked.connect(self._toggle_draw)
         self.btn_finish = QToolButton(); self.btn_finish.setText('Finish')
         self.btn_finish.clicked.connect(self.finish_draw)
         self.btn_clear = QToolButton(); self.btn_clear.setText('Clear AOI')
         self.btn_clear.clicked.connect(self.clear_aoi)
-        self.btn_fit = QToolButton(); self.btn_fit.setText('Fit')
+        self.btn_fit = QToolButton(); self.btn_fit.setText('⤢ Fit')
         self.btn_fit.clicked.connect(self._fit)
         self.btn_chm = QToolButton(); self.btn_chm.setText('CHM')
         self.btn_chm.setCheckable(True); self.btn_chm.setEnabled(False)
@@ -121,12 +124,14 @@ class CanvasMap(QWidget):
         for b in (self.btn_draw, self.btn_finish, self.btn_clear, self.btn_fit, self.btn_chm):
             bar.addWidget(b)
         bar.addStretch(1)
-        self.lbl_coord = QLabel(''); self.lbl_coord.setStyleSheet('color:#666;')
+        self.lbl_coord = QLabel(''); self.lbl_coord.setStyleSheet('color:#9aa0a6;')
         bar.addWidget(self.lbl_coord)
-        v.addLayout(bar)
+        v.addWidget(barw)
 
         self.scene = QGraphicsScene(self)
         self.view = _View(self.scene, self)
+        self.view.setBackgroundBrush(QColor('#16181b'))
+        self.view.setFrameShape(self.view.Shape.NoFrame)
         v.addWidget(self.view, 1)
 
     # ----------------------------------------------------------- data
@@ -299,6 +304,14 @@ class CanvasMap(QWidget):
             self.scene.removeItem(self._helios_item); self._helios_item = None
         if cells:
             self._helios_item = self._paint_cells(cells, '#e5484d', 130, radius_m)
+
+    def clear_overlays(self):
+        """Remove route + density + HELIOS overlays (keeps the DTM and drawn AOI)."""
+        for attr in ('_route_group', '_density_item', '_helios_item'):
+            it = getattr(self, attr, None)
+            if it is not None:
+                self.scene.removeItem(it)
+                setattr(self, attr, None)
 
     def _marker(self, grp, sp, hexcolor):
         m = QGraphicsEllipseItem(-5, -5, 10, 10)

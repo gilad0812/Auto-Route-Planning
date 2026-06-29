@@ -21,6 +21,7 @@ from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
     QPushButton, QDoubleSpinBox, QPlainTextEdit, QFileDialog, QMessageBox,
+    QProgressBar,
 )
 
 from helios_integration import run_feedback_loop          # noqa: E402
@@ -118,11 +119,15 @@ class HeliosDialog(QDialog):
         v.addLayout(form)
 
         btns = QHBoxLayout()
-        self.btn_run = QPushButton('Run Validation'); self.btn_run.clicked.connect(self._run)
+        self.btn_run = QPushButton('Run Validation'); self.btn_run.setObjectName('primary')
+        self.btn_run.clicked.connect(self._run)
         self.btn_stop = QPushButton('Stop'); self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self._stop)
         btns.addWidget(self.btn_run); btns.addWidget(self.btn_stop); btns.addStretch(1)
         v.addLayout(btns)
+
+        self.prog = QProgressBar(); self.prog.setRange(0, 0); self.prog.hide()
+        v.addWidget(self.prog)
 
         self.lbl_result = QLabel(''); self.lbl_result.setTextFormat(Qt.RichText)
         self.lbl_result.setWordWrap(True)
@@ -159,6 +164,7 @@ class HeliosDialog(QDialog):
         self.log.clear(); self.lbl_result.setText('')
         self.btn_run.setEnabled(False); self.btn_stop.setEnabled(True)
         self.btn_traj.setEnabled(False); self.btn_xml.setEnabled(False)
+        self.prog.show()
 
         self.worker = HeliosWorker(
             dtm=self.dtm, dtm_path=self.dtm_path, route=self.route,
@@ -179,6 +185,7 @@ class HeliosDialog(QDialog):
     def _finished(self, res):
         self.result = res
         self.btn_run.setEnabled(True); self.btn_stop.setEnabled(False)
+        self.prog.hide()
         if res.get('error'):
             self.lbl_result.setText(f'<span style="color:#cf222e"><b>Error:</b> '
                                     f'{res["error"]}</span>')
