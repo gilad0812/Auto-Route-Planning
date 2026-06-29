@@ -1,40 +1,17 @@
-"""
-Fast analytical point-density estimate for a planned route.
+"""Fast analytical point-density estimate for a planned route.
 
-Computes the EXPECTED LiDAR point density per ground cell straight from scan
-geometry — no ray tracing — so a route can be iterated in ~a second instead of
-waiting hours for a HELIOS++ simulation.
+Expected LiDAR density per ground cell from scan geometry alone (no ray tracing),
+so a route iterates in ~a second instead of a HELIOS++ run.
 
-Model
------
-For a line scanner the local areal point density a single pass deposits at a
-ground point seen under scan angle θ is
+Model: a single pass deposits ρ(θ) = pulse_freq·cos²θ / (speed·h·FOV) at a point
+seen under scan angle θ (h = AGL there, FOV = 2·half-angle). scan_freq cancels in
+the derivation, so it doesn't affect average density. Per-cell density sums ρ over
+every pass whose swath covers it — capturing swath-edge thinning (cos²θ), range²
+thinning over valleys, coverage gaps, and the FOV cut-off.
 
-    ρ(θ) = pulse_freq · cos²θ / (speed · h · FOV)
-
-where h is the height of the aircraft above THAT ground point and FOV = 2·scan
-half-angle (radians). Derivation: along-track line spacing is speed/L and
-across-track point spacing is (h/cosθ)·(FOV·L/pulse_freq)/cosθ; their product
-(the per-point ground area) is speed·h·FOV/(pulse_freq·cos²θ) — the scan
-frequency L cancels, which is why scan_freq does not affect average density.
-
-The total density at a cell is the sum of ρ over every pass whose swath covers
-it (|θ| ≤ scan half-angle). This captures the geometric drivers the route
-controls:
-  • swath-edge thinning            (cos²θ)
-  • range² thinning over valleys   (h = pass altitude − terrain, per cell)
-  • coverage gaps                  (no pass covers the cell → 0)
-  • scan FOV limits                (θ cut-off)
-
-It models occlusion/shadowing (line-of-sight march) and a canopy-penetration
-thinning when a CHM is supplied; it does NOT model multiple returns — so it is
-an estimator for ITERATING, confirmed by a single HELIOS++ run.
-
-Vegetation
-----------
-When a binary vegetation mask (`chm`, value > 0 = vegetated) is passed, those
-cells get their density multiplied by `veg_penetration` (default 0.4): the
-thumb-rule fraction of pulses that reach the GROUND through the canopy.
+Occlusion is modelled by a line-of-sight march; a CHM thins vegetated cells by
+`veg_penetration`. Multiple returns are not modelled — an estimator for iterating,
+confirmed by one HELIOS++ run.
 """
 
 import math
@@ -135,16 +112,10 @@ def estimate_density_grid(
     if dtm.nodata is not None:
         terr = np.where(terr == dtm.nodata, np.nan, terr)
 
-    # Terrain surface normal per cell, from the local slope (∂z/∂east, ∂z/∂north).
-    # Used below for (1) the back-facing test (cos_i ≤ 0 → never hit) and (2) the
-    # `nrm` factor that projects per-surface density onto HELIOS's horizontal grid.
-    #
-    # Differentiate the DTM at its NATIVE pixel resolution, then sample per cell —
-    # NOT np.gradient on the fine per-cell grid. A coarse DTM (e.g. 20 m pixels)
-    # sampled onto a 1 m grid is a staircase: its 1 m gradient is 0 on a pixel's
-    # flat interior and near-vertical at the pixel riser, inventing cliffs that
-    # exist neither in the terrain nor in HELIOS's smoothed mesh. The native
-    # gradient is the real slope. (t.a>0 east per col, t.e<0 north per row.)
+    # Surface normal per cell from local slope — for the back-facing test (cos_i ≤ 0)
+    # and per-surface density. Differentiate the DTM at NATIVE pixel resolution, not
+    # on the fine cell grid: a coarse DTM upsampled to 1 m is a staircase that
+    # invents cliffs at the pixel risers. (t.a>0 east per col, t.e<0 north per row.)
     arr_f = np.where(arr == dtm.nodata, np.nan, arr) if dtm.nodata is not None else arr
     arr_f = np.where(np.isnan(arr_f), np.nanmean(arr_f), arr_f)
     g_e = (np.gradient(arr_f, axis=1) / (t.a * lon_m))[row, col]   # ∂z/∂east  per m
@@ -180,27 +151,20 @@ def estimate_density_grid(
         h = z_pass - terr                           # AGL above each cell
         with np.errstate(invalid="ignore"):
             R = np.sqrt(d * d + h * h)              # slant range
-            # cos(incidence) between the ray and the surface normal; for flat
-            # ground this reduces to cos(scan angle) = h/R (the old model).
+            # cos(incidence) of ray vs surface normal; flat ground → h/R.
             cos_i = (h + ox * g_e + oy * g_n) / (np.maximum(R, 1e-6) * nrm)
             covered = (np.isfinite(h) & (h > 1.0)
                        & (d <= h * tan_half) & (cos_i > 0.0))
-            # cos_i / R gives density per unit of the actual (tilted) terrain
-            # surface — points per SURFACE m². That is the survey-quality metric we
-            # want: how densely the real hillside is sampled, regardless of how
-            # steep it is. HELIOS's verify_point_density normalises by the same
-            # tilted surface area, so the estimate and the simulation are directly
-            # comparable. (`nrm` is still used above, in cos_i, for the incidence.)
+            # cos_i / R → points per tilted SURFACE m² (survey-quality metric);
+            # HELIOS normalises the same way, so estimate and sim are comparable.
             contrib = np.where(
                 covered,
                 pulse_freq_hz * cos_i / (speed_ms * np.maximum(R, 1.0) * fov),
                 0.0,
             )
-        # Occlusion: march from the aircraft (foot of the pass, at z_pass) down to
-        # the cell; if terrain in between rises above the sight line, the beam is
-        # blocked → this pass deposits nothing here (shadowed gully floor / lee
-        # face behind a ridge or cliff). This is the dominant effect HELIOS sees
-        # that pure scan geometry misses.
+        # Occlusion: march the sight-line from the pass down to the cell; terrain
+        # rising above it blocks the beam (shadowed gully floor / lee face). The
+        # dominant effect HELIOS sees that pure scan geometry misses.
         if occlusion:
             with np.errstate(invalid="ignore"):
                 blocked = np.zeros_like(h, dtype=bool)
@@ -212,10 +176,8 @@ def estimate_density_grid(
             contrib = np.where(blocked, 0.0, contrib)
         density += contrib
 
-    # ── Canopy penetration: thin vegetated cells to the ground-return fraction ─
-    # A binary mask marks where vegetation stands; pulses that hit canopy mostly
-    # do not reach the ground, so the ground point density there is a fraction
-    # (`veg_penetration`, thumb rule 0.4) of the bare-earth estimate.
+    # Canopy: vegetated cells keep only `veg_penetration` of the bare-earth density
+    # (the fraction of pulses reaching the ground through the canopy).
     if chm is not None:
         ca = np.asarray(chm.array, dtype=float)
         ct = chm.src.transform
@@ -245,8 +207,7 @@ def estimate_density_grid(
         "failing_cells_geo": failing_geo,
         "n_fail": len(failing_geo),
         "n_cells": int(inside.sum()),
-        # Voids = AOI cells the scan reaches with ~zero points (occlusion shadows /
-        # coverage gaps) — distinct from merely under-dense cells.
+        # Voids = reached cells with ~zero points (occlusion shadows / gaps).
         "n_void": int((in_vals <= 0.0).sum()),
         "median_density": float(np.median(in_vals)) if in_vals.size else 0.0,
         "min_density": float(in_vals.min()) if in_vals.size else 0.0,

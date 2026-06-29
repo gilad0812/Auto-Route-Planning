@@ -334,13 +334,9 @@ def build_survey_xml(
         scanner=scanner_ref,
     )
 
-    # Scanner settings written inline on every leg (avoids template lookup issues).
-    # `active` is decided per leg below: the scanner fires only WHILE flying along
-    # a pass, and is OFF during the connector hop between passes (the side lines),
-    # which real post-processing discards. HELIOS' leg `active` governs the segment
-    # from this leg to the NEXT one, so a leg scans iff its next leg is in the same
-    # pass. (If a sim ever comes back near-empty on the passes, this is the flag to
-    # flip — it would mean HELIOS uses the previous→this convention instead.)
+    # Scanner settings inline per leg. `active` governs this leg → the NEXT leg, so
+    # a leg scans iff its next leg is in the same pass — scanner ON along a pass, OFF
+    # on the connector hop between passes. (Near-empty passes? flip this convention.)
     _scan_base = dict(
         pulseFreq_hz=str(pulse_freq_hz),   # HELIOS++ expects lowercase 'hz'
         scanFreq_hz=str(scan_freq_hz),
@@ -522,23 +518,15 @@ def run_helios(
     except ImportError:
         helios_cwd = helios_bin.parent
 
-    # Build an env that includes the Conda runtime library directories so the
-    # binary can load its dependencies (STATUS_DLL_NOT_FOUND on Windows /
-    # "error while loading shared libraries" on Linux otherwise). HELIOS++ is
-    # distributed as a full Conda env, identifiable by a conda-meta/ marker
-    # directory at its root.
+    # HELIOS ships as a full Conda env; build an env that loads ITS runtime libs
+    # (else STATUS_DLL_NOT_FOUND / missing shared libraries).
     import platform as _platform
     run_env = os.environ.copy()
-    # Always drop our GDAL/PROJ data pointers so HELIOS uses its own — a stray
-    # PROJ_LIB/GDAL_DATA from rasterio (dev) or the frozen bundle can mismatch
-    # HELIOS's GDAL.
+    # drop our GDAL/PROJ pointers so HELIOS uses its own (a stray one mismatches)
     for _v in ("GDAL_DATA", "PROJ_LIB", "PROJ_DATA", "GDAL_DRIVER_PATH"):
         run_env.pop(_v, None)
-    # helios++.exe embeds its OWN Python. When we run inside a PyInstaller-frozen
-    # .exe, the parent leaks PYTHON*/PyInstaller vars (PYTHONHOME, PYTHONPATH,
-    # _PYI_*, _MEIPASS*) into the child, so HELIOS's embedded interpreter tries to
-    # initialise against OUR bundled runtime and dies at startup (0xC0000139).
-    # Strip them so HELIOS uses its own interpreter home.
+    # helios++.exe embeds its own Python; strip PYTHON*/_PYI*/_MEIPASS* or, in a
+    # frozen build, it inits against our runtime and dies at startup (0xC0000139).
     _stripped = []
     for _k in list(run_env.keys()):
         _ku = _k.upper()
@@ -569,19 +557,12 @@ def run_helios(
                 str(_conda_root / "Scripts"),
                 str(_conda_root / "DLLs"),
             ]
-            # Build a CLEAN PATH (conda dirs + Windows system dirs only) instead
-            # of inheriting ours. The parent process's PATH — the project venv's
-            # rasterio/GDAL DLLs in dev, or the PyInstaller bundle's DLLs in the
-            # frozen .exe — otherwise shadows HELIOS's own libraries and it dies
-            # at startup with a wrong-version DLL (STATUS_ENTRYPOINT_NOT_FOUND,
-            # 0xC0000139). A clean PATH makes HELIOS load only its own DLLs.
+            # CLEAN PATH (conda + system dirs only): our inherited PATH would shadow
+            # HELIOS's DLLs with wrong-version ones and crash it (0xC0000139).
             run_env["PATH"] = os.pathsep.join(_dll_dirs + _sys_dirs)
-            # Bulletproofing for the frozen (.exe) case: a PyInstaller parent can
-            # force its own VC-runtime onto this child via the inherited
-            # activation context, which a clean PATH can't override and which
-            # crashes HELIOS with a wrong-version DLL (0xC0000139). Copy HELIOS's
-            # OWN runtime DLLs next to helios++.exe — the executable's own
-            # directory is the FIRST place Windows looks, so these always win.
+            # Frozen case: the inherited activation context can force our VC-runtime
+            # on HELIOS (a clean PATH can't override it). Copy HELIOS's own runtime
+            # DLLs next to helios++.exe — the exe's dir is searched first, so they win.
             import shutil as _shutil
             _bindir = helios_bin.parent
             for _name in (
@@ -598,8 +579,7 @@ def run_helios(
                     except Exception:
                         pass
         else:
-            # Fallback: couldn't locate the conda root, but still scrub the
-            # PyInstaller bundle dir from PATH so it can't shadow HELIOS DLLs.
+            # No conda root found — still scrub the bundle dir from PATH.
             _meipass = getattr(sys, "_MEIPASS", None)
             entries = run_env.get("PATH", "").split(os.pathsep)
             if _meipass:
@@ -622,11 +602,8 @@ def run_helios(
                     str(_lib_dir) + os.pathsep + run_env.get("LD_LIBRARY_PATH", "")
                 )
 
-    # Inside a PyInstaller-frozen .exe, every descendant process inherits state
-    # that makes HELIOS crash at startup (0xC0000139) — clean PATH, scrubbed env,
-    # std handles and activation contexts all fail to prevent it. Re-parenting
-    # HELIOS via WMI is the only thing that avoids it, so in a frozen build we
-    # launch it that way; in dev we use a normal subprocess (which works).
+    # In a frozen .exe every descendant inherits state that crashes HELIOS at
+    # startup (0xC0000139); re-parenting via WMI is the only fix. Dev uses Popen.
     _use_wmi = _platform.system() == "Windows" and getattr(sys, "frozen", False)
     if log:
         log(f"[diag] use_wmi={_use_wmi} conda_root={_conda_root} cwd={helios_cwd}")
@@ -656,12 +633,8 @@ def run_helios(
         env=run_env,
     )
 
-    # HELIOS++ fully-buffers stdout when it's piped (not a terminal), so its
-    # per-leg progress lines can sit in the child's libc buffer for a long time
-    # before they reach us — the process can be busy for minutes while we see
-    # nothing. Read its output on a background thread and emit periodic
-    # heartbeats whenever nothing has arrived for a while, so the caller can
-    # tell the simulation is alive rather than hung.
+    # HELIOS fully-buffers piped stdout, so progress lines can lag minutes. Pump its
+    # output on a background thread and emit heartbeats during quiet spells.
     line_queue: "queue.Queue[Optional[str]]" = queue.Queue()
 
     def _pump() -> None:
@@ -906,11 +879,8 @@ def verify_point_density(
             np.add.at(grid, (yi, xi), 1)
         del xs, ys
 
-    # Per-cell density in pts/m². By default the divisor is the flat cell area
-    # (cell_size²). When a DTM is supplied, divide instead by the TILTED SURFACE
-    # area (cell_size² · sec slope) so density is reported per SURFACE m² — the
-    # survey-quality metric, matching the estimator's convention. Computed as a
-    # full grid so the pass/fail test and the stats use the same definition.
+    # Per-cell density in pts/m². With a DTM, divide by the TILTED SURFACE area
+    # (cell² · sec slope) not flat cell area — per-surface m², matching the estimator.
     all_cx = x_min + (np.arange(nx) + 0.5) * cell_size
     all_cy = y_min + (np.arange(ny) + 0.5) * cell_size
     gx, gy = np.meshgrid(all_cx, all_cy)
@@ -919,11 +889,9 @@ def verify_point_density(
         cell_area = cell_area * _surface_stretch(dtm, gx, gy, ref_lon, ref_lat, is_geo)
     dens_grid = grid.astype(float) / cell_area     # pts per (surface) m²
 
-    # Canopy thinning: where a binary vegetation mask (chm > 0) marks vegetation,
-    # multiply the ground density by `veg_penetration` (thumb rule 0.4) — the SAME
-    # planning factor the estimator applies, so the two agree over vegetated
-    # cells. HELIOS itself sims bare earth; this is a post-process factor, not
-    # ray-traced canopy occlusion. Sample the mask by location (metric→lon/lat).
+    # Canopy thinning: vegetated cells (chm > 0) keep only `veg_penetration` of the
+    # density — the same post-process factor the estimator applies (HELIOS sims bare
+    # earth, not ray-traced canopy), so the two agree over vegetation.
     if chm is not None:
         ca = np.asarray(chm.array, dtype=float)
         ct = chm.src.transform
@@ -940,11 +908,9 @@ def verify_point_density(
         veg = np.isfinite(mask) & (mask > 0)
         dens_grid = np.where(veg, dens_grid * float(veg_penetration), dens_grid)
 
-    # With an AOI polygon, count EVERY in-region cell below the threshold —
-    # including empty ones (occlusion voids are real coverage gaps); the polygon
-    # mask below excludes the rectangular grid's empty margin. Without a polygon
-    # we can't tell "outside the survey" from "void inside it", so we fall back to
-    # only judging populated cells (grid > 0) to avoid flagging the empty margin.
+    # With an AOI polygon, fail EVERY in-region cell below threshold (empty ones are
+    # real voids). Without one, judge only populated cells (grid > 0) so the grid's
+    # empty rectangular margin isn't flagged.
     if region is not None:
         fail_mask = (dens_grid < min_points)
     else:
@@ -962,9 +928,7 @@ def verify_point_density(
 
     failing_cells: List[Tuple[float, float]] = list(zip(cx.tolist(), cy.tolist()))
 
-    # ── AOI density statistics (coverage %, voids, median/min) ───────────────
-    # Over every AOI cell INCLUDING empty ones, so coverage reflects the whole
-    # surveyed area (voids = empty cells are counted too).
+    # AOI density stats over every cell incl. empty ones (voids count toward coverage).
     if region is not None:
         in_region = _points_in_polygon(gx.ravel(), gy.ravel(), region).reshape(grid.shape)
     else:
@@ -1070,9 +1034,8 @@ def run_feedback_loop(
         "error": None,
     }
 
-    # Survey polygon in metric coords, derived once the projection origin is
-    # known. Restricts the density check to the area of interest so swath
-    # overhang beyond the polygon doesn't count as a failure.
+    # Survey polygon in metric coords (set once the origin is known) — restricts the
+    # density check to the AOI so swath overhang beyond it doesn't count as failure.
     region_metric: Optional[List[Tuple[float, float]]] = None
 
     try:
@@ -1088,9 +1051,8 @@ def run_feedback_loop(
         export_trajectory(route, str(traj_path), speed_ms, is_geo)
         result["trajectory_path"] = str(traj_path)
 
-        # Route → metric for the survey XML. The projection origin MUST match the
-        # terrain OBJ's origin (see _route_to_metric) or the mesh and flight legs
-        # drift apart and HELIOS records zero points.
+        # Route → metric for the survey XML. Origin MUST match the terrain OBJ's
+        # origin or mesh and flight legs drift apart and HELIOS records zero points.
         metric_route, ref_lon, ref_lat = _route_to_metric(route, is_geo, ref_lon, ref_lat)
 
         # Project the survey polygon into the same metric frame.

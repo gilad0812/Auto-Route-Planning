@@ -1,21 +1,9 @@
 
-"""
-Auto-detect and install HELIOS++ (https://github.com/3dgeo-heidelberg/helios).
+"""Auto-detect and install HELIOS++ (github.com/3dgeo-heidelberg/helios).
 
-Install target : <project_root>/helios_bin/
-Persisted state: <project_root>/helios_bin/.helios_config.json
-
-Detection order
-───────────────
-1. Saved path in .helios_config.json (fastest, used after first install)
-2. Recursive search inside helios_bin/
-3. System PATH (shutil.which)
-
-Installation
-────────────
-Downloads the latest release from GitHub, then runs the installer silently:
-  Windows        – NSIS .exe              →  <installer> /S /D=<install_dir>
-  Linux / macOS  – conda-constructor .sh  →  <installer> -b -f -p <install_dir>
+Detection order: bundled-with-app → saved .helios_config.json → helios_bin/ →
+system PATH. Install downloads the latest GitHub release and runs it silently
+(Windows NSIS /S, Linux/macOS conda-constructor -b -f -p).
 """
 
 from __future__ import annotations
@@ -52,11 +40,8 @@ _BIN_NAME = "helios++.exe" if _IS_WIN else "helios++"
 _API_LATEST = "https://api.github.com/repos/3dgeo-heidelberg/helios/releases/latest"
 
 
-# ── Custom scanner assets ─────────────────────────────────────────────────────
-# Scanner definitions used by this project that are not shipped with the
-# HELIOS++ release. They are appended (idempotently) to the installed
-# data/scanners_als.xml so survey references like
-# "data/scanners_als.xml#riegl_vux_120_23" resolve on any fresh install.
+# Project scanner defs not shipped with HELIOS, appended idempotently to the
+# installed data/scanners_als.xml so survey refs resolve on a fresh install.
 
 _CUSTOM_ALS_SCANNERS: dict[str, str] = {
     "riegl_vux_120_23": """\

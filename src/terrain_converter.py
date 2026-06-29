@@ -1,11 +1,8 @@
-"""
-Convert a GeoTIFF DTM raster to a Wavefront OBJ mesh for HELIOS++ scenes.
+"""Convert a GeoTIFF DTM to a Wavefront OBJ mesh for HELIOS++ scenes.
 
-The output mesh uses the same flat-Earth metric coordinate system as
-helios_integration._route_to_metric(): vertices are expressed in metres
-relative to a reference (ref_lon, ref_lat) point — typically the route
-centroid — so the mesh and the survey legs are aligned without a full
-re-projection.
+Vertices are in the same flat-Earth metric frame as the survey legs (metres from
+ref_lon/ref_lat, typically the route centroid), so mesh and legs align without a
+full re-projection.
 """
 
 from __future__ import annotations
@@ -53,13 +50,9 @@ def dtm_to_obj(
                          Larger values → coarser but faster mesh.
         ref_lon:         Reference longitude (degrees) for the local projection.
         ref_lat:         Reference latitude  (degrees) for the local projection.
-        crop_bounds:     Optional (minx, miny, maxx, maxy) in the DTM's CRS
-                         (lon/lat for geographic, metres for projected). When
-                         given, only this region — grown by `margin_m` — is
-                         meshed, instead of the whole DTM. A smaller mesh means
-                         a smaller HELIOS++ KD-tree: faster build, far less
-                         memory (avoids OOM), and fewer triangles per ray, with
-                         no fidelity loss inside the surveyed area.
+        crop_bounds:     Optional (minx, miny, maxx, maxy) in the DTM's CRS; only
+                         this region (grown by margin_m) is meshed — a smaller mesh
+                         means a smaller HELIOS KD-tree (faster, far less memory).
         margin_m:        Metres to expand `crop_bounds` on every side (so the
                          outermost passes' swaths still land on meshed terrain).
 
