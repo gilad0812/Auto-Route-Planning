@@ -26,6 +26,7 @@ import platform
 import shutil
 import stat
 import subprocess
+import sys
 import urllib.request
 from pathlib import Path
 from typing import Callable, Optional
@@ -155,12 +156,30 @@ def find_helios_root(binary: Path) -> Path:
     return binary.parent
 
 
+def _bundled_dirs() -> list[Path]:
+    """Locations to check for a HELIOS++ shipped INSIDE the app bundle, so a frozen
+    onedir build is self-contained: copy the helios install into the dist folder
+    (next to LidarRoutePlanner.exe) as `helios/`. Checked first so the shipped copy
+    always wins over whatever happens to be on the host machine."""
+    dirs: list[Path] = []
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).parent
+        dirs += [exe_dir / "helios", exe_dir / "_internal" / "helios"]
+    return dirs
+
+
 def find_helios_binary() -> Optional[Path]:
     """
     Return path to helios++ binary if already available, else None.
 
-    Checks in order: saved config → project install dir → system PATH.
+    Checks in order: bundled-with-app → saved config → project install dir → PATH.
     """
+    # 0. Bundled inside the frozen app (self-contained deployment).
+    for d in _bundled_dirs():
+        found = _find_binary_under(d)
+        if found:
+            return found
+
     # 1. Saved path
     cfg = _load_config()
     saved = cfg.get("binary_path")
