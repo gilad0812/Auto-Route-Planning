@@ -150,7 +150,7 @@ class MainWindow(QMainWindow):
         gb_flight = QGroupBox('Flight')
         fl = QFormLayout(gb_flight)
         self.sp_alt = self._dspin(1, 1000, 100, ' m', 5)
-        self.sp_overlap = self._dspin(0, 99, 20, ' %', 5)
+        self.sp_overlap = self._dspin(20, 50, 20, ' %', 1)
         self.cb_adaptive = QCheckBox('Terrain-adaptive spacing'); self.cb_adaptive.setChecked(True)
         fl.addRow('Altitude AGL', self.sp_alt)
         fl.addRow('Overlap', self.sp_overlap)
