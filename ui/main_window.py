@@ -514,13 +514,11 @@ class MainWindow(QMainWindow):
         slast = (valid[-1]['x'], valid[-1]['y'])
         start_leg, end_leg = [], []
         e = self._ferry_inpoly_far(sfirst, self.home, poly)
-        if e:                               # entry → survey start (drop dup start)
-            bp = build_manual_pass(self.dtm, e, sfirst, params, self.is_geo, base + 1)
-            start_leg = bp[:-1]
+        if e:                               # entry → survey start (own pass id)
+            start_leg = build_manual_pass(self.dtm, e, sfirst, params, self.is_geo, base + 1)
         x = self._ferry_inpoly_far(slast, self.home, poly)
-        if x:                               # survey end → exit (drop dup end)
-            bp = build_manual_pass(self.dtm, slast, x, params, self.is_geo, base + 2)
-            end_leg = bp[1:]
+        if x:                               # survey end → exit (own pass id)
+            end_leg = build_manual_pass(self.dtm, slast, x, params, self.is_geo, base + 2)
         return start_leg, end_leg
 
     def _effective_result(self):

@@ -91,8 +91,11 @@ def plan_route(dtm, polygon, distance_above_surface,
     passes = lawnmower_waypoints(polygon, spacing, step)
     route = []
     for pass_id, pts in enumerate(passes):
+        # altitude from the DENSE samples; emit only the pass endpoints (a straight
+        # constant-altitude line needs no intermediate waypoints — the turns are it).
         z = _pass_altitude(dtm, pts, distance_above_surface, step, elev_sample_step)
-        for x, y in pts:
+        ends = [pts[0], pts[-1]] if len(pts) >= 2 else pts
+        for x, y in ends:
             route.append({'x': x, 'y': y, 'z': z, 'target_distance': distance_above_surface,
                           'pass_id': pass_id})
     return route
@@ -258,7 +261,10 @@ def plan_route_adaptive(dtm, polygon, distance_above_surface,
             if valid:
                 z = max(valid) + agl
 
-            for pu, pv in ordered:
+            # emit only the pass endpoints (the turns) — altitude already came from
+            # the dense elev_pts above, so no intermediate waypoints are needed.
+            ends = [ordered[0], ordered[-1]] if len(ordered) >= 2 else ordered
+            for pu, pv in ends:
                 gx, gy = uv2g(pu, pv)
                 route.append({'x': gx, 'y': gy, 'z': z,
                               'target_distance': agl, 'pass_id': pass_id})

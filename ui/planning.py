@@ -194,8 +194,9 @@ def build_manual_pass(dtm, p0, p1, params: PlanParams, is_geo, pass_id):
     z = _pass_altitude(dtm, pts, params.altitude_m, step_map, elev_step_map)
     if math.isnan(z):
         return []
+    # altitude from the dense samples; emit only the endpoints (start/end turns)
     return [{'x': x, 'y': y, 'z': z, 'target_distance': params.altitude_m,
-             'pass_id': pass_id} for x, y in pts]
+             'pass_id': pass_id} for x, y in (pts[0], pts[-1])]
 
 
 def load_dtm(path):
