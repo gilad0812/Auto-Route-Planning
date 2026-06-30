@@ -76,6 +76,9 @@ class _View(QGraphicsView):
         if self._owner.drawing and e.button() == Qt.LeftButton:
             self._owner.add_vertex(self.mapToScene(e.position().toPoint()))
             e.accept(); return
+        if self._owner.drawing_pass and e.button() == Qt.LeftButton:
+            self._owner.add_pass_vertex(self.mapToScene(e.position().toPoint()))
+            e.accept(); return
         super().mousePressEvent(e)
 
     def mouseDoubleClickEvent(self, e):
@@ -90,6 +93,7 @@ class _View(QGraphicsView):
 
 class CanvasMap(QWidget):
     polygonDrawn = Signal(object)        # emits a GeoJSON Polygon geometry dict
+    passDrawn = Signal(object)           # emits (lon,lat) — the END of a new pass (start = route end)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -97,8 +101,11 @@ class CanvasMap(QWidget):
         self.chm = None
         self._inv = None                 # world -> pixel
         self.drawing = False
+        self.drawing_pass = False
         self._verts = []                 # scene QPointF vertices in progress
         self._draw_items = []
+        self._pass_anchor = None         # scene point a drawn pass starts from (route end)
+        self._pass_preview = None        # rubber-band line to the cursor
         self._aoi_item = None
         self._route_group = None
         self._density_item = None
@@ -114,12 +121,18 @@ class CanvasMap(QWidget):
         self.btn_draw.setCheckable(True); self.btn_draw.clicked.connect(self._toggle_draw)
         self.btn_finish = QToolButton(); self.btn_finish.setText('Finish')
         self.btn_finish.clicked.connect(self.finish_draw)
+        self.btn_pass = QToolButton(); self.btn_pass.setText('✚ Add Pass')
+        self.btn_pass.setCheckable(True); self.btn_pass.setEnabled(False)
+        self.btn_pass.setToolTip('Click two points to add a flight pass; its height '
+                                 'is set from the terrain. Stays on for more passes.')
+        self.btn_pass.clicked.connect(self._toggle_pass)
         self.btn_fit = QToolButton(); self.btn_fit.setText('⤢ Fit')
         self.btn_fit.clicked.connect(self._fit)
         self.btn_chm = QToolButton(); self.btn_chm.setText('CHM')
         self.btn_chm.setCheckable(True); self.btn_chm.setEnabled(False)
         self.btn_chm.clicked.connect(self._toggle_chm)
-        for b in (self.btn_draw, self.btn_finish, self.btn_fit, self.btn_chm):
+        for b in (self.btn_draw, self.btn_finish, self.btn_pass,
+                  self.btn_fit, self.btn_chm):
             bar.addWidget(b)
         bar.addStretch(1)
         self.lbl_coord = QLabel(''); self.lbl_coord.setStyleSheet('color:#9aa0a6;')
@@ -140,6 +153,9 @@ class CanvasMap(QWidget):
         self._aoi_item = self._route_group = self._density_item = None
         self._helios_item = self._chm_item = None
         self._verts = []; self._draw_items = []
+        self._pass_anchor = None; self._pass_preview = None
+        self.drawing_pass = False; self.btn_pass.setChecked(False)
+        self.btn_pass.setEnabled(False)
 
         self._relief = _shaded_relief(dtm.array, dtm.nodata)
         h, w, _ = self._relief.shape
@@ -177,8 +193,10 @@ class CanvasMap(QWidget):
             return
         lon, lat = self._world(sp)
         z = self.dtm.elevation_at(lon, lat)
-        ztxt = f'{z:.0f} m' if z == z else '—'      # NaN check
+        ztxt = f'{z:.0f} m' if z == z else '000 m'      # NaN check
         self.lbl_coord.setText(f'{lat:.5f}, {lon:.5f}   ·   {ztxt}')
+        if self.drawing_pass:
+            self._update_pass_preview(sp)
 
     # ----------------------------------------------------------- drawing
     def _toggle_draw(self, on):
@@ -186,7 +204,45 @@ class CanvasMap(QWidget):
         self.view.setDragMode(QGraphicsView.NoDrag if on else QGraphicsView.ScrollHandDrag)
         self.view.setCursor(Qt.CrossCursor if on else Qt.ArrowCursor)
         if on:
+            if self.drawing_pass:                       # AOI and pass draw are exclusive
+                self.btn_pass.setChecked(False); self._toggle_pass(False)
             self.clear_aoi()
+
+    # ----------------------------------------------------------- manual passes
+    def _toggle_pass(self, on):
+        self.drawing_pass = on
+        self.view.setDragMode(QGraphicsView.NoDrag if on else QGraphicsView.ScrollHandDrag)
+        self.view.setCursor(Qt.CrossCursor if on else Qt.ArrowCursor)
+        if on and self.drawing:
+            self.btn_draw.setChecked(False); self._toggle_draw(False)
+        if not on:
+            self._clear_pass_temp()
+
+    def set_pass_anchor(self, lon, lat):
+        """Where a drawn pass starts from — the route's current end. The preview
+        rubber-bands from here to the cursor."""
+        self._pass_anchor = (self._scene(lon, lat)
+                             if self.dtm is not None and lon is not None else None)
+
+    def add_pass_vertex(self, sp):
+        """Single click: the click is the END of a new pass; its start is the route
+        end (anchor). Emits the clicked (lon, lat). Pass-draw stays on for chaining."""
+        self.passDrawn.emit(self._world(sp))
+
+    def _update_pass_preview(self, sp):
+        if self._pass_anchor is None:
+            return
+        path = QPainterPath(self._pass_anchor); path.lineTo(sp)
+        if self._pass_preview is None:
+            self._pass_preview = QGraphicsPathItem()
+            pen = QPen(QColor('#3fb950'), 2); pen.setCosmetic(True); pen.setStyle(Qt.DashLine)
+            self._pass_preview.setPen(pen)
+            self.scene.addItem(self._pass_preview)
+        self._pass_preview.setPath(path)
+
+    def _clear_pass_temp(self):
+        if self._pass_preview is not None:
+            self.scene.removeItem(self._pass_preview); self._pass_preview = None
 
     def add_vertex(self, sp):
         self._verts.append(sp)
@@ -258,8 +314,10 @@ class CanvasMap(QWidget):
         self._aoi_item = self._route_group = self._density_item = None
         self._helios_item = self._chm_item = None
         self._verts = []; self._draw_items = []
-        self.drawing = False
+        self._pass_anchor = None; self._pass_preview = None
+        self.drawing = False; self.drawing_pass = False
         self.btn_draw.setChecked(False)
+        self.btn_pass.setChecked(False); self.btn_pass.setEnabled(False)
         self.view.setDragMode(QGraphicsView.ScrollHandDrag)
         self.view.setCursor(Qt.ArrowCursor)
         self.btn_chm.setChecked(False); self.btn_chm.setEnabled(False)

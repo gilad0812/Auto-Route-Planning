@@ -15,7 +15,8 @@ if _SRC not in sys.path:
 
 from shapely.geometry import Polygon                     # noqa: E402
 from dtm import DTM                                      # noqa: E402
-from route_planner import plan_route_adaptive, plan_route  # noqa: E402
+from route_planner import (                                # noqa: E402
+    plan_route_adaptive, plan_route, _pass_altitude)
 from density_estimate import estimate_density_grid       # noqa: E402
 
 _LAT_M = 111139.0
@@ -147,6 +148,13 @@ def compute_plan(dtm, polygon, params: PlanParams, chm=None, is_geo=True):
         route = plan_route(dtm, polygon, params.altitude_m, spacing_map,
                            step_map, elev_sample_step=elev_step_map)
 
+    return estimate_for_route(dtm, polygon, route, params, chm=chm, is_geo=is_geo)
+
+
+def estimate_for_route(dtm, polygon, route, params: PlanParams, chm=None, is_geo=True):
+    """Run the density estimate + route stats for an already-built route over the
+    AOI. Used both for a freshly planned route and after manually adding passes."""
+    half = params.fov_deg / 2.0
     res = PlanResult(route=route, polygon=polygon)
     res.area_m2 = polygon_area_m2(polygon, is_geo)
     if not route:
@@ -168,6 +176,26 @@ def compute_plan(dtm, polygon, params: PlanParams, chm=None, is_geo=True):
         zs = [w['z'] for w in wps]
         res.alt_min, res.alt_max = min(zs), max(zs)
     return res
+
+
+def build_manual_pass(dtm, p0, p1, params: PlanParams, is_geo, pass_id):
+    """Build waypoints for a hand-drawn straight pass between (lon,lat) endpoints
+    p0→p1. Altitude is set automatically like any pass: max terrain along it + AGL,
+    held constant. Returns [] if the segment finds no valid terrain."""
+    to_m = _LAT_M if is_geo else 1.0
+    step_map = params.step_m / to_m
+    dtm_res_map = min(abs(dtm.src.res[0]), abs(dtm.src.res[1]))
+    elev_step_map = min(step_map, dtm_res_map)
+
+    (x0, y0), (x1, y1) = p0, p1
+    dist = math.hypot(x1 - x0, y1 - y0)
+    n = max(1, int(math.ceil(dist / step_map))) if step_map > 0 else 1
+    pts = [(x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n) for i in range(n + 1)]
+    z = _pass_altitude(dtm, pts, params.altitude_m, step_map, elev_step_map)
+    if math.isnan(z):
+        return []
+    return [{'x': x, 'y': y, 'z': z, 'target_distance': params.altitude_m,
+             'pass_id': pass_id} for x, y in pts]
 
 
 def load_dtm(path):

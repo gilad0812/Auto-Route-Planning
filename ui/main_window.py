@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from .planning import (PlanParams, compute_plan, load_dtm, chm_compatible,
-                       scan_freq_for_prr)
+                       scan_freq_for_prr, build_manual_pass, estimate_for_route)
 
 try:
     from .canvasmap import CanvasMap
@@ -204,6 +204,7 @@ class MainWindow(QMainWindow):
         if CanvasMap is not None:
             self.mapview = CanvasMap()
             self.mapview.polygonDrawn.connect(self._on_polygon_drawn)
+            self.mapview.passDrawn.connect(self._on_pass_drawn)
             return self.mapview
         self.mapview = None
         return self._stub('🗺  Map canvas failed to load.\n' + (_MAPVIEW_ERR or ''))
@@ -361,6 +362,9 @@ class MainWindow(QMainWindow):
         self.lbl_summary.setText('Compute a route to see results.')
         if self.mapview is not None:
             self.mapview.clear_overlays()
+            self.mapview.btn_pass.setChecked(False)
+            self.mapview._toggle_pass(False)
+            self.mapview.btn_pass.setEnabled(False)
         self.btn_helios.setEnabled(False)
         self.btn_geojson.setEnabled(False)
         self.btn_csv.setEnabled(False)
@@ -423,10 +427,58 @@ class MainWindow(QMainWindow):
         self.btn_helios.setEnabled(has_route)
         self.btn_geojson.setEnabled(has_route)
         self.btn_csv.setEnabled(has_route)
+        if self.mapview is not None:
+            self.mapview.btn_pass.setEnabled(has_route)
+            if has_route:
+                self._update_pass_anchor()
         self._set_busy(False)
         self.statusBar().showMessage(
             f'Done — {self.result.n_waypoints} waypoints' if has_route
             else 'Done — no route produced')
+
+    def _update_pass_anchor(self):
+        """Point the map's pass-preview at the route's current end (the start of the
+        next drawn pass)."""
+        if self.mapview is None or not (self.result and self.result.route):
+            return
+        last = next((w for w in reversed(self.result.route)
+                     if not (isinstance(w['z'], float) and math.isnan(w['z']))), None)
+        if last is not None:
+            self.mapview.set_pass_anchor(last['x'], last['y'])
+
+    def _on_pass_drawn(self, pt):
+        """A click in pass mode: build a pass from the route's end (start) to the
+        clicked point (end), set its altitude from the terrain, append, re-estimate."""
+        if not (self.result and self.result.route and self.dtm
+                and self.drawn_polygon is not None):
+            return
+        params = self._params()
+        last = next((w for w in reversed(self.result.route)
+                     if not (isinstance(w['z'], float) and math.isnan(w['z']))), None)
+        if last is None:
+            return
+        pid = max((w.get('pass_id', 0) for w in self.result.route), default=-1) + 1
+        new_pass = build_manual_pass(self.dtm, (last['x'], last['y']), pt,
+                                     params, self.is_geo, pid)
+        if not new_pass:
+            self.statusBar().showMessage('Drawn pass has no valid terrain — not added.')
+            return
+        self._set_busy(True, 'Pass added — re-estimating density…')
+        try:
+            route = self.result.route + new_pass
+            self.result = estimate_for_route(self.dtm, self.drawn_polygon, route,
+                                             params, chm=self.chm, is_geo=self.is_geo)
+        except Exception as e:
+            QMessageBox.critical(self, 'Re-estimate error', str(e))
+            return
+        finally:
+            self._set_busy(False)
+        self._render_summary(self.result)
+        self._render_map_overlays(self.result)
+        self._update_pass_anchor()
+        self.statusBar().showMessage(
+            f'Pass added at {new_pass[0]["z"]:.0f} m — {self.result.n_waypoints} '
+            f'waypoints. Click to add another or untick Add Pass.')
 
     # ---------------------------------------------------------------- HELIOS
     def _open_helios(self):
@@ -507,11 +559,14 @@ class MainWindow(QMainWindow):
                 else f'{r.path_len_m:.0f} m')
         ncell = max(est.get('n_cells', 0), 1)
         cov = 100.0 * (est.get('n_cells', 0) - est.get('n_fail', 0)) / ncell
+        n_passes = len({w.get('pass_id', 0) for w in r.route
+                        if not (isinstance(w['z'], float) and math.isnan(w['z']))})
 
         rows = [
             ('<b>Polygon</b>', ''),
             ('Area', area),
             ('<b>Route</b>', ''),
+            ('Passes', f'{n_passes}'),
             ('Waypoints', f'{r.n_waypoints}'),
             ('Path length', plen),
             ('Alt range', f'{r.alt_min:.0f} – {r.alt_max:.0f} m'),
