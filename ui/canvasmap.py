@@ -111,6 +111,7 @@ class CanvasMap(QWidget):
         self._density_item = None
         self._helios_item = None
         self._chm_item = None
+        self._home_item = None           # takeoff/return marker + ferry legs
 
         v = QVBoxLayout(self); v.setContentsMargins(0, 0, 0, 0); v.setSpacing(0)
         barw = QWidget(); barw.setObjectName('mapbar')
@@ -151,7 +152,7 @@ class CanvasMap(QWidget):
         self._inv = ~dtm.transform
         self.scene.clear()
         self._aoi_item = self._route_group = self._density_item = None
-        self._helios_item = self._chm_item = None
+        self._helios_item = self._chm_item = None; self._home_item = None
         self._verts = []; self._draw_items = []
         self._pass_anchor = None; self._pass_preview = None
         self.drawing_pass = False; self.btn_pass.setChecked(False)
@@ -312,7 +313,7 @@ class CanvasMap(QWidget):
         self.scene.clear()
         self.dtm = None; self.chm = None; self._inv = None
         self._aoi_item = self._route_group = self._density_item = None
-        self._helios_item = self._chm_item = None
+        self._helios_item = self._chm_item = None; self._home_item = None
         self._verts = []; self._draw_items = []
         self._pass_anchor = None; self._pass_preview = None
         self.drawing = False; self.drawing_pass = False
@@ -388,8 +389,37 @@ class CanvasMap(QWidget):
         if cells:
             self._helios_item = self._paint_cells(cells, '#e5484d', 130, radius_m)
 
+    def show_home(self, home, wps):
+        """Draw the takeoff/return-home point (entered as a coordinate) and dashed
+        ferry legs to the first and last survey waypoints. `home` is (lon, lat);
+        pass home=None to remove it. The scene is grown to keep the point reachable
+        even when it lies outside the DTM extent."""
+        if self._home_item is not None:
+            self.scene.removeItem(self._home_item); self._home_item = None
+        if self.dtm is None or home is None:
+            return
+        grp = QGraphicsItemGroup(); self.scene.addItem(grp)
+        hp = self._scene(home[0], home[1])
+        valid = [w for w in (wps or [])
+                 if not (isinstance(w['z'], float) and math.isnan(w['z']))]
+        if valid:
+            pen = QPen(QColor('#f0b000'), 2); pen.setCosmetic(True)
+            pen.setStyle(Qt.DashLine)
+            for end in (valid[0], valid[-1]):
+                path = QPainterPath(hp); path.lineTo(self._scene(end['x'], end['y']))
+                seg = QGraphicsPathItem(path); seg.setPen(pen); grp.addToGroup(seg)
+        m = QGraphicsEllipseItem(-6, -6, 12, 12)
+        m.setPos(hp); m.setBrush(QBrush(QColor('#f0b000')))
+        m.setPen(QPen(Qt.black, 1.5))
+        m.setFlag(QGraphicsEllipseItem.ItemIgnoresTransformations)
+        grp.addToGroup(m)
+        self._home_item = grp
+        self.scene.setSceneRect(self.scene.sceneRect().united(
+            QRectF(hp.x() - 20, hp.y() - 20, 40, 40)))
+
     def clear_overlays(self):
-        """Remove route + density + HELIOS overlays (keeps the DTM and drawn AOI)."""
+        """Remove route + density + HELIOS overlays (keeps the DTM and drawn AOI).
+        The home marker is managed separately via show_home so it persists."""
         for attr in ('_route_group', '_density_item', '_helios_item'):
             it = getattr(self, attr, None)
             if it is not None:
