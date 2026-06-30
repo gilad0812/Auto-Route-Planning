@@ -114,14 +114,12 @@ class CanvasMap(QWidget):
         self.btn_draw.setCheckable(True); self.btn_draw.clicked.connect(self._toggle_draw)
         self.btn_finish = QToolButton(); self.btn_finish.setText('Finish')
         self.btn_finish.clicked.connect(self.finish_draw)
-        self.btn_clear = QToolButton(); self.btn_clear.setText('Clear AOI')
-        self.btn_clear.clicked.connect(self.clear_aoi)
         self.btn_fit = QToolButton(); self.btn_fit.setText('⤢ Fit')
         self.btn_fit.clicked.connect(self._fit)
         self.btn_chm = QToolButton(); self.btn_chm.setText('CHM')
         self.btn_chm.setCheckable(True); self.btn_chm.setEnabled(False)
         self.btn_chm.clicked.connect(self._toggle_chm)
-        for b in (self.btn_draw, self.btn_finish, self.btn_clear, self.btn_fit, self.btn_chm):
+        for b in (self.btn_draw, self.btn_finish, self.btn_fit, self.btn_chm):
             bar.addWidget(b)
         bar.addStretch(1)
         self.lbl_coord = QLabel(''); self.lbl_coord.setStyleSheet('color:#9aa0a6;')
