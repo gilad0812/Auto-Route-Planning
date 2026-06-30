@@ -41,7 +41,7 @@ class PlanParams:
     fov_deg: float = 100.0           # fixed (RIEGL VUX-120-23, ±50°)
     overlap_pct: float = 20.0
     adaptive_spacing: bool = True
-    step_m: float = 50.0
+    step_m: float = 5.0             # along-track waypoint spacing (fixed, not exposed)
     min_points: int = 100
     speed_ms: float = 6.0
     pulse_freq_hz: int = 600_000

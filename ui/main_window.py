@@ -135,11 +135,9 @@ class MainWindow(QMainWindow):
         self.sp_alt = self._dspin(1, 1000, 100, ' m', 5)
         self.sp_overlap = self._dspin(0, 99, 20, ' %', 5)
         self.cb_adaptive = QCheckBox('Terrain-adaptive spacing'); self.cb_adaptive.setChecked(True)
-        self.sp_step = self._dspin(1, 500, 50, ' m', 5)
         fl.addRow('Altitude AGL', self.sp_alt)
         fl.addRow('Overlap', self.sp_overlap)
         fl.addRow('', self.cb_adaptive)
-        fl.addRow('Along-track step', self.sp_step)
         v.addWidget(gb_flight)
 
         # ── Scanner & density ──
@@ -394,7 +392,6 @@ class MainWindow(QMainWindow):
             altitude_m=self.sp_alt.value(),
             overlap_pct=self.sp_overlap.value(),
             adaptive_spacing=self.cb_adaptive.isChecked(),
-            step_m=self.sp_step.value(),
             min_points=self.sp_minpts.value(),
             speed_ms=self.sp_speed.value(),
             pulse_freq_hz=self.cmb_pulse.currentData(),
