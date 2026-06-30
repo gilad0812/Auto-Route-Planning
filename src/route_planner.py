@@ -231,8 +231,13 @@ def plan_route_adaptive(dtm, polygon, distance_above_surface,
     step_m = max(step * to_m, 0.5)
     esample_m = (elev_sample_step * to_m) if elev_sample_step else None
 
-    minu, minv, maxu, maxv = poly_cov.bounds
-    strip_us = [minu + (maxu - minu) * i / 12.0 for i in range(13)]
+    _, minv, _, maxv = poly_cov.bounds
+    # Inter-pass strip is scanned for hidden peaks at the DTM pixel size, so a
+    # narrow spire between passes can't slip between samples and leave a local
+    # coverage gap. Sampling finer than a pixel only re-reads the same cells, so
+    # the pixel size is both the safe and the cheapest resolution.
+    dtm_res_m = min(abs(dtm.src.res[0]), abs(dtm.src.res[1])) * to_m
+    strip_res = max(dtm_res_m, 0.5)
 
     route = []
     v = minv
@@ -265,18 +270,19 @@ def plan_route_adaptive(dtm, polygon, distance_above_surface,
         for _ in range(3):
             v_next = v + s_m
             strip_elevs, next_elevs = [], []
-            for frac in (0.25, 0.5, 0.75):
-                vv = v + (v_next - v) * frac
-                for u in strip_us:
-                    if poly_cov.intersects(Point(u, vv)):
-                        e = elev_uv(u, vv)
-                        if not math.isnan(e):
-                            strip_elevs.append(e)
-            for u in strip_us:
-                if poly_cov.intersects(Point(u, v_next)):
-                    e = elev_uv(u, v_next)
+            # sample interior lines of the gap densely along-track (one shapely
+            # clip per line, count scaled to the gap width so a spire can't hide)
+            n_cross = max(3, min(int(s_m / strip_res), 12))
+            for k in range(1, n_cross + 1):
+                vv = v + s_m * k / (n_cross + 1)
+                for pu, pv in _sample_line_in_polygon(poly_cov, vv, strip_res):
+                    e = elev_uv(pu, pv)
                     if not math.isnan(e):
-                        next_elevs.append(e)
+                        strip_elevs.append(e)
+            for pu, pv in _sample_line_in_polygon(poly_cov, v_next, strip_res):
+                e = elev_uv(pu, pv)
+                if not math.isnan(e):
+                    next_elevs.append(e)
             if not strip_elevs and not next_elevs:
                 break
             ridge = max(strip_elevs + next_elevs)
