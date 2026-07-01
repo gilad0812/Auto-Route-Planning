@@ -14,16 +14,26 @@ from matplotlib import colors as mcolors
 
 from PySide6.QtCore import Qt, Signal, QPointF, QRectF
 from PySide6.QtGui import (
-    QImage, QPixmap, QPainter, QPen, QColor, QBrush, QPolygonF,
+    QImage, QPixmap, QPainter, QPen, QColor, QBrush, QPolygonF, QCursor,
 )
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGraphicsView, QGraphicsScene,
     QGraphicsPixmapItem, QGraphicsEllipseItem, QGraphicsPathItem,
-    QGraphicsPolygonItem, QToolButton, QLabel, QGraphicsItemGroup,
+    QGraphicsPolygonItem, QToolButton, QLabel, QGraphicsItemGroup, QToolTip,
 )
 from PySide6.QtGui import QPainterPath
 
 _LAT_M = 111139.0
+
+
+def _point_seg_dist(px, py, ax, ay, bx, by):
+    """Shortest distance from point (px,py) to segment (ax,ay)-(bx,by)."""
+    dx, dy = bx - ax, by - ay
+    d2 = dx * dx + dy * dy
+    if d2 == 0:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / d2))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
 
 
 # ----------------------------------------------------------------- imagery
@@ -37,12 +47,15 @@ def _shaded_relief(arr, nodata):
     zmin, zmax = float(af.min()), float(af.max())
     norm = (af - zmin) / max(zmax - zmin, 1e-9)
     rgb = plt.get_cmap('gist_earth')(norm)[..., :3]
+    # Hillshade = surface-normal · sun direction. gradient gives dy per row (south,
+    # since row increases downward) and dx per col (east). North is up-screen = -row,
+    # so the outward surface normal in (East, North, Up) is (-dx, +dy, 1). Lighting
+    # it with the sun at azimuth 315° (NW), 45° elevation. Using the raw dot product
+    # (not an aspect angle) avoids the sign/quadrant slips that invert the relief.
     dy, dx = np.gradient(af)
-    slope = np.pi / 2 - np.arctan(np.hypot(dx, dy))
-    aspect = np.arctan2(dy, -dx)
     az, alt = np.radians(315), np.radians(45)
-    hs = (np.sin(alt) * np.sin(slope)
-          + np.cos(alt) * np.cos(slope) * np.cos(az - aspect))
+    lx, ly, lz = np.cos(alt) * np.sin(az), np.cos(alt) * np.cos(az), np.sin(alt)
+    hs = (-dx * lx + dy * ly + lz) / np.sqrt(dx * dx + dy * dy + 1.0)
     hs = np.clip(hs, 0, 1)[..., None]
     out = np.clip(rgb * (0.45 + 0.55 * hs), 0, 1)
     return np.ascontiguousarray((out * 255).astype(np.uint8))
@@ -112,6 +125,7 @@ class CanvasMap(QWidget):
         self._helios_item = None
         self._chm_item = None
         self._home_item = None           # takeoff/return marker + ferry legs
+        self._pass_segs = []             # [(ax, ay, bx, by, z)] scene coords, for hover
 
         v = QVBoxLayout(self); v.setContentsMargins(0, 0, 0, 0); v.setSpacing(0)
         barw = QWidget(); barw.setObjectName('mapbar')
@@ -153,7 +167,7 @@ class CanvasMap(QWidget):
         self.scene.clear()
         self._aoi_item = self._route_group = self._density_item = None
         self._helios_item = self._chm_item = None; self._home_item = None
-        self._verts = []; self._draw_items = []
+        self._verts = []; self._draw_items = []; self._pass_segs = []
         self._pass_anchor = None; self._pass_preview = None
         self.drawing_pass = False; self.btn_pass.setChecked(False)
         self.btn_pass.setEnabled(False)
@@ -198,6 +212,26 @@ class CanvasMap(QWidget):
         self.lbl_coord.setText(f'{lat:.5f}, {lon:.5f}   ·   {ztxt}')
         if self.drawing_pass:
             self._update_pass_preview(sp)
+        else:
+            self._pass_tooltip(sp)
+
+    def _pass_tooltip(self, sp):
+        """Show the pass altitude in a tooltip when the cursor is near a pass line."""
+        if not self._pass_segs:
+            QToolTip.hideText()
+            return
+        # hover tolerance: a few screen pixels expressed in scene units
+        scale = abs(self.view.transform().m11()) or 1.0
+        tol = 6.0 / scale
+        best_z, best_d = None, tol
+        for ax, ay, bx, by, z in self._pass_segs:
+            d = _point_seg_dist(sp.x(), sp.y(), ax, ay, bx, by)
+            if d <= best_d:
+                best_d, best_z = d, z
+        if best_z is not None:
+            QToolTip.showText(QCursor.pos(), f'Pass altitude: {best_z:.0f} m')
+        else:
+            QToolTip.hideText()
 
     # ----------------------------------------------------------- drawing
     def _toggle_draw(self, on):
@@ -314,7 +348,7 @@ class CanvasMap(QWidget):
         self.dtm = None; self.chm = None; self._inv = None
         self._aoi_item = self._route_group = self._density_item = None
         self._helios_item = self._chm_item = None; self._home_item = None
-        self._verts = []; self._draw_items = []
+        self._verts = []; self._draw_items = []; self._pass_segs = []
         self._pass_anchor = None; self._pass_preview = None
         self.drawing = False; self.drawing_pass = False
         self.btn_draw.setChecked(False)
@@ -347,6 +381,7 @@ class CanvasMap(QWidget):
         # ── route: altitude-coloured cosmetic polylines + start/end markers ──
         wps = [w for w in (route_wps or [])
                if not (isinstance(w['z'], float) and math.isnan(w['z']))]
+        self._pass_segs = []
         if len(wps) >= 2:
             grp = QGraphicsItemGroup(); self.scene.addItem(grp)
             zs = [w['z'] for w in wps]; zmin, zmax = min(zs), max(zs)
@@ -358,6 +393,10 @@ class CanvasMap(QWidget):
                 item = QGraphicsPathItem(seg)
                 pen = QPen(QColor(mcolors.to_hex(cmap(t))), 2); pen.setCosmetic(True)
                 item.setPen(pen); grp.addToGroup(item)
+                # remember the pass lines (both ends same pass_id) for hover readout;
+                # skip the inter-pass connector legs.
+                if a.get('pass_id') is not None and a.get('pass_id') == b.get('pass_id'):
+                    self._pass_segs.append((pa.x(), pa.y(), pb.x(), pb.y(), a['z']))
             self._marker(grp, self._scene(wps[0]['x'], wps[0]['y']), '#1a7f37')
             self._marker(grp, self._scene(wps[-1]['x'], wps[-1]['y']), '#cf222e')
             self._route_group = grp
@@ -425,6 +464,7 @@ class CanvasMap(QWidget):
             if it is not None:
                 self.scene.removeItem(it)
                 setattr(self, attr, None)
+        self._pass_segs = []
 
     def _marker(self, grp, sp, hexcolor):
         m = QGraphicsEllipseItem(-5, -5, 10, 10)
