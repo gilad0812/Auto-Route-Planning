@@ -57,11 +57,16 @@ def lawnmower_waypoints(polygon, spacing, step):
 
 
 def _pass_altitude(dtm, pts, agl, step, elev_sample_step=None):
-    """Constant altitude for a straight pass: max terrain elevation along it + agl.
+    """Constant altitude for a straight pass: mean terrain elevation along it + agl.
 
     elev_sample_step decouples terrain sampling from the waypoint step: when finer,
-    terrain is resampled densely so a peak BETWEEN waypoints can't be missed (flight
-    safety) without adding waypoints. Returns NaN when no valid terrain is found.
+    terrain is resampled densely so the mean reflects the whole pass, not just the
+    waypoints. Returns NaN when no valid terrain is found.
+
+    NOTE: altitude tracks the AVERAGE terrain of the pass, so AGL is only nominal on
+    average — over a local peak the true clearance drops below `agl` (and can go
+    negative if a spike rises more than `agl` above the pass mean). The autopilot /
+    operator owns terrain-collision avoidance.
     """
     if elev_sample_step and elev_sample_step < step and len(pts) >= 2:
         (x0, y0), (x1, y1) = pts[0], pts[-1]
@@ -73,7 +78,7 @@ def _pass_altitude(dtm, pts, agl, step, elev_sample_step=None):
         sample_pts = pts
     elevs = [dtm.elevation_at(x, y) for x, y in sample_pts]
     valid = [e for e in elevs if not math.isnan(e)]
-    return (max(valid) + agl) if valid else float('nan')
+    return (sum(valid) / len(valid) + agl) if valid else float('nan')
 
 
 def plan_route(dtm, polygon, distance_above_surface,
@@ -82,7 +87,7 @@ def plan_route(dtm, polygon, distance_above_surface,
     each pass.
 
     LiDAR strip registration needs constant altitude per straight pass (terrain-
-    following per-waypoint breaks it), so Z = max terrain along the pass + AGL, held
+    following per-waypoint breaks it), so Z = mean terrain along the pass + AGL, held
     constant for the whole pass; different passes may sit at different altitudes.
 
     elev_sample_step: terrain-sampling resolution for the max-elevation check,
@@ -259,7 +264,9 @@ def plan_route_adaptive(dtm, polygon, distance_above_surface,
             valid = [e for e in (elev_uv(pu, pv) for pu, pv in elev_pts)
                      if not math.isnan(e)]
             if valid:
-                z = max(valid) + agl
+                # altitude tracks the pass MEAN terrain (not the peak); AGL is only
+                # nominal on average — true clearance dips below AGL over local highs.
+                z = sum(valid) / len(valid) + agl
 
             # emit only the pass endpoints (the turns) — altitude already came from
             # the dense elev_pts above, so no intermediate waypoints are needed.
