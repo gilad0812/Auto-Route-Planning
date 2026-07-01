@@ -88,16 +88,35 @@ class MainWindow(QMainWindow):
         a_quit = QAction('Quit', self); a_quit.triggered.connect(self.close)
         m.addAction(a_dtm); m.addAction(a_chm); m.addSeparator(); m.addAction(a_quit)
 
+        mv = self.menuBar().addMenu('&View')
+        self.act_profile = QAction('Elevation profile', self, checkable=True)
+        self.act_profile.setChecked(False)
+        self.act_profile.setShortcut('Ctrl+E')
+        self.act_profile.toggled.connect(self._toggle_profile)
+        mv.addAction(self.act_profile)
+
     def _build_body(self):
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(self._build_sidebar())      # params (left)
-        splitter.addWidget(self._build_map())          # map (center)
-        splitter.addWidget(self._build_summary())      # results (right)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setStretchFactor(2, 0)
-        splitter.setSizes([340, 760, 300])
-        self.setCentralWidget(splitter)
+        top = QSplitter(Qt.Horizontal)
+        top.addWidget(self._build_sidebar())           # params (left)
+        top.addWidget(self._build_map())               # map (center)
+        top.addWidget(self._build_summary())           # results (right)
+        top.setStretchFactor(0, 0)
+        top.setStretchFactor(1, 1)
+        top.setStretchFactor(2, 0)
+        top.setSizes([340, 760, 300])
+
+        from .profile import ProfilePanel
+        self.profile_panel = ProfilePanel()            # full-width strip below
+        self.profile_panel.setVisible(False)           # opened on demand via View menu
+
+        outer = QSplitter(Qt.Vertical)
+        outer.addWidget(top)
+        outer.addWidget(self.profile_panel)
+        outer.setStretchFactor(0, 1)
+        outer.setStretchFactor(1, 0)
+        outer.setCollapsible(1, True)                  # drag-collapse the profile
+        self.body_splitter = outer
+        self.setCentralWidget(outer)
 
     def _build_sidebar(self):
         panel = QWidget()
@@ -390,6 +409,8 @@ class MainWindow(QMainWindow):
         self.btn_helios.setEnabled(False)
         self.btn_geojson.setEnabled(False)
         self.btn_csv.setEnabled(False)
+        if getattr(self, 'profile_panel', None) is not None:
+            self.profile_panel.clear()
 
     def _on_polygon_drawn(self, geom):
         try:
@@ -575,6 +596,7 @@ class MainWindow(QMainWindow):
             self._render_map_overlays(self.result)
         else:
             self._show_home()
+        self._refresh_profile()
 
     def _params(self):
         return PlanParams(
@@ -611,6 +633,7 @@ class MainWindow(QMainWindow):
         self.setEnabled(True)
         self._render_summary(self.result)
         self._render_map_overlays(self.result)
+        self._refresh_profile()
         has_route = bool(self.result.route)
         self.btn_helios.setEnabled(has_route)
         self.btn_geojson.setEnabled(has_route)
@@ -666,9 +689,36 @@ class MainWindow(QMainWindow):
         self._render_summary(self.result)
         self._render_map_overlays(self.result)
         self._update_pass_anchor()
+        self._refresh_profile()
         self.statusBar().showMessage(
             f'Pass added at {new_pass[0]["z"]:.0f} m — {self.result.n_waypoints} '
             f'waypoints. Click to add another or untick Add Pass.')
+
+    # ---------------------------------------------------------------- profile
+    def _toggle_profile(self, on):
+        """Show/hide the bottom elevation-profile bar (View menu / Ctrl+E)."""
+        if getattr(self, 'profile_panel', None) is None:
+            return
+        self.profile_panel.setVisible(on)
+        if on:
+            sizes = self.body_splitter.sizes()
+            if sizes[-1] == 0:                         # give the bar room when opening
+                total = sum(sizes) or self.height()
+                self.body_splitter.setSizes([max(int(total * 0.72), total - 220), 220])
+            self._refresh_profile()
+
+    def _refresh_profile(self):
+        """Redraw the elevation-profile bar for the current route (skips work while
+        the bar is hidden; reopening refreshes it)."""
+        if getattr(self, 'profile_panel', None) is None or not self.profile_panel.isVisible():
+            return
+        if not (self.result and self.result.route and self.dtm):
+            self.profile_panel.clear()
+            return
+        from .profile import route_profile
+        dist, terr, flight = route_profile(
+            self._route_with_home(), self.dtm, self.is_geo)
+        self.profile_panel.update_profile(dist, terr, flight, agl=self.sp_alt.value())
 
     # ---------------------------------------------------------------- HELIOS
     def _open_helios(self):
