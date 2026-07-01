@@ -451,12 +451,45 @@ class MainWindow(QMainWindow):
         self.mapview.show_home(self.home, wps)
 
     def _home_waypoint(self):
-        """Home as a route waypoint for display/export: flown at the survey's top
-        altitude so the ferry legs clear the surveyed terrain. None if unset."""
+        """Home as a route waypoint for display/export, flown at the transit
+        altitude so the ferry legs clear terrain. None if unset."""
         if self.home is None or not (self.result and self.result.route):
             return None
-        return {'x': self.home[0], 'y': self.home[1], 'z': self.result.alt_max,
+        return {'x': self.home[0], 'y': self.home[1], 'z': self._transit_altitude(),
                 'target_distance': None, 'pass_id': 'home'}
+
+    def _terrain_max_along(self, p0, p1):
+        """Max DTM terrain elevation sampled (at pixel resolution) along the
+        segment p0→p1, ignoring cells outside the DTM. NaN if none have data."""
+        ax, ay = p0
+        bx, by = p1
+        dist = math.hypot(bx - ax, by - ay)
+        res_map = min(abs(self.dtm.src.res[0]), abs(self.dtm.src.res[1]))
+        n = 0 if dist == 0 else max(1, min(4000, int(dist / max(res_map, 1e-12))))
+        best = float('nan')
+        for i in range(n + 1):
+            f = 0.0 if n == 0 else i / n
+            e = self.dtm.elevation_at(ax + (bx - ax) * f, ay + (by - ay) * f)
+            if e == e:                       # not NaN
+                best = e if math.isnan(best) else max(best, e)
+        return best
+
+    def _transit_altitude(self):
+        """Ferry/home height: clears the surveyed terrain (alt_max) AND the terrain
+        under the ferry path where the DTM has data. Falls back to alt_max where the
+        path leaves the DTM (no elevation data to clear against)."""
+        base = self.result.alt_max
+        valid = [w for w in self.result.route
+                 if not (isinstance(w['z'], float) and math.isnan(w['z']))]
+        if self.home is None or not valid:
+            return base
+        agl = self.sp_alt.value()
+        tmax = float('nan')
+        for w in (valid[0], valid[-1]):      # the two ferry endpoints
+            m = self._terrain_max_along(self.home, (w['x'], w['y']))
+            if not math.isnan(m):
+                tmax = m if math.isnan(tmax) else max(tmax, m)
+        return base if math.isnan(tmax) else max(base, tmax + agl)
 
     def _route_with_home(self):
         """Effective route bracketed by the home point (takeoff … return)."""
