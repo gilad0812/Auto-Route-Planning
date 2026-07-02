@@ -169,9 +169,14 @@ class MainWindow(QMainWindow):
         gb_flight = QGroupBox('Flight')
         fl = QFormLayout(gb_flight)
         self.sp_alt = self._dspin(1, 1000, 100, ' m', 5)
+        self.sp_minclear = self._dspin(0, 500, 50, ' m', 5)
+        self.sp_minclear.setToolTip('The pass altitude is raised if needed so it '
+                                    'stays at least this far above the highest point '
+                                    'of the pass.')
         self.sp_overlap = self._dspin(20, 50, 20, ' %', 1)
         self.cb_adaptive = QCheckBox('Terrain-adaptive spacing'); self.cb_adaptive.setChecked(True)
         fl.addRow('Altitude AGL', self.sp_alt)
+        fl.addRow('Min clearance above peak', self.sp_minclear)
         fl.addRow('Overlap', self.sp_overlap)
         fl.addRow('', self.cb_adaptive)
         v.addWidget(gb_flight)
@@ -601,6 +606,7 @@ class MainWindow(QMainWindow):
     def _params(self):
         return PlanParams(
             altitude_m=self.sp_alt.value(),
+            min_peak_clearance_m=self.sp_minclear.value(),
             overlap_pct=self.sp_overlap.value(),
             adaptive_spacing=self.cb_adaptive.isChecked(),
             min_points=self.sp_minpts.value(),

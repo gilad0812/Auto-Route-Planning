@@ -47,6 +47,7 @@ class PlanParams:
     pulse_freq_hz: int = 600_000
     scan_freq_hz: float = 224.4
     veg_penetration: float = 0.4
+    min_peak_clearance_m: float = 50.0   # min clearance above a pass's highest point
 
 
 @dataclass
@@ -140,13 +141,15 @@ def compute_plan(dtm, polygon, params: PlanParams, chm=None, is_geo=True):
             scan_half_angle_deg=half, step=step_map,
             overlap_frac=params.overlap_pct / 100.0, is_geo=is_geo,
             elev_sample_step=elev_step_map,
+            min_peak_clearance=params.min_peak_clearance_m,
         )
     else:
         spacing_map = (2.0 * params.altitude_m
                        * math.tan(math.radians(half))
                        * (1.0 - params.overlap_pct / 100.0)) / to_m
         route = plan_route(dtm, polygon, params.altitude_m, spacing_map,
-                           step_map, elev_sample_step=elev_step_map)
+                           step_map, elev_sample_step=elev_step_map,
+                           min_peak_clearance=params.min_peak_clearance_m)
 
     return estimate_for_route(dtm, polygon, route, params, chm=chm, is_geo=is_geo)
 
@@ -180,8 +183,9 @@ def estimate_for_route(dtm, polygon, route, params: PlanParams, chm=None, is_geo
 
 def build_manual_pass(dtm, p0, p1, params: PlanParams, is_geo, pass_id):
     """Build waypoints for a hand-drawn straight pass between (lon,lat) endpoints
-    p0→p1. Altitude is set automatically like any pass: max terrain along it + AGL,
-    held constant. Returns [] if the segment finds no valid terrain."""
+    p0→p1. Altitude is set automatically like any pass: mean terrain + AGL, floored so
+    it stays at least min_peak_clearance above the pass's highest point. Held constant.
+    Returns [] if the segment finds no valid terrain."""
     to_m = _LAT_M if is_geo else 1.0
     step_map = params.step_m / to_m
     dtm_res_map = min(abs(dtm.src.res[0]), abs(dtm.src.res[1]))
@@ -191,7 +195,8 @@ def build_manual_pass(dtm, p0, p1, params: PlanParams, is_geo, pass_id):
     dist = math.hypot(x1 - x0, y1 - y0)
     n = max(1, int(math.ceil(dist / step_map))) if step_map > 0 else 1
     pts = [(x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n) for i in range(n + 1)]
-    z = _pass_altitude(dtm, pts, params.altitude_m, step_map, elev_step_map)
+    z = _pass_altitude(dtm, pts, params.altitude_m, step_map, elev_step_map,
+                       params.min_peak_clearance_m)
     if math.isnan(z):
         return []
     # altitude from the dense samples; emit only the endpoints (start/end turns)
