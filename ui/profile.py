@@ -89,7 +89,9 @@ class ProfilePanel(QWidget):
         self.lbl.setText('Elevation profile — compute a route to populate.')
         self.canvas.draw_idle()
 
-    def update_profile(self, dist, terr, flight, agl=None):
+    def update_profile(self, dist, terr, flight, agl=None, tol=50.0):
+        # tol defaults to ±50 so the 50–150 m AGL band is drawn as a reference
+        # corridor even though the route itself isn't constrained to it.
         self.ax.clear()
         self._style_axes()
         if not dist:
@@ -109,6 +111,11 @@ class ProfilePanel(QWidget):
         ax.fill_between(d, base, t, where=np.isfinite(t), color='#6f5a3d',
                         alpha=0.85, linewidth=0, zorder=1)
         ax.plot(d, t, color='#c8a97a', lw=1.2, label='Terrain', zorder=2)
+        if agl and tol:
+            # the allowed corridor: AGL band terrain+[agl-tol, agl+tol]
+            ax.fill_between(d, t + (agl - tol), t + (agl + tol), where=np.isfinite(t),
+                            color='#3fb0ff', alpha=0.12, linewidth=0, zorder=2,
+                            label=f'AGL band ({agl - tol:.0f}–{agl + tol:.0f} m)')
         if agl:
             ax.plot(d, t + agl, color='#6b7280', lw=0.9, ls='--',
                     label=f'Target ({agl:.0f} m AGL)', zorder=3)
