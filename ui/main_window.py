@@ -32,6 +32,13 @@ from shapely.geometry import shape as shapely_shape
 
 PULSE_FREQS = (150_000, 300_000, 600_000, 1_200_000, 1_800_000, 2_400_000)
 
+# Ferry/home legs are pure transit (not scanned). They fly at the connecting pass's
+# altitude to avoid altitude changes at the survey boundary, and only climb above it
+# when the terrain under the leg comes within this clearance margin — enough to keep
+# the ferry line off the ground without needless extra altitude (a multirotor
+# recovers nothing on the descent, so every wasted metre of climb is wasted energy).
+_TRANSIT_BUFFER_M = 20.0
+
 
 def _hr():
     line = QFrame()
@@ -476,13 +483,10 @@ class MainWindow(QMainWindow):
         wps = self.result.route if (self.result and self.result.route) else []
         self.mapview.show_home(self.home, wps)
 
-    def _home_waypoint(self):
-        """Home as a route waypoint for display/export, flown at the transit
-        altitude so the ferry legs clear terrain. None if unset."""
-        if self.home is None or not (self.result and self.result.route):
-            return None
-        return {'x': self.home[0], 'y': self.home[1], 'z': self._transit_altitude(),
-                'target_distance': None, 'pass_id': 'home'}
+    def _transit_wp(self, x, y, z):
+        """A non-survey ferry waypoint (home, or a survey-boundary climb/descent
+        point) at the given position/altitude."""
+        return {'x': x, 'y': y, 'z': z, 'target_distance': None, 'pass_id': 'home'}
 
     def _terrain_max_along(self, p0, p1):
         """Max DTM terrain elevation sampled (at pixel resolution) along the
@@ -500,28 +504,49 @@ class MainWindow(QMainWindow):
                 best = e if math.isnan(best) else max(best, e)
         return best
 
-    def _transit_altitude(self):
-        """Ferry/home height: clears the surveyed terrain (alt_max) AND the terrain
-        under the ferry path where the DTM has data. Falls back to alt_max where the
-        path leaves the DTM (no elevation data to clear against)."""
-        base = self.result.alt_max
-        valid = [w for w in self.result.route
-                 if not (isinstance(w['z'], float) and math.isnan(w['z']))]
-        if self.home is None or not valid:
-            return base
-        agl = self.sp_alt.value()
-        tmax = float('nan')
-        for w in (valid[0], valid[-1]):      # the two ferry endpoints
-            m = self._terrain_max_along(self.home, (w['x'], w['y']))
-            if not math.isnan(m):
-                tmax = m if math.isnan(tmax) else max(tmax, m)
-        return base if math.isnan(tmax) else max(base, tmax + agl)
+    def _ferry_altitude(self, endpoint):
+        """Flat transit height for the pure-transit ferry leg between home and
+        `endpoint` (the first/last survey waypoint). Primary rule: fly at the
+        connecting pass's own altitude, so entering/leaving the survey needs no
+        altitude change. Only climb above that when the terrain under THIS leg would
+        come within the clearance buffer — just enough to keep the ferry line off the
+        ground — and never pinned to the global survey max. Falls back to the pass
+        altitude where the leg leaves the DTM (no terrain to clear against)."""
+        ez = endpoint['z']                              # connecting pass altitude
+        tmax = self._terrain_max_along(self.home, (endpoint['x'], endpoint['y']))
+        if math.isnan(tmax):
+            return ez
+        return max(ez, tmax + _TRANSIT_BUFFER_M)        # raise only to clear terrain
 
     def _route_with_home(self):
-        """Effective route bracketed by the home point (takeoff … return)."""
+        """Effective route bracketed by the home point (takeoff … return).
+
+        Each ferry leg is flown FLAT at its own transit altitude, then the drop to
+        (or climb from) the pass altitude happens at the survey edge — not spread
+        across the leg. If the descent were interpolated over the whole ferry, the
+        flight line would sag through any mid-leg terrain peak; holding altitude to
+        the boundary and stepping down over the survey entry point keeps the ferry
+        clear of the ground the whole way."""
         route = self.result.route
-        hw = self._home_waypoint()
-        return ([hw] + route + [hw]) if hw else route
+        if self.home is None or not route:
+            return route
+        valid = [w for w in route
+                 if not (isinstance(w['z'], float) and math.isnan(w['z']))]
+        if not valid:
+            return route
+        first, last = valid[0], valid[-1]
+        hx, hy = self.home
+        a_out = self._ferry_altitude(first)
+        a_ret = self._ferry_altitude(last)
+
+        head = [self._transit_wp(hx, hy, a_out)]
+        if a_out > first['z'] + 1e-6:          # hold high, then descend at the edge
+            head.append(self._transit_wp(first['x'], first['y'], a_out))
+        tail = []
+        if a_ret > last['z'] + 1e-6:           # climb at the edge, then hold high
+            tail.append(self._transit_wp(last['x'], last['y'], a_ret))
+        tail.append(self._transit_wp(hx, hy, a_ret))
+        return head + route + tail
 
     def _survey_end(self):
         """Last valid survey waypoint — where a manually drawn pass chains from."""
