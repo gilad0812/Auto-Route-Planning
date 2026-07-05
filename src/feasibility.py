@@ -8,7 +8,7 @@ not a flight-dynamics sim. Two computations:
                    the main input and the propulsion efficiency η the only unknown
                    (so uncalibrated the answer carries a ±band; one real flight pins η).
 
-Plus operational gates (comms range, max work altitude, derated MTOW, wind).
+Plus operational gates (comms range, max work altitude, derated MTOW).
 
 All Fuse Thor numbers are baked in as defaults below (from the manual). The module
 is Qt-free and deterministic so it can be unit-tested without a display.
@@ -32,7 +32,6 @@ CLIMB_MS = 3.0               # ±3 m/s
 CRUISE_MAX_MS = 15.0
 MAX_WORK_AGL_M = 400.0
 COMMS_RANGE_M = 10_000.0     # 6 dBi omni (mid option)
-WIND_MAX_KT = 20.0
 
 # Propulsion efficiency (figure of merit) — the one unknown. Uncalibrated we assume
 # a typical value with a wide band; a one-flight calibration replaces this.
@@ -55,6 +54,21 @@ def hover_power_w(mass_kg, rho, eta):
     return (mass_kg * G) ** 1.5 / (math.sqrt(2.0 * rho * DISK_AREA_M2) * eta)
 
 
+def calibrate_eta(payload_kg, duration_min, battery_used_frac,
+                  elev_m=0.0, temp_c=15.0):
+    """Solve the propulsion efficiency η from ONE measured steady flight:
+    η = ideal_hover_power / measured_avg_power, where measured avg power = energy
+    drawn / duration. Returns η (clamped to a sane 0.3–0.95)."""
+    m = NET_KG + BATTERY_KG + payload_kg
+    rho = air_density(elev_m, temp_c)
+    hours = duration_min / 60.0
+    if hours <= 0 or battery_used_frac <= 0:
+        return ETA_DEFAULT
+    avg_power = (BATTERY_WH * battery_used_frac) / hours
+    ideal = (m * G) ** 1.5 / math.sqrt(2.0 * rho * DISK_AREA_M2)   # η = 1 power
+    return max(0.3, min(0.95, ideal / avg_power))
+
+
 @dataclass
 class FeasibilityResult:
     feasible: bool = False           # nominal energy fits the usable budget
@@ -64,6 +78,8 @@ class FeasibilityResult:
     n_turns: int = 0
     auw_kg: float = 0.0
     air_density: float = 0.0
+    site_elev_m: float = 0.0         # operating altitude used for air density
+    takeoff_elev_m: float = 0.0      # takeoff ground used for the MTOW gate
     hover_power_w: float = 0.0
     energy_wh: float = 0.0           # nominal
     energy_wh_lo: float = 0.0        # η band
@@ -114,14 +130,21 @@ def flight_time(route, is_geo=True, cruise_ms=6.0, climb_ms=CLIMB_MS,
     return total, dist, n_turns
 
 
-def estimate_feasibility(route, is_geo=True, payload_kg=5.0, cruise_ms=6.0,
-                         site_elev_m=0.0, temp_c=15.0, wind_kt=None,
+def estimate_feasibility(route, is_geo=True, payload_kg=3.0, cruise_ms=6.0,
+                         site_elev_m=0.0, temp_c=15.0,
                          eta=ETA_DEFAULT, eta_band=ETA_BAND,
-                         home=None, terrain_at=None):
+                         home=None, terrain_at=None, takeoff_elev_m=None):
     """Full feasibility estimate for a flown route. `terrain_at(x,y)->elev` (optional)
-    enables the AGL gate; `home=(lon,lat)` (optional) enables the comms-range gate."""
+    enables the AGL gate; `home=(lon,lat)` (optional) enables the comms-range gate.
+
+    site_elev_m is the OPERATING altitude (drives air density → energy, so pass the
+    mean flight altitude AMSL). takeoff_elev_m is the launch ground (drives the MTOW
+    derate — takeoff can be at a different elevation than the survey); defaults to
+    site_elev_m when not given."""
     r = FeasibilityResult()
     r.auw_kg = NET_KG + BATTERY_KG + payload_kg
+    r.site_elev_m = site_elev_m
+    r.takeoff_elev_m = site_elev_m if takeoff_elev_m is None else takeoff_elev_m
     r.air_density = air_density(site_elev_m, temp_c)
 
     r.flight_time_s, r.distance_m, r.n_turns = flight_time(
@@ -142,13 +165,12 @@ def estimate_feasibility(route, is_geo=True, payload_kg=5.0, cruise_ms=6.0,
 
     # ── operational gates ──
     wps = _route_wps(route)
-    derated_mtow = MTOW_KG * (1 - 0.05 * site_elev_m / 1000.0) \
+    derated_mtow = MTOW_KG * (1 - 0.05 * r.takeoff_elev_m / 1000.0) \
         * (1 - 0.05 * max(0.0, temp_c - 20.0) / 10.0)
     if r.auw_kg > derated_mtow:
         r.gates.append(f'Takeoff weight {r.auw_kg:.1f} kg exceeds derated MTOW '
-                       f'{derated_mtow:.1f} kg (at {site_elev_m:.0f} m / {temp_c:.0f} °C).')
-    if wind_kt is not None and wind_kt > WIND_MAX_KT:
-        r.gates.append(f'Wind {wind_kt:.0f} kt exceeds the {WIND_MAX_KT:.0f} kt limit.')
+                       f'{derated_mtow:.1f} kg (at {r.takeoff_elev_m:.0f} m / '
+                       f'{temp_c:.0f} °C).')
     if terrain_at is not None and wps:
         max_agl = max((w['z'] - terrain_at(w['x'], w['y'])) for w in wps
                       if not math.isnan(terrain_at(w['x'], w['y'])))
