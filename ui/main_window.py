@@ -65,6 +65,12 @@ class MainWindow(QMainWindow):
         self.home = None                 # takeoff/return-home (lon, lat) or None
         self.home_ground = float('nan')  # terrain elevation at home, if in the DTM
 
+        # mission-feasibility inputs (edited via the Feasibility menu)
+        from feasibility import ETA_DEFAULT
+        # site elevation is auto-derived from the route/home, not stored here
+        self.feas = {'payload_kg': 3.0, 'temp_c': 15.0,
+                     'eta': ETA_DEFAULT, 'calibrated': False}
+
         self._build_menu()
         self._build_body()
         self._update_scan_freq()                 # derive the initial scan freq
@@ -101,6 +107,11 @@ class MainWindow(QMainWindow):
         self.act_profile.setShortcut('Ctrl+E')
         self.act_profile.toggled.connect(self._toggle_profile)
         mv.addAction(self.act_profile)
+
+        mf = self.menuBar().addMenu('&Feasibility')
+        a_feas = QAction('Mission conditions & calibration…', self)
+        a_feas.triggered.connect(self._open_feasibility)
+        mf.addAction(a_feas)
 
     def _build_body(self):
         top = QSplitter(Qt.Horizontal)
@@ -725,6 +736,49 @@ class MainWindow(QMainWindow):
             f'Pass added at {new_pass[0]["z"]:.0f} m — {self.result.n_waypoints} '
             f'waypoints. Click to add another or untick Add Pass.')
 
+    # ------------------------------------------------------------- feasibility
+    def _open_feasibility(self):
+        from .feasibility_ui import FeasibilityDialog
+        air, _ = self._feas_elevations()          # for the calibration air density
+        dlg = FeasibilityDialog(self, self.feas['payload_kg'], self.feas['temp_c'],
+                                self.feas['eta'], self.feas['calibrated'], air)
+        if dlg.exec():                     # Accepted == 1 (truthy), Rejected == 0
+            self.feas = dlg.values()
+            if self.result is not None:
+                self._render_summary(self.result)
+
+    def _feas_elevations(self):
+        """(operating_amsl, takeoff_amsl) auto-derived: operating = mean flight
+        altitude of the route (drives air density). takeoff = home ground only when
+        a home is set (drives the MTOW derate); None otherwise — with no home the
+        estimate is based purely on the polygon route and the MTOW gate falls back
+        to the operating altitude. (0, None) when there's no route."""
+        if not (self.result and self.result.route and self.dtm):
+            return 0.0, None
+        wps = [w for w in self._route_with_home()
+               if not (isinstance(w['z'], float) and math.isnan(w['z']))]
+        if not wps:
+            return 0.0, None
+        air = sum(w['z'] for w in wps) / len(wps)
+        takeoff = (self.home_ground
+                   if self.home is not None and not math.isnan(self.home_ground)
+                   else None)
+        return air, takeoff
+
+    def _feasibility(self):
+        """FeasibilityResult for the current flown route, or None if no route."""
+        if not (self.result and self.result.route and self.dtm):
+            return None
+        import feasibility as F
+        air, takeoff = self._feas_elevations()
+        return F.estimate_feasibility(
+            self._route_with_home(), is_geo=self.is_geo,
+            payload_kg=self.feas['payload_kg'], cruise_ms=self.sp_speed.value(),
+            site_elev_m=air, temp_c=self.feas['temp_c'],
+            eta=self.feas['eta'],
+            home=self.home, terrain_at=self.dtm.elevation_at,
+            takeoff_elev_m=takeoff)
+
     # ---------------------------------------------------------------- profile
     def _toggle_profile(self, on):
         """Show/hide the bottom elevation-profile bar (View menu / Ctrl+E)."""
@@ -857,8 +911,32 @@ class MainWindow(QMainWindow):
             ('Median density', f"{est.get('median_density', 0):.0f} pts/m²"),
             ('Min density', f"{est.get('min_density', 0):.0f} pts/m²"),
         ]
+
+        fr = self._feasibility()
+        if fr is not None:
+            verdict = ('✓ feasible' if fr.robust else
+                       ('~ feasible (nominal)' if fr.feasible else '✗ over budget'))
+            batt = (f'{fr.batteries_needed} batteries'
+                    if fr.batteries_needed > 1 else '1 battery')
+            cal = 'calibrated' if self.feas['calibrated'] else 'uncalibrated ±band'
+            rows += [
+                ('<b>Feasibility (Thor)</b>', ''),
+                ('Flight time', f'{fr.flight_time_s / 60:.0f} min'),
+                ('Payload', f"{self.feas['payload_kg']:.1f} kg"),
+            ]
+            if self.home is not None:      # takeoff ground only matters with a home
+                rows.append(('Takeoff alt', f'{fr.takeoff_elev_m:.0f} m'))
+            rows += [
+                ('Energy need', f'{fr.energy_wh:.0f} Wh ({cal})'),
+                ('Usable / batteries', f'{fr.usable_wh:.0f} Wh · {batt}'),
+                ('Verdict', f'{verdict} ({fr.margin_pct:+.0f}% margin)'),
+            ]
+
         html = ['<table cellspacing=6>']
         for k, val in rows:
             html.append(f'<tr><td>{k}</td><td><b>{val}</b></td></tr>')
         html.append('</table>')
+        if fr is not None and fr.gates:
+            html.append('<div style="color:#e5a13a;margin-top:6px;">⚠ '
+                        + '<br>⚠ '.join(fr.gates) + '</div>')
         self.lbl_summary.setText(''.join(html))
