@@ -132,8 +132,6 @@ class MainWindow(QMainWindow):
         # be squeezed narrower than their contents — so a change in one panel steals
         # width from the map, never from the other panel.
         top.setChildrenCollapsible(False)
-        sw = sidebar.minimumWidth()                    # content-derived, DPI-aware
-        top.setSizes([sw, max(400, 1400 - sw - 300), 300])
 
         from .profile import ProfilePanel
         self.profile_panel = ProfilePanel()            # full-width strip below
@@ -264,7 +262,10 @@ class MainWindow(QMainWindow):
         self.sidebar_scroll = scroll
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         sb_w = scroll.verticalScrollBar().sizeHint().width()
-        scroll.setMinimumWidth(panel.minimumSizeHint().width() + sb_w + 4)
+        # Floor = content's own minimum (DPI-aware) + scrollbar + a little comfort
+        # padding. The 3-pane splitter opens each side panel at its minimum, so this
+        # padding is also the sidebar's opening width — a touch roomier than a tight fit.
+        scroll.setMinimumWidth(panel.minimumSizeHint().width() + sb_w + 44)
         return scroll
 
     def _dspin(self, lo, hi, val, suffix, step):
