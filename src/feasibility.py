@@ -165,7 +165,9 @@ def estimate_feasibility(route, is_geo=True, payload_kg=3.0, cruise_ms=6.0,
 
     # ── operational gates ──
     wps = _route_wps(route)
-    derated_mtow = MTOW_KG * (1 - 0.05 * r.takeoff_elev_m / 1000.0) \
+    # both derates only ever REDUCE MTOW: clamp elevation ≥ 0 so a below-sea-level
+    # takeoff (e.g. the Dead Sea, −430 m) can't inflate MTOW past the structural limit
+    derated_mtow = MTOW_KG * (1 - 0.05 * max(0.0, r.takeoff_elev_m) / 1000.0) \
         * (1 - 0.05 * max(0.0, temp_c - 20.0) / 10.0)
     if r.auw_kg > derated_mtow:
         r.gates.append(f'Takeoff weight {r.auw_kg:.1f} kg exceeds derated MTOW '
@@ -186,6 +188,16 @@ def estimate_feasibility(route, is_geo=True, payload_kg=3.0, cruise_ms=6.0,
         if far > COMMS_RANGE_M:
             r.gates.append(f'Farthest waypoint {far / 1000:.1f} km from home exceeds '
                            f'the {COMMS_RANGE_M / 1000:.0f} km comms range.')
+        # RTH-reserve energy: the fraction held back for auto-return-home must cover
+        # the flight back from the farthest point (still air, horizontal at cruise).
+        # If not, the drone can hit the RH trigger too far out to make it home.
+        reserve_wh = BATTERY_WH * RH_RESERVE_FRAC
+        return_wh = (r.hover_power_w * (far / cruise_ms) / 3600.0
+                     if cruise_ms > 0 else 0.0)
+        if return_wh > reserve_wh:
+            r.gates.append(f'Return from the farthest point ({far / 1000:.1f} km) needs '
+                           f'~{return_wh:.0f} Wh, but the {RH_RESERVE_FRAC * 100:.0f}% '
+                           f'auto-return reserve holds only {reserve_wh:.0f} Wh.')
 
     if eta == ETA_DEFAULT:
         r.notes.append('Uncalibrated η — energy carries a ±%.0f%% band; one measured '
