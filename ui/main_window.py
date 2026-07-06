@@ -39,6 +39,10 @@ PULSE_FREQS = (150_000, 300_000, 600_000, 1_200_000, 1_800_000, 2_400_000)
 # recovers nothing on the descent, so every wasted metre of climb is wasted energy).
 _TRANSIT_BUFFER_M = 20.0
 
+# Passes are always floored at least this far above their highest point. Fixed (not
+# exposed in the UI) — it's a safety clearance, not a routine tuning knob.
+_MIN_PEAK_CLEARANCE_M = 50.0
+
 
 def _hr():
     line = QFrame()
@@ -116,13 +120,20 @@ class MainWindow(QMainWindow):
 
     def _build_body(self):
         top = QSplitter(Qt.Horizontal)
-        top.addWidget(self._build_sidebar())           # params (left)
+        sidebar = self._build_sidebar()                # params (left)
+        top.addWidget(sidebar)
         top.addWidget(self._build_map())               # map (center)
         top.addWidget(self._build_summary())           # results (right)
         top.setStretchFactor(0, 0)
         top.setStretchFactor(1, 1)
         top.setStretchFactor(2, 0)
-        top.setSizes([340, 760, 300])
+        # Only the map flexes; the side panels can't be collapsed and (thanks to their
+        # scroll areas tracking content width, see _build_sidebar/_build_summary) can't
+        # be squeezed narrower than their contents — so a change in one panel steals
+        # width from the map, never from the other panel.
+        top.setChildrenCollapsible(False)
+        sw = sidebar.minimumWidth()                    # content-derived, DPI-aware
+        top.setSizes([sw, max(400, 1400 - sw - 300), 300])
 
         from .profile import ProfilePanel
         self.profile_panel = ProfilePanel()            # full-width strip below
@@ -187,15 +198,12 @@ class MainWindow(QMainWindow):
         # ── Flight ──
         gb_flight = QGroupBox('Flight')
         fl = QFormLayout(gb_flight)
+        fl.setRowWrapPolicy(QFormLayout.WrapLongRows)          # field drops under label
+        fl.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)  # when the pane is narrow
         self.sp_alt = self._dspin(1, 1000, 100, ' m', 5)
-        self.sp_minclear = self._dspin(0, 500, 50, ' m', 5)
-        self.sp_minclear.setToolTip('The pass altitude is raised if needed so it '
-                                    'stays at least this far above the highest point '
-                                    'of the pass.')
         self.sp_overlap = self._dspin(20, 50, 20, ' %', 1)
         self.cb_adaptive = QCheckBox('Terrain-adaptive spacing'); self.cb_adaptive.setChecked(True)
         fl.addRow('Altitude AGL', self.sp_alt)
-        fl.addRow('Min clearance above peak', self.sp_minclear)
         fl.addRow('Overlap', self.sp_overlap)
         fl.addRow('', self.cb_adaptive)
         v.addWidget(gb_flight)
@@ -203,6 +211,8 @@ class MainWindow(QMainWindow):
         # ── Scanner & density ──
         gb_scan = QGroupBox('Scanner & density')
         scl = QFormLayout(gb_scan)
+        scl.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        scl.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         self.sp_minpts = QSpinBox(); self.sp_minpts.setRange(1, 100000); self.sp_minpts.setValue(100)
         self.sp_speed = self._dspin(0.1, 50, 6.0, ' m/s', 0.5)
         self.cmb_pulse = QComboBox()
@@ -245,7 +255,16 @@ class MainWindow(QMainWindow):
         v.addStretch(1)
 
         scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(panel)
-        scroll.setMinimumWidth(340)
+        # Adaptive: form rows wrap the field under the label when narrow, so the panel
+        # can compress a long way; the floor is the content's OWN minimum width (which
+        # scales with the font/DPI, not a hard-coded number) plus the scrollbar. With
+        # the horizontal scrollbar off and a non-collapsible splitter, the pane is
+        # exactly as wide as its contents need — never clipping, never scrolling
+        # sideways — and the map absorbs any width the results panel gives up.
+        self.sidebar_scroll = scroll
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        sb_w = scroll.verticalScrollBar().sizeHint().width()
+        scroll.setMinimumWidth(panel.minimumSizeHint().width() + sb_w + 4)
         return scroll
 
     def _dspin(self, lo, hi, val, suffix, step):
@@ -267,7 +286,6 @@ class MainWindow(QMainWindow):
     def _save_settings(self):
         s = self._settings()
         s.setValue('flight/agl', self.sp_alt.value())
-        s.setValue('flight/min_clearance', self.sp_minclear.value())
         s.setValue('flight/overlap', self.sp_overlap.value())
         s.setValue('flight/adaptive', self.cb_adaptive.isChecked())
         s.setValue('scan/min_points', self.sp_minpts.value())
@@ -283,8 +301,6 @@ class MainWindow(QMainWindow):
     def _load_settings(self):
         s = self._settings()
         self.sp_alt.setValue(s.value('flight/agl', self.sp_alt.value(), type=float))
-        self.sp_minclear.setValue(
-            s.value('flight/min_clearance', self.sp_minclear.value(), type=float))
         self.sp_overlap.setValue(
             s.value('flight/overlap', self.sp_overlap.value(), type=float))
         self.cb_adaptive.setChecked(
@@ -324,14 +340,40 @@ class MainWindow(QMainWindow):
     def _build_summary(self):
         panel = QWidget(); sv = QVBoxLayout(panel)
         title = QLabel('<b>Results</b>')
+
+        # Feasibility verdict banner — the redesign's headline element. Colour-coded
+        # (success / warning / danger via a dynamic "state" property) so the go/no-go
+        # answer is scannable before any other metric. Hidden until a route exists.
+        self.verdict_banner = QFrame(); self.verdict_banner.setObjectName('verdictBanner')
+        vb = QVBoxLayout(self.verdict_banner)
+        vb.setContentsMargins(14, 12, 14, 12); vb.setSpacing(6)
+        self.verdict_headline = QLabel(); self.verdict_headline.setObjectName('verdictHeadline')
+        self.verdict_reason = QLabel(); self.verdict_reason.setObjectName('verdictReason')
+        self.verdict_reason.setWordWrap(True)
+        self.energy_bar = QProgressBar(); self.energy_bar.setObjectName('energyBar')
+        self.energy_bar.setTextVisible(False); self.energy_bar.setRange(0, 100)
+        self.energy_bar.setFixedHeight(6)
+        vb.addWidget(self.verdict_headline); vb.addWidget(self.verdict_reason)
+        vb.addWidget(self.energy_bar)
+        self.verdict_banner.setVisible(False)
+
         self.lbl_summary = QLabel('Compute a route to see results.')
         self.lbl_summary.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.lbl_summary.setTextFormat(Qt.RichText)
         self.lbl_summary.setWordWrap(True)
-        sv.addWidget(title); sv.addWidget(self.lbl_summary); sv.addStretch(1)
+        sv.addWidget(title); sv.addWidget(self.verdict_banner)
+        sv.addWidget(self.lbl_summary); sv.addStretch(1)
         scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(panel)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)  # wrap, don't scroll sideways
         scroll.setMinimumWidth(260)
         return scroll
+
+    @staticmethod
+    def _set_state(widget, state):
+        """Set the dynamic 'state' property (success/warning/danger) and re-polish
+        so the QSS attribute selectors re-apply."""
+        widget.setProperty('state', state)
+        widget.style().unpolish(widget); widget.style().polish(widget)
 
     def _stub(self, text):
         w = QWidget(); l = QVBoxLayout(w)
@@ -478,6 +520,8 @@ class MainWindow(QMainWindow):
         self.base_result = None
         self.survey_route = []
         self.lbl_summary.setText('Compute a route to see results.')
+        if getattr(self, 'verdict_banner', None) is not None:
+            self.verdict_banner.setVisible(False)
         if self.mapview is not None:
             self.mapview.clear_overlays()
             self._show_home()                 # keep the marker, drop stale ferry legs
@@ -697,7 +741,7 @@ class MainWindow(QMainWindow):
     def _params(self):
         return PlanParams(
             altitude_m=self.sp_alt.value(),
-            min_peak_clearance_m=self.sp_minclear.value(),
+            min_peak_clearance_m=_MIN_PEAK_CLEARANCE_M,
             overlap_pct=self.sp_overlap.value(),
             adaptive_spacing=self.cb_adaptive.isChecked(),
             min_points=self.sp_minpts.value(),
@@ -969,11 +1013,27 @@ class MainWindow(QMainWindow):
 
         fr = self._feasibility()
         if fr is not None:
-            verdict = ('✓ feasible' if fr.robust else
-                       ('~ feasible (nominal)' if fr.feasible else '✗ over budget'))
             batt = (f'{fr.batteries_needed} batteries'
                     if fr.batteries_needed > 1 else '1 battery')
             cal = 'calibrated' if self.feas['calibrated'] else 'uncalibrated ±band'
+            # ── verdict banner ──
+            if fr.robust:
+                state, head = 'success', '✓ Feasible'
+            elif fr.feasible:
+                state, head = 'warning', '~ Feasible (nominal only)'
+            else:
+                state, head = 'danger', '✗ Over energy budget'
+            self._set_state(self.verdict_banner, state)
+            self._set_state(self.verdict_headline, state)
+            self._set_state(self.energy_bar, state)
+            self.verdict_headline.setText(head)
+            self.verdict_reason.setText(
+                f'Needs {fr.energy_wh:.0f} Wh vs {fr.usable_wh:.0f} Wh usable on '
+                f'{batt} — {fr.margin_pct:+.0f}% margin.')
+            self.energy_bar.setValue(
+                int(min(100, round(100.0 * fr.energy_wh / max(fr.usable_wh, 1.0)))))
+            self.verdict_banner.setVisible(True)
+            # ── supporting detail (demoted below the banner) ──
             rows += [
                 ('<b>Feasibility (Thor)</b>', ''),
                 ('Flight time', f'{fr.flight_time_s / 60:.0f} min'),
@@ -984,14 +1044,15 @@ class MainWindow(QMainWindow):
             rows += [
                 ('Energy need', f'{fr.energy_wh:.0f} Wh ({cal})'),
                 ('Usable / batteries', f'{fr.usable_wh:.0f} Wh · {batt}'),
-                ('Verdict', f'{verdict} ({fr.margin_pct:+.0f}% margin)'),
             ]
+        else:
+            self.verdict_banner.setVisible(False)
 
         html = ['<table cellspacing=6>']
         for k, val in rows:
             html.append(f'<tr><td>{k}</td><td><b>{val}</b></td></tr>')
         html.append('</table>')
         if fr is not None and fr.gates:
-            html.append('<div style="color:#e5a13a;margin-top:6px;">⚠ '
+            html.append('<div style="color:#e6c98a;margin-top:6px;">⚠ '
                         + '<br>⚠ '.join(fr.gates) + '</div>')
         self.lbl_summary.setText(''.join(html))
