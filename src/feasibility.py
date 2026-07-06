@@ -96,38 +96,53 @@ def _route_wps(route):
             if not (isinstance(w.get('z'), float) and math.isnan(w.get('z')))]
 
 
-def flight_time(route, is_geo=True, cruise_ms=6.0, climb_ms=CLIMB_MS,
-                turn_penalty_s=TURN_PENALTY_S, takeoff_land_s=TAKEOFF_LAND_S):
-    """(total_s, distance_m, n_turns). Per segment the drone flies horizontal and
-    vertical concurrently, so segment time = max(horiz/cruise, |Δz|/climb); plus a
-    penalty per heading change and a fixed takeoff/land allowance."""
+def _flight_profile(route, is_geo=True, cruise_ms=6.0, climb_ms=CLIMB_MS,
+                    turn_penalty_s=TURN_PENALTY_S, takeoff_land_s=TAKEOFF_LAND_S):
+    """Walk the route once → (segments, distance_m, n_turns). `segments` is a list of
+    (duration_s, elev_m) energy chunks: one per flown segment (at its mean altitude),
+    one per turn (at the turn waypoint's altitude), and one takeoff/land allowance
+    (at the first waypoint). Summing durations gives total flight time; evaluating
+    hover power at each chunk's altitude gives altitude-resolved energy."""
     wps = _route_wps(route)
     if len(wps) < 2:
-        return takeoff_land_s, 0.0, 0
+        return [(takeoff_land_s, wps[0]['z'] if wps else 0.0)], 0.0, 0
     lat0 = sum(w['y'] for w in wps) / len(wps)
     lon_m = _LAT_M * math.cos(math.radians(lat0)) if is_geo else 1.0
     lat_m = _LAT_M if is_geo else 1.0
 
-    total, dist, headings = 0.0, 0.0, []
+    segments, dist, headings = [], 0.0, []
     for a, b in zip(wps, wps[1:]):
         dx = (b['x'] - a['x']) * lon_m
         dy = (b['y'] - a['y']) * lat_m
         horiz = math.hypot(dx, dy)
         dz = abs(b['z'] - a['z'])
         dist += horiz
-        total += max(horiz / cruise_ms, dz / climb_ms) if cruise_ms > 0 else 0.0
+        seg_s = max(horiz / cruise_ms, dz / climb_ms) if cruise_ms > 0 else 0.0
+        segments.append((seg_s, 0.5 * (a['z'] + b['z'])))   # energy at pass altitude
         headings.append(math.atan2(dy, dx) if horiz > 0 else None)
 
     n_turns = 0
-    for h0, h1 in zip(headings, headings[1:]):
+    for (h0, h1), turn_wp in zip(zip(headings, headings[1:]), wps[1:]):
         if h0 is None or h1 is None:
             continue
         d = abs(h1 - h0) % (2 * math.pi)
         d = min(d, 2 * math.pi - d)
         if d > math.radians(30):
             n_turns += 1
-    total += n_turns * turn_penalty_s + takeoff_land_s
-    return total, dist, n_turns
+            segments.append((turn_penalty_s, turn_wp['z']))
+    segments.append((takeoff_land_s, wps[0]['z']))          # spin-up + land near start
+    return segments, dist, n_turns
+
+
+def flight_time(route, is_geo=True, cruise_ms=6.0, climb_ms=CLIMB_MS,
+                turn_penalty_s=TURN_PENALTY_S, takeoff_land_s=TAKEOFF_LAND_S):
+    """(total_s, distance_m, n_turns). Per segment the drone flies horizontal and
+    vertical concurrently, so segment time = max(horiz/cruise, |Δz|/climb); plus a
+    penalty per heading change and a fixed takeoff/land allowance."""
+    segments, dist, n_turns = _flight_profile(
+        route, is_geo=is_geo, cruise_ms=cruise_ms, climb_ms=climb_ms,
+        turn_penalty_s=turn_penalty_s, takeoff_land_s=takeoff_land_s)
+    return sum(s for s, _ in segments), dist, n_turns
 
 
 def estimate_feasibility(route, is_geo=True, payload_kg=3.0, cruise_ms=6.0,
@@ -145,17 +160,25 @@ def estimate_feasibility(route, is_geo=True, payload_kg=3.0, cruise_ms=6.0,
     r.auw_kg = NET_KG + BATTERY_KG + payload_kg
     r.site_elev_m = site_elev_m
     r.takeoff_elev_m = site_elev_m if takeoff_elev_m is None else takeoff_elev_m
-    r.air_density = air_density(site_elev_m, temp_c)
+    r.air_density = air_density(site_elev_m, temp_c)   # representative (mean-alt) ρ
 
-    r.flight_time_s, r.distance_m, r.n_turns = flight_time(
+    segments, r.distance_m, r.n_turns = _flight_profile(
         route, is_geo=is_geo, cruise_ms=cruise_ms)
+    r.flight_time_s = sum(s for s, _ in segments)
 
-    r.hover_power_w = hover_power_w(r.auw_kg, r.air_density, eta)
-    hours = r.flight_time_s / 3600.0
-    r.energy_wh = r.hover_power_w * hours
+    # Altitude-resolved energy: each chunk burns power at ITS OWN air density (a high
+    # pass in thinner air costs more than a low one), so sum energy over the segments
+    # instead of flight-mean power × total time. Air is thinner with height; temp is
+    # held constant (the ISA lapse is too site-variable to assume — see notes).
+    def _energy_wh(e):
+        return sum(hover_power_w(r.auw_kg, air_density(z, temp_c), e) * (dur / 3600.0)
+                   for dur, z in segments)
+
+    r.hover_power_w = hover_power_w(r.auw_kg, r.air_density, eta)   # representative
+    r.energy_wh = _energy_wh(eta)
     # energy ∝ 1/η, so the η band maps to an energy band (low η → worst case)
-    r.energy_wh_lo = hover_power_w(r.auw_kg, r.air_density, eta * (1 + eta_band)) * hours
-    r.energy_wh_hi = hover_power_w(r.auw_kg, r.air_density, eta * (1 - eta_band)) * hours
+    r.energy_wh_lo = _energy_wh(eta * (1 + eta_band))
+    r.energy_wh_hi = _energy_wh(eta * (1 - eta_band))
 
     r.usable_wh = BATTERY_WH * (1.0 - RH_RESERVE_FRAC)
     r.feasible = r.energy_wh <= r.usable_wh
