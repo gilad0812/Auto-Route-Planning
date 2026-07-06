@@ -8,7 +8,7 @@ import csv
 import json
 import math
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
@@ -74,6 +74,7 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._build_body()
         self._update_scan_freq()                 # derive the initial scan freq
+        self._load_settings()                    # restore last-used params + η
         self._progress = QProgressBar()
         self._progress.setRange(0, 0)            # indeterminate "busy" bar
         self._progress.setMaximumWidth(170)
@@ -255,6 +256,60 @@ class MainWindow(QMainWindow):
     def _update_scan_freq(self):
         """Lock scan freq to the value derived from the selected pulse rate."""
         self.sp_scanfreq.setValue(scan_freq_for_prr(self.cmb_pulse.currentData()))
+
+    # -------------------------------------------------------- settings persistence
+    def _settings(self):
+        # per-user store (Windows registry HKCU); survives restarts on the air-gapped
+        # machine. Only planning PARAMETERS + calibration are persisted, not the DTM/
+        # AOI/home mission state (which belongs to a mission, not to preferences).
+        return QSettings('AutoRoutePlanning', 'RoutePlanner')
+
+    def _save_settings(self):
+        s = self._settings()
+        s.setValue('flight/agl', self.sp_alt.value())
+        s.setValue('flight/min_clearance', self.sp_minclear.value())
+        s.setValue('flight/overlap', self.sp_overlap.value())
+        s.setValue('flight/adaptive', self.cb_adaptive.isChecked())
+        s.setValue('scan/min_points', self.sp_minpts.value())
+        s.setValue('scan/speed', self.sp_speed.value())
+        s.setValue('scan/pulse_freq', self.cmb_pulse.currentData())
+        s.setValue('scan/veg', self.sp_veg.value())
+        s.setValue('feas/payload_kg', self.feas['payload_kg'])
+        s.setValue('feas/temp_c', self.feas['temp_c'])
+        s.setValue('feas/eta', self.feas['eta'])           # measured — worth keeping
+        s.setValue('feas/calibrated', self.feas['calibrated'])
+        s.setValue('window/geometry', self.saveGeometry())
+
+    def _load_settings(self):
+        s = self._settings()
+        self.sp_alt.setValue(s.value('flight/agl', self.sp_alt.value(), type=float))
+        self.sp_minclear.setValue(
+            s.value('flight/min_clearance', self.sp_minclear.value(), type=float))
+        self.sp_overlap.setValue(
+            s.value('flight/overlap', self.sp_overlap.value(), type=float))
+        self.cb_adaptive.setChecked(
+            s.value('flight/adaptive', self.cb_adaptive.isChecked(), type=bool))
+        self.sp_minpts.setValue(
+            s.value('scan/min_points', self.sp_minpts.value(), type=int))
+        self.sp_speed.setValue(s.value('scan/speed', self.sp_speed.value(), type=float))
+        pf = s.value('scan/pulse_freq', self.cmb_pulse.currentData(), type=int)
+        idx = self.cmb_pulse.findData(pf)
+        if idx >= 0:
+            self.cmb_pulse.setCurrentIndex(idx)           # re-derives the scan freq
+        self.sp_veg.setValue(s.value('scan/veg', self.sp_veg.value(), type=float))
+        self.feas['payload_kg'] = s.value(
+            'feas/payload_kg', self.feas['payload_kg'], type=float)
+        self.feas['temp_c'] = s.value('feas/temp_c', self.feas['temp_c'], type=float)
+        self.feas['eta'] = s.value('feas/eta', self.feas['eta'], type=float)
+        self.feas['calibrated'] = s.value(
+            'feas/calibrated', self.feas['calibrated'], type=bool)
+        geo = s.value('window/geometry')
+        if geo is not None:
+            self.restoreGeometry(geo)
+
+    def closeEvent(self, event):
+        self._save_settings()
+        super().closeEvent(event)
 
     def _build_map(self):
         # Native Qt map canvas (offline) — DTM relief, draw the AOI here.
