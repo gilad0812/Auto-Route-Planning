@@ -116,6 +116,13 @@ QToolButton {{ background: #232830; border: 1px solid {BORDER_CTRL}; color: {TEX
 QToolButton:hover {{ background: #2a3038; border-color: #465060; color: {TEXT}; }}
 QToolButton:checked {{ background: {ACCENT_PRESS}; color: {ACCENT_TEXT}; border-color: {ACCENT_PRESS}; }}
 
+/* Disclosure header (collapsible section) — flat, quiet, not a chunky button */
+QToolButton#disclosure {{ background: transparent; border: none; color: {MUTED};
+    padding: 3px 2px; font-size: 11px; font-weight: 600; }}
+QToolButton#disclosure:hover {{ background: transparent; color: {TEXT_SECONDARY}; }}
+QToolButton#disclosure:checked {{ background: transparent; color: {TEXT_SECONDARY};
+    border: none; }}
+
 /* Checkbox */
 QCheckBox {{ spacing: 7px; }}
 QCheckBox::indicator {{ width: 16px; height: 16px; border: 1px solid {BORDER_CTRL};

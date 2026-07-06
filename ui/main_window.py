@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QFormLayout, QDoubleSpinBox, QSpinBox, QCheckBox, QComboBox, QGroupBox,
     QSplitter, QScrollArea, QFileDialog, QMessageBox, QFrame, QProgressBar,
-    QApplication, QAbstractSpinBox,
+    QApplication, QAbstractSpinBox, QToolButton,
 )
 
 from .planning import (PlanParams, compute_plan, load_dtm, chm_compatible,
@@ -51,6 +51,38 @@ def _hr():
     return line
 
 
+class CollapsibleSection(QWidget):
+    """A disclosure: a click-to-toggle header (▸/▾) over a content area that hides
+    the rarely-touched params so the routine knobs stay uncluttered up top."""
+
+    def __init__(self, title, parent=None):
+        super().__init__(parent)
+        self.toggle = QToolButton()
+        self.toggle.setObjectName('disclosure')
+        self.toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.toggle.setArrowType(Qt.RightArrow)
+        self.toggle.setText(title)
+        self.toggle.setCheckable(True)
+        self.toggle.setChecked(False)
+        self.toggle.setCursor(Qt.PointingHandCursor)
+        self._content = QWidget()
+        self._content.setVisible(False)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(2)
+        lay.addWidget(self.toggle); lay.addWidget(self._content)
+        self.toggle.toggled.connect(self._on_toggle)
+
+    def _on_toggle(self, on):
+        self.toggle.setArrowType(Qt.DownArrow if on else Qt.RightArrow)
+        self._content.setVisible(on)
+
+    def set_content_layout(self, layout):
+        self._content.setLayout(layout)
+
+    def set_expanded(self, on):
+        self.toggle.setChecked(on)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -79,6 +111,8 @@ class MainWindow(QMainWindow):
         self._build_body()
         self._update_scan_freq()                 # derive the initial scan freq
         self._load_settings()                    # restore last-used params + η
+        self._update_workflow()                  # seed the ✓ checklist state
+        self.lbl_summary.setText(self._empty_summary_html())   # guided empty state
         self._progress = QProgressBar()
         self._progress.setRange(0, 0)            # indeterminate "busy" bar
         self._progress.setMaximumWidth(170)
@@ -152,8 +186,8 @@ class MainWindow(QMainWindow):
         v.setSpacing(10)
         v.setContentsMargins(12, 12, 12, 12)
 
-        # ── Data ──
-        gb_data = QGroupBox('Data')
+        # ── Data ── (workflow step ①; titles get a ✓ via _update_workflow)
+        self.gb_data = gb_data = QGroupBox('① Data')
         dl = QVBoxLayout(gb_data)
         self.lbl_dtm = QLabel('DTM: (none)'); self.lbl_dtm.setWordWrap(True)
         self.lbl_chm = QLabel('CHM: (none)'); self.lbl_chm.setWordWrap(True)
@@ -169,8 +203,8 @@ class MainWindow(QMainWindow):
         dl.addWidget(self.lbl_chm); dl.addLayout(chm_row)
         v.addWidget(gb_data)
 
-        # ── AOI ──
-        gb_aoi = QGroupBox('AOI')
+        # ── AOI ── (workflow step ②)
+        self.gb_aoi = gb_aoi = QGroupBox('② Survey area')
         al = QVBoxLayout(gb_aoi)
         self.lbl_aoi = QLabel('Draw a polygon on the map to set the AOI.')
         self.lbl_aoi.setWordWrap(True); self.lbl_aoi.setStyleSheet('color:#888;')
@@ -181,8 +215,8 @@ class MainWindow(QMainWindow):
         al.addWidget(self.lbl_aoi); al.addWidget(b_enter_aoi); al.addWidget(b_clear_aoi)
         v.addWidget(gb_aoi)
 
-        # ── Takeoff / Home ──
-        gb_home = QGroupBox('Takeoff / Home')
+        # ── Takeoff / Home ── (optional — outside the numbered sequence)
+        gb_home = QGroupBox('Takeoff / Home · optional')
         hl = QVBoxLayout(gb_home)
         self.lbl_home = QLabel('Home: (none)')
         self.lbl_home.setWordWrap(True); self.lbl_home.setStyleSheet('color:#888;')
@@ -193,8 +227,8 @@ class MainWindow(QMainWindow):
         hl.addWidget(self.lbl_home); hl.addLayout(home_row)
         v.addWidget(gb_home)
 
-        # ── Flight ──
-        gb_flight = QGroupBox('Flight')
+        # ── Flight ── (workflow step ③)
+        gb_flight = QGroupBox('③ Flight')
         fl = QFormLayout(gb_flight)
         fl.setRowWrapPolicy(QFormLayout.WrapLongRows)          # field drops under label
         fl.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)  # when the pane is narrow
@@ -206,8 +240,9 @@ class MainWindow(QMainWindow):
         fl.addRow('', self.cb_adaptive)
         v.addWidget(gb_flight)
 
-        # ── Scanner & density ──
-        gb_scan = QGroupBox('Scanner & density')
+        # ── Scanner & density ── (workflow step ④) — routine knobs up top, the
+        # set-once scanner internals tucked behind an "Advanced" disclosure.
+        gb_scan = QGroupBox('④ Scanner & density')
         scl = QFormLayout(gb_scan)
         scl.setRowWrapPolicy(QFormLayout.WrapLongRows)
         scl.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
@@ -226,10 +261,18 @@ class MainWindow(QMainWindow):
         self.sp_veg = self._dspin(0, 1, 0.4, '', 0.05); self.sp_veg.setDecimals(2)
         scl.addRow('Min points / m²', self.sp_minpts)
         scl.addRow('Drone speed', self.sp_speed)
-        scl.addRow('Pulse freq', self.cmb_pulse)
-        scl.addRow('Scan freq (auto)', self.sp_scanfreq)
-        scl.addRow('Canopy ground-return frac', self.sp_veg)
-        scl.addRow(QLabel('FOV fixed at 100° (±50°)'))
+
+        self.scan_advanced = CollapsibleSection('Advanced')
+        adv = QFormLayout()
+        adv.setContentsMargins(0, 2, 0, 0)
+        adv.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        adv.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        adv.addRow('Pulse freq', self.cmb_pulse)
+        adv.addRow('Scan freq (auto)', self.sp_scanfreq)
+        adv.addRow('Canopy ground-return frac', self.sp_veg)
+        adv.addRow(QLabel('FOV fixed at 100° (±50°)'))
+        self.scan_advanced.set_content_layout(adv)
+        scl.addRow(self.scan_advanced)
         v.addWidget(gb_scan)
 
         self.btn_compute = QPushButton('Compute Route')
@@ -265,7 +308,12 @@ class MainWindow(QMainWindow):
         # Floor = content's own minimum (DPI-aware) + scrollbar + a little comfort
         # padding. The 3-pane splitter opens each side panel at its minimum, so this
         # padding is also the sidebar's opening width — a touch roomier than a tight fit.
+        # Measure with the Advanced disclosure EXPANDED so its (wider) rows are counted:
+        # a hidden child contributes nothing to the size hint, so measuring collapsed
+        # would let the floor clip the advanced rows when the user opens them later.
+        self.scan_advanced.set_expanded(True)
         scroll.setMinimumWidth(panel.minimumSizeHint().width() + sb_w + 44)
+        self.scan_advanced.set_expanded(False)
         return scroll
 
     def _dspin(self, lo, hi, val, suffix, step):
@@ -375,6 +423,36 @@ class MainWindow(QMainWindow):
         so the QSS attribute selectors re-apply."""
         widget.setProperty('state', state)
         widget.style().unpolish(widget); widget.style().polish(widget)
+
+    def _update_workflow(self):
+        """Flip the ✓ on the numbered workflow groups as each step is satisfied, so
+        the sidebar reads as a checklist of where you are."""
+        self.gb_data.setTitle('① Data ✓' if self.dtm is not None else '① Data')
+        self.gb_aoi.setTitle('② Survey area ✓' if self.drawn_polygon is not None
+                             else '② Survey area')
+
+    def _empty_summary_html(self):
+        """A guided placeholder for the results panel before a route exists: the
+        three gating steps, with done ones checked and the next one highlighted."""
+        steps = [('Load a DTM', self.dtm is not None),
+                 ('Draw a survey area', self.drawn_polygon is not None),
+                 ('Compute the route', False)]
+        cur = next((i for i, (_, done) in enumerate(steps) if not done), len(steps))
+        nums = ['①', '②', '③']
+        out = ['<div style="color:#8b96a3;">Get started</div>',
+               '<table cellspacing=5 style="margin-top:6px;">']
+        for i, (name, done) in enumerate(steps):
+            if done:
+                mark, color = '✓', '#4f9d7a'
+            elif i == cur:
+                mark, color = '→', '#e3e6e9'
+            else:
+                mark, color = '', '#74808c'
+            out.append(f'<tr><td style="color:{color};">{nums[i]}</td>'
+                       f'<td style="color:{color};">{name}</td>'
+                       f'<td style="color:{color};">{mark}</td></tr>')
+        out.append('</table>')
+        return ''.join(out)
 
     def _stub(self, text):
         w = QWidget(); l = QVBoxLayout(w)
@@ -520,7 +598,8 @@ class MainWindow(QMainWindow):
         self.result = None
         self.base_result = None
         self.survey_route = []
-        self.lbl_summary.setText('Compute a route to see results.')
+        self.lbl_summary.setText(self._empty_summary_html())
+        self._update_workflow()
         if getattr(self, 'verdict_banner', None) is not None:
             self.verdict_banner.setVisible(False)
         if self.mapview is not None:
@@ -759,6 +838,9 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, 'AOI', 'Draw a polygon on the map first.')
             return
         poly = self.drawn_polygon
+        self.verdict_banner.setVisible(False)
+        self.lbl_summary.setText(
+            '<i style="color:#8b96a3;">Computing route + density estimate…</i>')
         self._set_busy(True, 'Computing route + density estimate…')
         self.setEnabled(False)
         try:
@@ -769,6 +851,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.setEnabled(True)
             self._set_busy(False)
+            self.lbl_summary.setText(self._empty_summary_html())   # drop the busy line
             QMessageBox.critical(self, 'Compute error', str(e))
             self.statusBar().showMessage('Compute failed.')
             return
