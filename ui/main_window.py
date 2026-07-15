@@ -18,15 +18,26 @@ from PySide6.QtWidgets import (
 )
 
 from .planning import (PlanParams, compute_plan, load_dtm, chm_compatible,
-                       scan_freq_for_prr, build_manual_pass, estimate_for_route,
-                       _path_length_m, _LAT_M)
+                       scan_lines_for_square_pattern, build_manual_pass,
+                       estimate_for_route, _path_length_m, _LAT_M)
 
 try:
-    from .canvasmap import CanvasMap
+    from .canvasmap import CanvasMap, FAILURE_REASON_STYLE, FAILURE_REASON_LABEL
     _MAPVIEW_ERR = None
 except Exception as _e:
     CanvasMap = None
     _MAPVIEW_ERR = str(_e)
+    # Qt-free fallback so the summary legend still renders without the map backend.
+    FAILURE_REASON_STYLE = {
+        "range": ("#e5484d", 130), "shadow": ("#8250df", 120),
+        "thin": ("#ff9900", 95), "gap": ("#8c959f", 120),
+    }
+    FAILURE_REASON_LABEL = {
+        "range": ("Beyond scanner range", "lower AGL or PRR"),
+        "shadow": ("Occlusion shadow", "needs a cross-pass, or accept"),
+        "thin": ("Thin (under target)", "lower AGL / tighter AOI"),
+        "gap": ("Not covered", "spacing / AOI edge"),
+    }
 
 from shapely.geometry import shape as shapely_shape
 
@@ -237,7 +248,7 @@ class MainWindow(QMainWindow):
         self.cb_adaptive = QCheckBox('Terrain-adaptive spacing'); self.cb_adaptive.setChecked(True)
         fl.addRow('Altitude AGL', self.sp_alt)
         fl.addRow('Overlap', self.sp_overlap)
-        fl.addRow('', self.cb_adaptive)
+        fl.addRow(self.cb_adaptive)               # span both columns → hug the left edge
         v.addWidget(gb_flight)
 
         # ── Scanner & density ── (workflow step ④) — routine knobs up top, the
@@ -252,12 +263,17 @@ class MainWindow(QMainWindow):
         for f in PULSE_FREQS:
             self.cmb_pulse.addItem(f'{f:,}', f)
         self.cmb_pulse.setCurrentText('600,000')
-        # Scan freq is derived from the pulse rate, not entered: read-only + locked.
+        # Scan freq is DERIVED for a square point pattern from AGL/speed/PRR/FOV,
+        # not entered: read-only + locked, and recomputed whenever those change.
         self.sp_scanfreq = self._dspin(1, 5000, 224.4, ' Hz', 10)
         self.sp_scanfreq.setReadOnly(True)
         self.sp_scanfreq.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        self.sp_scanfreq.setToolTip('Auto-derived from the pulse frequency (locked).')
+        self.sp_scanfreq.setToolTip(
+            'Derived for a square (isotropic) point pattern from AGL, speed, pulse '
+            'rate and FOV, clamped to the mirror’s 50–400 lines/s (locked).')
         self.cmb_pulse.currentIndexChanged.connect(self._update_scan_freq)
+        self.sp_alt.valueChanged.connect(self._update_scan_freq)
+        self.sp_speed.valueChanged.connect(self._update_scan_freq)
         self.sp_veg = self._dspin(0, 1, 0.4, '', 0.05); self.sp_veg.setDecimals(2)
         scl.addRow('Min points / m²', self.sp_minpts)
         scl.addRow('Drone speed', self.sp_speed)
@@ -322,8 +338,14 @@ class MainWindow(QMainWindow):
         return s
 
     def _update_scan_freq(self):
-        """Lock scan freq to the value derived from the selected pulse rate."""
-        self.sp_scanfreq.setValue(scan_freq_for_prr(self.cmb_pulse.currentData()))
+        """Derive the scan (mirror) line rate for an isotropic 'square' point pattern
+        from the current flight geometry — scan = sqrt(v·PRR / (2·AGL·tanθ)), clamped
+        to the datasheet 50–400 lines/s. Tracks AGL, speed and pulse rate; replaces
+        the old fixed nominal anchor."""
+        half = 100.0 / 2.0                       # FOV fixed at 100° (±50°)
+        self.sp_scanfreq.setValue(scan_lines_for_square_pattern(
+            self.cmb_pulse.currentData(), self.sp_alt.value(), half,
+            self.sp_speed.value()))
 
     # -------------------------------------------------------- settings persistence
     def _settings(self):
@@ -1052,10 +1074,14 @@ class MainWindow(QMainWindow):
         wps = [w for w in r.route
                if not (isinstance(w['z'], float) and math.isnan(w['z']))]
         est = r.estimate or {}
-        cells = est.get('failing_cells_geo', [])
         rad = max(float(est.get('cell_size_m', 2.0)), 3.0)
-        self.mapview.show_plan(wps, cells, density_color='#ff9900',
-                               density_radius_m=rad)
+        by_reason = est.get('failing_cells_by_reason')
+        if by_reason:
+            self.mapview.show_plan(wps, None, density_radius_m=rad,
+                                   cells_by_reason=by_reason)
+        else:                       # older result shape: single-colour fallback
+            self.mapview.show_plan(wps, est.get('failing_cells_geo', []),
+                                   density_color='#ff9900', density_radius_m=rad)
         self.mapview.show_home(self.home, wps)
 
     # ---------------------------------------------------------------- render
@@ -1094,6 +1120,23 @@ class MainWindow(QMainWindow):
             ('Median density', f"{est.get('median_density', 0):.0f} pts/m²"),
             ('Min density', f"{est.get('min_density', 0):.0f} pts/m²"),
         ]
+        # Failure breakdown by CAUSE — swatch colours match the map overlay, so the
+        # operator reads why each patch is orange/red/etc. and what lever fixes it.
+        _reason_counts = {'range': est.get('n_beyond_range', 0),
+                          'shadow': est.get('n_shadow', 0),
+                          'thin': est.get('n_thin', 0),
+                          'gap': est.get('n_gap', 0)}
+        if any(_reason_counts.values()):
+            rows.append(('<b>Why cells fail</b>', ''))
+            for key in ('range', 'shadow', 'thin', 'gap'):
+                n = _reason_counts[key]
+                if not n:
+                    continue
+                hexc = FAILURE_REASON_STYLE[key][0]
+                label, lever = FAILURE_REASON_LABEL[key]
+                rows.append(
+                    (f'<span style="color:{hexc}">■</span> {label}',
+                     f'{n:,} cells · <i>{lever}</i>'))
 
         fr = self._feasibility()
         if fr is not None:

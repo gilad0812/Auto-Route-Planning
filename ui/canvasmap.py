@@ -25,6 +25,22 @@ from PySide6.QtGui import QPainterPath
 
 _LAT_M = 111139.0
 
+# Under-density overlay palette, keyed by the estimator's failure CAUSE. Shared
+# with the summary legend so map colours and text agree. (hex, alpha).
+FAILURE_REASON_STYLE = {
+    "range": ("#e5484d", 130),    # beyond scanner max range — lower AGL/PRR
+    "shadow": ("#8250df", 120),   # occlusion shadow — cross-pass or accept
+    "thin": ("#ff9900", 95),      # reached but under target — AGL/edge thinning
+    "gap": ("#8c959f", 120),      # never in a swath — spacing / AOI-edge gap
+}
+# Human labels + the operator's lever, for the legend.
+FAILURE_REASON_LABEL = {
+    "range": ("Beyond scanner range", "lower AGL or PRR"),
+    "shadow": ("Occlusion shadow", "needs a cross-pass, or accept"),
+    "thin": ("Thin (under target)", "lower AGL / tighter AOI"),
+    "gap": ("Not covered", "spacing / AOI edge"),
+}
+
 
 def _point_seg_dist(px, py, ax, ay, bx, by):
     """Shortest distance from point (px,py) to segment (ax,ay)-(bx,by)."""
@@ -364,7 +380,8 @@ class CanvasMap(QWidget):
 
     # ----------------------------------------------------------- overlays
     def show_plan(self, route_wps, density_cells, density_color='#ff9900',
-                  density_radius_m=3.0, max_density_pts=20000):
+                  density_radius_m=3.0, max_density_pts=20000,
+                  cells_by_reason=None):
         if self.dtm is None:
             return
         # clear previous overlays
@@ -374,7 +391,14 @@ class CanvasMap(QWidget):
             self.scene.removeItem(self._density_item); self._density_item = None
 
         # ── under-density: overlay image of ground-sized dots (scales w/ zoom) ──
-        if density_cells:
+        # Prefer the cause-coloured breakdown when the estimate provides it; fall
+        # back to a single colour for older results / callers.
+        if cells_by_reason:
+            layers = [(cells_by_reason.get(k, []), hexc, alpha)
+                      for k, (hexc, alpha) in FAILURE_REASON_STYLE.items()]
+            self._density_item = self._paint_cell_layers(
+                layers, density_radius_m, max_density_pts)
+        elif density_cells:
             self._density_item = self._paint_cells(
                 density_cells, density_color, 90, density_radius_m, max_density_pts)
 
@@ -416,6 +440,31 @@ class CanvasMap(QWidget):
         for lon, lat in cells:
             c, r = self._inv * (lon, lat)
             p.drawEllipse(QPointF(c, r), rad_px, rad_px)
+        p.end()
+        item = QGraphicsPixmapItem(QPixmap.fromImage(ov))
+        self.scene.addItem(item)
+        return item
+
+    def _paint_cell_layers(self, layers, radius_m, max_pts=20000):
+        """Paint several (cells, color_hex, alpha) layers onto ONE overlay image
+        so cause-coloured failure cells share a single scene item. Each layer is
+        down-sampled independently to keep the draw bounded."""
+        h, w, _ = self._relief.shape
+        ov = QImage(w, h, QImage.Format_RGBA8888); ov.fill(0)
+        p = QPainter(ov)
+        p.setPen(QPen(Qt.NoPen))
+        rad_px = max(1.0, radius_m / self._pixel_m())
+        for cells, color_hex, alpha in layers:
+            if not cells:
+                continue
+            if len(cells) > max_pts:
+                step = len(cells) / max_pts
+                cells = [cells[int(i * step)] for i in range(max_pts)]
+            col = QColor(color_hex); col.setAlpha(alpha)
+            p.setBrush(QBrush(col))
+            for lon, lat in cells:
+                c, r = self._inv * (lon, lat)
+                p.drawEllipse(QPointF(c, r), rad_px, rad_px)
         p.end()
         item = QGraphicsPixmapItem(QPixmap.fromImage(ov))
         self.scene.addItem(item)

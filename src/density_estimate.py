@@ -17,6 +17,8 @@ confirmed by one HELIOS++ run.
 import math
 import numpy as np
 
+from scanner import max_range_m as _scanner_max_range
+
 try:
     from matplotlib.path import Path as _MplPath
     _MPL_OK = True
@@ -59,6 +61,11 @@ def estimate_density_grid(
     """
     fov = 2.0 * math.radians(scan_half_angle_deg)
     tan_half = math.tan(math.radians(scan_half_angle_deg))
+    # Scanner range envelope (VUX-120-23 datasheet, >=20 % reflectivity, MTA
+    # resolved): pulses are still EMITTED across the full FOV — the `fov` divisor
+    # in the density formula is unchanged — but beyond this slant range they
+    # return nothing, so those cells get no contribution.
+    rng_max = _scanner_max_range(pulse_freq_hz)
 
     passes = [p for p in _group_passes(route)
               if len(p) >= 2 and not math.isnan(float(p[0]["z"]))]
@@ -133,6 +140,9 @@ def estimate_density_grid(
 
     # ── Accumulate density from every pass ───────────────────────────────────
     density = np.zeros((ny, nx), dtype=float)
+    range_hit = np.zeros((ny, nx), dtype=bool)   # in-FOV but beyond max range
+    any_fov = np.zeros((ny, nx), dtype=bool)     # in some pass's FOV (any range)
+    any_covered = np.zeros((ny, nx), dtype=bool)  # in-FOV AND in-range (pre-occlusion)
     for pts in passes:
         z_pass = float(pts[0]["z"])
         ax = (pts[0]["x"] - cu) * lon_m
@@ -153,8 +163,10 @@ def estimate_density_grid(
             R = np.sqrt(d * d + h * h)              # slant range
             # cos(incidence) of ray vs surface normal; flat ground → h/R.
             cos_i = (h + ox * g_e + oy * g_n) / (np.maximum(R, 1e-6) * nrm)
-            covered = (np.isfinite(h) & (h > 1.0)
-                       & (d <= h * tan_half) & (cos_i > 0.0))
+            in_fov = (np.isfinite(h) & (h > 1.0)
+                      & (d <= h * tan_half) & (cos_i > 0.0))
+            range_hit |= in_fov & (R > rng_max)   # emitted, but no return
+            covered = in_fov & (R <= rng_max)
             # cos_i / R → points per tilted SURFACE m² (survey-quality metric);
             # HELIOS normalises the same way, so estimate and sim are comparable.
             contrib = np.where(
@@ -174,6 +186,8 @@ def estimate_density_grid(
                     los = z_pass - tf * h           # straight sight-line altitude
                     blocked |= covered & (_terr_EN(Em, Nm) > los + occ_margin_m)
             contrib = np.where(blocked, 0.0, contrib)
+        any_fov |= in_fov
+        any_covered |= covered
         density += contrib
 
     # Canopy: vegetated cells keep only `veg_penetration` of the bare-earth density
@@ -201,14 +215,39 @@ def estimate_density_grid(
     rows, cols = np.where(fail_mask)
     failing_geo = list(zip(LON[rows, cols].tolist(), LAT[rows, cols].tolist()))
 
+    # Categorise each failing cell by CAUSE, so the map colours them and the
+    # operator sees the lever, not just "orange":
+    #   thin   — reached but under target (AGL over low ground, swath-edge cos²).
+    #   shadow — a pass had it in-range & in-FOV, but occlusion blocked the beam.
+    #   range  — only ever seen beyond the scanner's max range (AGL/PRR mismatch).
+    #   gap    — never fell in any pass's swath (spacing / AOI-edge coverage gap).
+    _thin = fail_mask & (density > 0.0)
+    _void = fail_mask & ~_thin
+    _shadow = _void & any_covered
+    _range = _void & ~any_covered & range_hit
+    _gap = _void & ~any_covered & ~range_hit
+
+    def _geo(m):
+        r, c = np.where(m)
+        return list(zip(LON[r, c].tolist(), LAT[r, c].tolist()))
+
+    by_reason = {"range": _geo(_range), "shadow": _geo(_shadow),
+                 "thin": _geo(_thin), "gap": _geo(_gap)}
+
     in_vals = density[inside]
     return {
+        "failing_cells_by_reason": by_reason,
+        "n_thin": int(_thin.sum()), "n_shadow": int(_shadow.sum()),
+        "n_beyond_range": int(_range.sum()), "n_gap": int(_gap.sum()),
         "passed": len(failing_geo) == 0,
         "failing_cells_geo": failing_geo,
         "n_fail": len(failing_geo),
         "n_cells": int(inside.sum()),
         # Voids = reached cells with ~zero points (occlusion shadows / gaps).
         "n_void": int((in_vals <= 0.0).sum()),
+        # Failing cells that sat beyond the scanner's max range from >=1 pass —
+        # the tell that the AGL/PRR combo, not the geometry, is what's starving them.
+        "n_range_limited": int((range_hit & fail_mask).sum()),
         "median_density": float(np.median(in_vals)) if in_vals.size else 0.0,
         "min_density": float(in_vals.min()) if in_vals.size else 0.0,
         "cell_size_m": cell,

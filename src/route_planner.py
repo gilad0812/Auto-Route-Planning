@@ -27,7 +27,9 @@ def lawnmower_waypoints(polygon, spacing, step):
         inter = line.intersection(polygon)
         if not inter.is_empty:
             if inter.geom_type == 'MultiLineString':
-                for seg in inter:
+                # .geoms — direct iteration of multi-geometries was removed in
+                # Shapely 2.0; iterating `inter` itself crashes on concave AOIs.
+                for seg in inter.geoms:
                     coords = list(seg.coords)
                     if toggle:
                         coords.reverse()
@@ -78,6 +80,85 @@ def _pass_altitude(dtm, pts, agl, step, elev_sample_step=None, min_peak_clearanc
     if not valid:
         return float('nan')
     return max(sum(valid) / len(valid) + agl, max(valid) + min_peak_clearance)
+
+
+def band_pass_altitudes(route, dtm, agl, is_geo=True, band_half_m=50.0):
+    """Merge consecutive passes onto a shared altitude wherever both can stay inside
+    the AGL corridor [AGL−band_half, AGL+band_half] (the ±band_half m band the
+    elevation profile draws around the target AGL), so passes that don't need a
+    distinct height don't get one — each shared height is one z-calibration instead
+    of one per pass.
+
+    A pass keeps its planned altitude z_i as the floor (it is never LOWERED — that
+    would cut clearance and narrow the swath the spacing assumed). It may be RAISED
+    up to valley_i + AGL + band_half, the highest constant altitude keeping its
+    lowest ground under the band ceiling. Consecutive passes whose windows
+    [z_i, ceil_i] still share an altitude are flown together at the max of their
+    planned altitudes (the lowest height clearing all of them). Greedy over the
+    flight order — optimal for the fewest bands. Only ever raises, so clearance
+    improves and coverage only gains overlap. Rewrites z in place; returns route.
+    """
+    from collections import OrderedDict
+    groups = OrderedDict()
+    for w in route:
+        groups.setdefault(w.get('pass_id'), []).append(w)
+    passes = list(groups.values())
+    if len(passes) < 2:
+        return route
+
+    def _z(w):
+        return w['z']
+
+    def _valid(wps):
+        return [w for w in wps if not (isinstance(_z(w), float) and math.isnan(_z(w)))]
+
+    all_valid = [w for wps in passes for w in _valid(wps)]
+    if not all_valid:
+        return route
+    lat0 = sum(w['y'] for w in all_valid) / len(all_valid)
+    lon_m = _LAT_M * math.cos(math.radians(lat0)) if is_geo else 1.0
+    lat_m = _LAT_M if is_geo else 1.0
+    res_m = min(abs(dtm.src.res[0]), abs(dtm.src.res[1])) * (lat_m if is_geo else 1.0)
+    step = max(res_m, 2.0)
+
+    # window per pass: (z_floor, ceiling, waypoints), or None where it can't be banded
+    windows = []
+    for wps in passes:
+        vv = _valid(wps)
+        if len(vv) < 1:
+            windows.append(None); continue
+        z_i = vv[0]['z']                          # constant along the pass
+        (x0, y0), (x1, y1) = (vv[0]['x'], vv[0]['y']), (vv[-1]['x'], vv[-1]['y'])
+        seg = math.hypot((x1 - x0) * lon_m, (y1 - y0) * lat_m)
+        n = max(1, int(seg / step))
+        elevs = [dtm.elevation_at(x0 + (x1 - x0) * k / n, y0 + (y1 - y0) * k / n)
+                 for k in range(n + 1)]
+        ev = [e for e in elevs if not math.isnan(e)]
+        if not ev:
+            windows.append(None); continue
+        ceil_i = min(ev) + agl + band_half_m       # keep the lowest ground in-band
+        windows.append((z_i, max(z_i, ceil_i), wps))   # ceiling ≥ floor (safety wins)
+
+    i = 0
+    while i < len(windows):
+        if windows[i] is None:
+            i += 1; continue
+        lo, hi, members = windows[i][0], windows[i][1], [windows[i][2]]
+        j = i + 1
+        while j < len(windows) and windows[j] is not None:
+            zj, cj, wj = windows[j]
+            nlo, nhi = max(lo, zj), min(hi, cj)
+            if nlo <= nhi:                         # a shared in-band altitude survives
+                lo, hi, = nlo, nhi
+                members.append(wj); j += 1
+            else:
+                break
+        for wps in members:                        # fly the band at its lowest common height
+            for w in wps:
+                if not (isinstance(w['z'], float) and math.isnan(w['z'])):
+                    w['z'] = lo
+        i = j
+    return route
 
 
 def plan_route(dtm, polygon, distance_above_surface,
@@ -190,6 +271,10 @@ def plan_route_adaptive(dtm, polygon, distance_above_surface,
 
     Spacing: tightened where terrain between two passes rises and shrinks their
     swath, evaluated at the highest terrain in the strip, iterated to a fixed point.
+
+    Altitude banding is applied afterward (band_pass_altitudes), not here: it only
+    raises passes, and the spacing cap makes an inline version equivalent to the
+    post-step, so it stays a decoupled step in compute_plan.
 
     Passes stop at the AOI boundary (rim margin is the operator's job, by over-
     drawing the polygon). Runs in a rotated metric frame so passes are horizontal.

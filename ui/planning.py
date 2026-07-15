@@ -16,22 +16,17 @@ if _SRC not in sys.path:
 from shapely.geometry import Polygon                     # noqa: E402
 from dtm import DTM                                      # noqa: E402
 from route_planner import (                                # noqa: E402
-    plan_route_adaptive, plan_route, _pass_altitude)
+    plan_route_adaptive, plan_route, _pass_altitude, band_pass_altitudes)
 from density_estimate import estimate_density_grid       # noqa: E402
+from scanner import (                                      # noqa: E402
+    max_range_m, scan_lines_for_square_pattern)
 
 _LAT_M = 111139.0
 
-# Scan (mirror-oscillation) frequency is derived from the pulse rate: across-track
-# resolution f_scan = Δθ·PRR/(2·FOV) is linear in PRR with Δθ and the FOV fixed, so
-# anchor to the scanner's nominal setting (600 kHz → 224.4 Hz) and scale.
-_REF_PRR_HZ = 600_000.0
-_REF_SCAN_HZ = 224.4
-
-
-def scan_freq_for_prr(pulse_freq_hz):
-    """Scan frequency (Hz) for a given pulse rate, scaled from the 600 kHz → 224.4 Hz
-    nominal point so the across-track resolution stays fixed."""
-    return _REF_SCAN_HZ * (float(pulse_freq_hz) / _REF_PRR_HZ)
+# Scan (mirror) line rate is DERIVED for an isotropic point pattern from the flight
+# geometry + pulse rate (scanner.scan_lines_for_square_pattern), not anchored to a
+# nominal. It cancels out of the density estimate (average density is invariant to
+# it), so it only sets the point pattern fed to HELIOS and shown to the operator.
 
 
 @dataclass
@@ -135,21 +130,39 @@ def compute_plan(dtm, polygon, params: PlanParams, chm=None, is_geo=True):
     elev_step_map = min(step_map, dtm_res_map)
     half = params.fov_deg / 2.0
 
+    # Range-capped swath: beyond the scanner's max range (per PRR, >=20 % refl.)
+    # pulses return nothing, so at high AGL the USABLE half-angle is set by range
+    # (slant = agl/cosθ <= max_range), not the emission FOV. Plan spacing from the
+    # effective angle so coverage doesn't silently fail at the swath edges; the
+    # estimator keeps the full FOV (emission spread) + its own range cutoff.
+    rng = max_range_m(params.pulse_freq_hz)
+    if params.altitude_m >= rng:
+        raise ValueError(
+            f'AGL {params.altitude_m:.0f} m exceeds the VUX-120 max range '
+            f'{rng:.0f} m at {params.pulse_freq_hz:,} Hz (>=20 % reflectivity) — '
+            f'no ground returns even at nadir. Lower the AGL or the pulse rate.')
+    half_eff = min(half, math.degrees(math.acos(params.altitude_m / rng)))
+
     if params.adaptive_spacing:
         route = plan_route_adaptive(
             dtm, polygon, params.altitude_m,
-            scan_half_angle_deg=half, step=step_map,
+            scan_half_angle_deg=half_eff, step=step_map,
             overlap_frac=params.overlap_pct / 100.0, is_geo=is_geo,
             elev_sample_step=elev_step_map,
             min_peak_clearance=params.min_peak_clearance_m,
         )
     else:
         spacing_map = (2.0 * params.altitude_m
-                       * math.tan(math.radians(half))
+                       * math.tan(math.radians(half_eff))
                        * (1.0 - params.overlap_pct / 100.0)) / to_m
         route = plan_route(dtm, polygon, params.altitude_m, spacing_map,
                            step_map, elev_sample_step=elev_step_map,
                            min_peak_clearance=params.min_peak_clearance_m)
+
+    # Merge adjacent passes onto a shared altitude wherever both stay inside the
+    # ±50 m AGL corridor — fewer distinct heights → fewer per-altitude LiDAR
+    # z-calibrations. Only ever raises a pass, so clearance/coverage stay safe.
+    route = band_pass_altitudes(route, dtm, params.altitude_m, is_geo=is_geo)
 
     return estimate_for_route(dtm, polygon, route, params, chm=chm, is_geo=is_geo)
 
