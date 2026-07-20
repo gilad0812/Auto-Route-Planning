@@ -1,6 +1,7 @@
 import math
 import numpy as np
-from shapely.geometry import shape, LineString, Point, Polygon, mapping
+import shapely
+from shapely.geometry import shape, LineString, Polygon, mapping
 
 _LAT_M = 111139.0  # metres per degree latitude (WGS-84 approximation)
 
@@ -131,12 +132,12 @@ def band_pass_altitudes(route, dtm, agl, is_geo=True, band_half_m=50.0):
         (x0, y0), (x1, y1) = (vv[0]['x'], vv[0]['y']), (vv[-1]['x'], vv[-1]['y'])
         seg = math.hypot((x1 - x0) * lon_m, (y1 - y0) * lat_m)
         n = max(1, int(seg / step))
-        elevs = [dtm.elevation_at(x0 + (x1 - x0) * k / n, y0 + (y1 - y0) * k / n)
-                 for k in range(n + 1)]
-        ev = [e for e in elevs if not math.isnan(e)]
-        if not ev:
+        t = np.arange(n + 1) / n
+        elevs = dtm.elevation_at_many(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t)
+        ev = elevs[~np.isnan(elevs)]
+        if ev.size == 0:
             windows.append(None); continue
-        ceil_i = min(ev) + agl + band_half_m       # keep the lowest ground in-band
+        ceil_i = float(ev.min()) + agl + band_half_m   # keep the lowest ground in-band
         windows.append((z_i, max(z_i, ceil_i), wps))   # ceiling ≥ floor (safety wins)
 
     i = 0
@@ -220,18 +221,19 @@ def _auto_pass_angle(dtm, polygon, lon_m, lat_m, n=21, n_angles=180):
     xs = np.linspace(minx, maxx, n)
     ys = np.linspace(miny, maxy, n)
     cx, cy = (minx + maxx) / 2.0, (miny + maxy) / 2.0
-    pxs, pys, pes = [], [], []                       # sample points in local metres
-    for yy in ys:
-        for xx in xs:
-            if polygon.intersects(Point(xx, yy)):
-                e = dtm.elevation_at(xx, yy)
-                if not math.isnan(e):
-                    pxs.append((xx - cx) * lon_m)
-                    pys.append((yy - cy) * lat_m)
-                    pes.append(e)
-    if len(pes) < 4:
+    # Vectorised: mesh -> polygon containment -> one batched elevation lookup, in
+    # place of an n*n Python loop of point-in-polygon + scalar elevation_at.
+    gx, gy = np.meshgrid(xs, ys)
+    gx, gy = gx.ravel(), gy.ravel()
+    inside = shapely.contains_xy(polygon, gx, gy)
+    gx, gy = gx[inside], gy[inside]
+    es = dtm.elevation_at_many(gx, gy)
+    good = ~np.isnan(es)
+    pxs = (gx[good] - cx) * lon_m                    # sample points in local metres
+    pys = (gy[good] - cy) * lat_m
+    pes = es[good]
+    if pes.size < 4:
         return 0.0
-    pxs, pys, pes = np.asarray(pxs), np.asarray(pys), np.asarray(pes)
     if float(pes.max() - pes.min()) < 1.0:           # ~flat: orientation irrelevant
         return 0.0
 
@@ -262,7 +264,7 @@ def plan_route_adaptive(dtm, polygon, distance_above_surface,
                         scan_half_angle_deg, step,
                         overlap_frac=0.2, is_geo=True, min_spacing_m=2.0,
                         elev_sample_step=None, orientation='auto',
-                        min_peak_clearance=50.0):
+                        min_peak_clearance=50.0, edge_margin=False):
     """Lawnmower route with terrain-adaptive pass spacing and orientation.
 
     Orientation: passes follow the contours (via _auto_pass_angle) — since altitude
@@ -312,14 +314,34 @@ def plan_route_adaptive(dtm, polygon, distance_above_surface,
         nn = u * st + v * ct
         return (lon0 + e / lon_m, lat0 + nn / lat_m)
 
-    def elev_uv(u, v):
-        gx, gy = uv2g(u, v)
-        return dtm.elevation_at(gx, gy)
+    def elev_uv_many(us, vs):
+        """Batched elev_uv: rotated-metric (u, v) arrays -> one array elevation lookup."""
+        us = np.asarray(us, dtype=float)
+        vs = np.asarray(vs, dtype=float)
+        e = us * ct - vs * st
+        nn = us * st + vs * ct
+        return dtm.elevation_at_many(lon0 + e / lon_m, lat0 + nn / lat_m)
+
+    def _valid_elevs(uv_list):
+        """Non-NaN elevations for a list of (u, v) points, in one batched lookup."""
+        if not uv_list:
+            return np.empty(0)
+        a = np.asarray(uv_list, dtype=float)
+        ev = elev_uv_many(a[:, 0], a[:, 1])
+        return ev[~np.isnan(ev)]
 
     poly_uv = Polygon([g2uv(px, py) for px, py in polygon.exterior.coords])
     if not poly_uv.is_valid:
         poly_uv = poly_uv.buffer(0)
-    poly_cov = poly_uv          # passes stop at the AOI boundary (rim = operator's job)
+    poly_cov = poly_uv          # by default passes stop at the AOI boundary
+    if edge_margin:
+        # Fly-past rim: extend coverage one full pass pitch (base_spacing_m) beyond the
+        # AOI on every side, so edge cells get the same overlap as the interior and the
+        # boundary "gap" band disappears. The width is a derived pass pitch, not a
+        # chosen margin; the density estimate still scores only the true AOI.
+        buffered = poly_uv.buffer(base_spacing_m)
+        if buffered.is_valid and not buffered.is_empty:
+            poly_cov = buffered
 
     # step / elev_sample_step arrive in map units; convert to metres for the frame.
     to_m = lat_m if is_geo else 1.0
@@ -348,14 +370,13 @@ def plan_route_adaptive(dtm, polygon, distance_above_surface,
                 elev_pts = _sample_line_in_polygon(poly_cov, v, esample_m)
             else:
                 elev_pts = ordered
-            valid = [e for e in (elev_uv(pu, pv) for pu, pv in elev_pts)
-                     if not math.isnan(e)]
-            if valid:
+            valid = _valid_elevs(elev_pts)
+            if valid.size:
                 # altitude tracks the pass MEAN terrain + AGL, but never dips below
                 # min_peak_clearance above the pass peak (so the highest point on the
                 # line always keeps at least that clearance).
-                z = max(sum(valid) / len(valid) + agl,
-                        max(valid) + min_peak_clearance)
+                z = max(float(valid.sum()) / valid.size + agl,
+                        float(valid.max()) + min_peak_clearance)
 
             # emit only the pass endpoints (the turns) — altitude already came from
             # the dense elev_pts above, so no intermediate waypoints are needed.
@@ -371,24 +392,20 @@ def plan_route_adaptive(dtm, polygon, distance_above_surface,
         s_m = base_spacing_m
         for _ in range(3):
             v_next = v + s_m
-            strip_elevs, next_elevs = [], []
             # sample interior lines of the gap densely along-track (one shapely
-            # clip per line, count scaled to the gap width so a spire can't hide)
+            # clip per line, count scaled to the gap width so a spire can't hide),
+            # then one batched elevation lookup over all the points.
             n_cross = max(3, min(int(s_m / strip_res), 12))
+            strip_uv = []
             for k in range(1, n_cross + 1):
                 vv = v + s_m * k / (n_cross + 1)
-                for pu, pv in _sample_line_in_polygon(poly_cov, vv, strip_res):
-                    e = elev_uv(pu, pv)
-                    if not math.isnan(e):
-                        strip_elevs.append(e)
-            for pu, pv in _sample_line_in_polygon(poly_cov, v_next, strip_res):
-                e = elev_uv(pu, pv)
-                if not math.isnan(e):
-                    next_elevs.append(e)
-            if not strip_elevs and not next_elevs:
+                strip_uv.extend(_sample_line_in_polygon(poly_cov, vv, strip_res))
+            strip_elevs = _valid_elevs(strip_uv)
+            next_elevs = _valid_elevs(_sample_line_in_polygon(poly_cov, v_next, strip_res))
+            if strip_elevs.size == 0 and next_elevs.size == 0:
                 break
-            ridge = max(strip_elevs + next_elevs)
-            z_next = (max(next_elevs) + agl) if next_elevs else None
+            ridge = float(np.concatenate([strip_elevs, next_elevs]).max())
+            z_next = (float(next_elevs.max()) + agl) if next_elevs.size else None
             agl_cur = (z_cur - ridge) if z_cur is not None else agl
             agl_next = (z_next - ridge) if z_next is not None else agl
             hs_cur = max(agl_cur, 1.0) * tan_t

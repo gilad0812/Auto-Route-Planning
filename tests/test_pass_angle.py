@@ -17,12 +17,18 @@ from route_planner import _auto_pass_angle                # noqa: E402
 
 
 class FakeDTM:
-    """Minimal stand-in: _auto_pass_angle only calls elevation_at(x, y)."""
+    """Minimal stand-in exposing the DTM sampling interface the planner uses:
+    scalar elevation_at and the vectorised elevation_at_many."""
     def __init__(self, z_fn):
         self._z = z_fn
 
     def elevation_at(self, x, y):
         return self._z(x, y)
+
+    def elevation_at_many(self, xs, ys):
+        import numpy as np
+        return np.asarray(self._z(np.asarray(xs, dtype=float),
+                                  np.asarray(ys, dtype=float)), dtype=float)
 
 
 # Projected metric frame (lon_m = lat_m = 1); AOI is a centred square.

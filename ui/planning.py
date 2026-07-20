@@ -36,6 +36,7 @@ class PlanParams:
     fov_deg: float = 100.0           # fixed (RIEGL VUX-120-23, ±50°)
     overlap_pct: float = 20.0
     adaptive_spacing: bool = True
+    edge_margin: bool = False        # fly one pass-pitch past the AOI to cover the rim
     step_m: float = 5.0             # along-track waypoint spacing (fixed, not exposed)
     min_points: int = 100
     speed_ms: float = 6.0
@@ -150,12 +151,20 @@ def compute_plan(dtm, polygon, params: PlanParams, chm=None, is_geo=True):
             overlap_frac=params.overlap_pct / 100.0, is_geo=is_geo,
             elev_sample_step=elev_step_map,
             min_peak_clearance=params.min_peak_clearance_m,
+            edge_margin=params.edge_margin,
         )
     else:
         spacing_map = (2.0 * params.altitude_m
                        * math.tan(math.radians(half_eff))
                        * (1.0 - params.overlap_pct / 100.0)) / to_m
-        route = plan_route(dtm, polygon, params.altitude_m, spacing_map,
+        # Edge fly-past: buffer the coverage polygon one pass-pitch so passes extend
+        # past the AOI rim. The density estimate below still scores only `polygon`.
+        cover_poly = polygon
+        if params.edge_margin:
+            buffered = polygon.buffer(spacing_map)
+            if not buffered.is_empty and buffered.is_valid:
+                cover_poly = buffered
+        route = plan_route(dtm, cover_poly, params.altitude_m, spacing_map,
                            step_map, elev_sample_step=elev_step_map,
                            min_peak_clearance=params.min_peak_clearance_m)
 
