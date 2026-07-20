@@ -24,7 +24,8 @@
     installer are built for this. Default 3.12.10 (strong binary-wheel coverage).
 
 .PARAMETER KitDir
-    Output folder for the kit. Default C:\arp_offline_kit (kept off OneDrive).
+    Output folder for the kit. Default: offline_kit\ inside the repo (gitignored, so
+    the ~300 MB wheelhouse is never committed).
 
 .PARAMETER RepoRoot
     Repo to package. Default: this script's folder.
@@ -38,8 +39,8 @@
 [CmdletBinding()]
 param(
     [string]$PyVersion = "3.12.10",
-    [string]$KitDir    = "C:\arp_offline_kit",
     [string]$RepoRoot  = $PSScriptRoot,
+    [string]$KitDir    = (Join-Path $RepoRoot "offline_kit"),
     [switch]$SkipPythonInstaller,
     [switch]$SkipBundle
 )

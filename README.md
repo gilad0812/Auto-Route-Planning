@@ -80,12 +80,12 @@ The one online step happens on a connected machine; the standalone never connect
 .\make_offline_kit.ps1 -PyVersion 3.12.10
 ```
 
-This writes `C:\arp_offline_kit\`: a `wheelhouse\` of every dependency (built for the
-target Python / `win_amd64`), the matching CPython installer, a full-history
-`repo.bundle`, and `install_offline.ps1`. Flags: `-KitDir <dir>`,
-`-SkipPythonInstaller`, `-SkipBundle`.
+This writes `offline_kit\` inside the repo (gitignored): a `wheelhouse\` of every
+dependency (built for the target Python / `win_amd64`), the matching CPython
+installer, a full-history `repo.bundle`, and `install_offline.ps1`. Flags:
+`-KitDir <dir>`, `-SkipPythonInstaller`, `-SkipBundle`.
 
-**2. Copy** the whole `C:\arp_offline_kit\` folder to the air-gapped machine.
+**2. Copy** the whole `offline_kit\` folder to the air-gapped machine.
 
 **3. On the air-gapped machine — from inside the kit folder:**
 

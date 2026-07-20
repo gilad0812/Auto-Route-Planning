@@ -9,4 +9,5 @@ __pycache__/
 build/
 dist/
 helios_bin/
+offline_kit/
 *.las
