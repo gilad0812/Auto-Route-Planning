@@ -28,8 +28,6 @@ def lawnmower_waypoints(polygon, spacing, step):
         inter = line.intersection(polygon)
         if not inter.is_empty:
             if inter.geom_type == 'MultiLineString':
-                # .geoms — direct iteration of multi-geometries was removed in
-                # Shapely 2.0; iterating `inter` itself crashes on concave AOIs.
                 for seg in inter.geoms:
                     coords = list(seg.coords)
                     if toggle:
