@@ -40,11 +40,24 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
-exe = EXE(
-    pyz, a.scripts, [],
-    exclude_binaries=True,
-    name='LidarRoutePlanner',
-    console=False,
-    icon=ICON,
-)
-coll = COLLECT(exe, a.binaries, a.datas, name='LidarRoutePlanner')
+# Onedir (default) vs onefile. Set RP_ONEFILE=1 (build.ps1 -OneFile) to get a single
+# movable LidarRoutePlanner.exe. Onefile self-extracts to a temp dir on every launch,
+# so it starts slower and canNOT hold HELIOS (find_helios_binary looks for a helios/
+# folder next to the exe, not inside _MEIPASS) — ship helios/ beside the exe if needed.
+ONEFILE = bool(os.environ.get('RP_ONEFILE'))
+if ONEFILE:
+    exe = EXE(
+        pyz, a.scripts, a.binaries, a.datas, [],
+        name='LidarRoutePlanner',
+        console=False,
+        icon=ICON,
+    )
+else:
+    exe = EXE(
+        pyz, a.scripts, [],
+        exclude_binaries=True,
+        name='LidarRoutePlanner',
+        console=False,
+        icon=ICON,
+    )
+    coll = COLLECT(exe, a.binaries, a.datas, name='LidarRoutePlanner')

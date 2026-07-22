@@ -5,8 +5,8 @@
 
 .DESCRIPTION
     1. Stops any running instance (it would lock files in the bundle).
-    2. Runs PyInstaller (onedir) into a build root OUTSIDE OneDrive, to dodge
-       OneDrive file locks and Windows MAX_PATH issues during the build.
+    2. Runs PyInstaller (onedir) into a build root (default: the repo root, which
+       now lives off OneDrive). build/ and dist/ there are already gitignored.
     3. Copies the HELIOS++ install into the bundle as `helios\`, which the app
        finds first via find_helios_binary() when frozen.
     4. Verifies the bundle is self-contained (app exe + helios++.exe present).
@@ -19,17 +19,28 @@
     Folder holding the HELIOS++ install to bake in. Default C:\helios_bin.
 
 .PARAMETER BuildRoot
-    Where PyInstaller writes build/ and dist/. Default C:\route_planner_build
-    (kept off OneDrive on purpose).
+    Where PyInstaller writes build/ and dist/. Default: the repo root, so both land
+    inside the repo (already gitignored). Pass a different path to build elsewhere.
 
 .PARAMETER SkipHelios
-    Build the exe only; do not copy HELIOS into the bundle.
+    Build the exe only; do not copy HELIOS beside it.
+
+.PARAMETER OneFile
+    Produce a single movable dist\LidarRoutePlanner.exe instead of a onedir folder.
+    It self-extracts to a temp dir on each launch (slower startup) and cannot hold
+    HELIOS inside it. For a truly single file, combine with -SkipHelios; if you need
+    HELIOS validation on the target, the helios\ folder is placed next to the exe and
+    the two must travel together.
+
+.EXAMPLE
+    .\build.ps1 -OneFile -SkipHelios    # one movable .exe, no HELIOS
 #>
 [CmdletBinding()]
 param(
     [string]$HeliosSource = "C:\helios_bin",
-    [string]$BuildRoot    = "C:\route_planner_build",
-    [switch]$SkipHelios
+    [string]$BuildRoot    = $PSScriptRoot,
+    [switch]$SkipHelios,
+    [switch]$OneFile
 )
 
 $ErrorActionPreference = "Stop"
@@ -58,20 +69,32 @@ if ($running) {
     Start-Sleep -Milliseconds 500
 }
 
-# 2. PyInstaller build (onedir) into the off-OneDrive build root.
-Info "Building with PyInstaller -> $DistPath"
+# 2. PyInstaller build. Onedir (default) -> dist\LidarRoutePlanner\ folder;
+#    -OneFile -> a single dist\LidarRoutePlanner.exe (via RP_ONEFILE in the spec).
+$mode = if ($OneFile) { "onefile (single .exe)" } else { "onedir (folder)" }
+Info "Building with PyInstaller [$mode] -> $DistPath"
 Push-Location $RepoRoot
 try {
+    if ($OneFile) { $env:RP_ONEFILE = "1" } else { Remove-Item Env:RP_ONEFILE -ErrorAction SilentlyContinue }
     pyinstaller desktop.spec --noconfirm --distpath $DistPath --workpath $WorkPath
     if (-not $?) { Die "PyInstaller build failed." }
 }
-finally { Pop-Location }
+finally { Pop-Location; Remove-Item Env:RP_ONEFILE -ErrorAction SilentlyContinue }
 
-$AppExe = Join-Path $Bundle "$AppName.exe"
+# Where the app landed, and where a bundled HELIOS must sit to be found (next to the
+# exe, per find_helios_binary): the bundle folder for onedir, dist\ for onefile.
+if ($OneFile) {
+    $AppExe       = Join-Path $DistPath "$AppName.exe"
+    $HeliosParent = $DistPath
+} else {
+    $AppExe       = Join-Path $Bundle "$AppName.exe"
+    $HeliosParent = $Bundle
+}
 if (-not (Test-Path $AppExe)) { Die "Build finished but $AppExe is missing." }
 Ok "App built: $AppExe"
 
-# 3. Bake HELIOS++ into the bundle as helios\.
+# 3. Place HELIOS++ as helios\ next to the exe (skipped for a truly single-file exe
+#    unless you want validation on the target — then it rides alongside the exe).
 if ($SkipHelios) {
     Info "SkipHelios set - not bundling HELIOS."
 }
@@ -79,7 +102,7 @@ else {
     if (-not (Test-Path $HeliosSource)) {
         Die "HELIOS source '$HeliosSource' not found. Pass -HeliosSource <dir> or -SkipHelios."
     }
-    $HeliosDest = Join-Path $Bundle "helios"
+    $HeliosDest = Join-Path $HeliosParent "helios"
     Info "Copying HELIOS++ from $HeliosSource -> $HeliosDest (this can take a while)..."
     if (Test-Path $HeliosDest) { Remove-Item $HeliosDest -Recurse -Force }
     New-Item -ItemType Directory -Path $HeliosDest -Force | Out-Null
@@ -87,10 +110,20 @@ else {
 
     $heliosExe = Get-ChildItem -Path $HeliosDest -Recurse -Filter "helios++.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $heliosExe) { Die "Copied HELIOS but helios++.exe was not found under $HeliosDest." }
-    Ok "HELIOS baked in: $($heliosExe.FullName)"
+    Ok "HELIOS placed beside the exe: $($heliosExe.FullName)"
 }
 
 # 4. Done.
-Ok "Self-contained bundle ready:"
-Write-Host "      $Bundle" -ForegroundColor Green
-Write-Host "Copy that whole folder to the standalone machine and run $AppName.exe." -ForegroundColor Green
+if ($OneFile) {
+    Ok "Single-file app ready:"
+    Write-Host "      $AppExe" -ForegroundColor Green
+    if ($SkipHelios) {
+        Write-Host "Move just that one .exe to the other machine and run it." -ForegroundColor Green
+    } else {
+        Write-Host "Move LidarRoutePlanner.exe AND the helios\ folder together (HELIOS must sit beside the exe)." -ForegroundColor Green
+    }
+} else {
+    Ok "Self-contained bundle ready:"
+    Write-Host "      $Bundle" -ForegroundColor Green
+    Write-Host "Copy that whole folder to the standalone machine and run $AppName.exe." -ForegroundColor Green
+}

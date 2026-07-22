@@ -1,13 +1,29 @@
+# Data / large binaries (DTM, CHM, LAS point clouds, HELIOS install)
 data/*
+helios_bin/
+*.las
+
+# Python
 .venv/
 __pycache__/
 *.pyc
 *.pyo
 .env
-.claude/
-./idea
+
+# Build output — PyInstaller writes build/ and dist/ here
+# (BuildRoot in build.ps1 defaults to the repo root)
 build/
 dist/
-helios_bin/
+
+# Offline dev kit — wheelhouse + Python installer + repo bundle (~300 MB)
 offline_kit/
-*.las
+
+# Editors / IDEs
+.vscode/
+.idea/
+.claude/
+
+# OS cruft
+Thumbs.db
+Desktop.ini
+.DS_Store
