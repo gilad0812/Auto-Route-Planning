@@ -23,6 +23,10 @@ from scanner import (                                      # noqa: E402
 
 _LAT_M = 111139.0
 
+# Max AOI area for one plan. A single drone survey is one flight; capping the AOI also
+# keeps the native window comfortably under the DTM cell cap, so it never decimates.
+MAX_AOI_M2 = 3_000_000  # 3 km²
+
 # Scan (mirror) line rate is DERIVED for an isotropic point pattern from the flight
 # geometry + pulse rate (scanner.scan_lines_for_square_pattern), not anchored to a
 # nominal. It cancels out of the density estimate (average density is invariant to
@@ -123,8 +127,26 @@ def _path_length_m(route, is_geo):
     return tot
 
 
+def _aoi_native(dtm, polygon, params: PlanParams, half_deg):
+    """For a large DTM (held out of RAM), materialise just the AOI window at NATIVE
+    resolution so planning/estimation get a contiguous full-detail block with RAM
+    bounded by the AOI, not the whole raster. No-op for a DTM already in RAM (small
+    raster, or an AOI window). `half_deg` sizes the rim margin (strip sampling + edge
+    fly-past)."""
+    if dtm is None or getattr(dtm, 'array', None) is not None:
+        return dtm
+    bs = (2.0 * params.altitude_m * math.tan(math.radians(half_deg))
+          * (1.0 - params.overlap_pct / 100.0))
+    return dtm.read_window(polygon.bounds, margin_m=2.5 * bs + 10.0)
+
+
 def compute_plan(dtm, polygon, params: PlanParams, chm=None, is_geo=True):
     """Run plan + density estimate for one AOI. Returns a PlanResult."""
+    area = polygon_area_m2(polygon, is_geo)
+    if area > MAX_AOI_M2:
+        raise ValueError(
+            f'AOI is {area / 1e6:.2f} km² — over the {MAX_AOI_M2 / 1e6:.0f} km² limit '
+            f'for one plan. Draw a smaller area.')
     to_m = _LAT_M if is_geo else 1.0
     step_map = params.step_m / to_m
     dtm_res_map = min(abs(dtm.src.res[0]), abs(dtm.src.res[1]))
@@ -143,6 +165,12 @@ def compute_plan(dtm, polygon, params: PlanParams, chm=None, is_geo=True):
             f'{rng:.0f} m at {params.pulse_freq_hz:,} Hz (>=20 % reflectivity) — '
             f'no ground returns even at nadir. Lower the AGL or the pulse rate.')
     half_eff = min(half, math.degrees(math.acos(params.altitude_m / rng)))
+
+    # Large DTM: materialise the AOI window at native resolution (RAM bounded by the
+    # AOI). No-op for a DTM already in RAM. src.res stays native, so the sampling steps
+    # above are unchanged.
+    dtm = _aoi_native(dtm, polygon, params, half_eff)
+    chm = _aoi_native(chm, polygon, params, half_eff)
 
     if params.adaptive_spacing:
         route = plan_route_adaptive(
@@ -180,6 +208,9 @@ def estimate_for_route(dtm, polygon, route, params: PlanParams, chm=None, is_geo
     """Run the density estimate + route stats for an already-built route over the
     AOI. Used both for a freshly planned route and after manually adding passes."""
     half = params.fov_deg / 2.0
+    # Native-res AOI window for a large DTM (no-op if already in RAM / already windowed).
+    dtm = _aoi_native(dtm, polygon, params, half)
+    chm = _aoi_native(chm, polygon, params, half)
     res = PlanResult(route=route, polygon=polygon)
     res.area_m2 = polygon_area_m2(polygon, is_geo)
     if not route:

@@ -46,7 +46,9 @@ class InteractiveDTMViewer:
 
     def _draw_dtm(self):
         src = self.dtm.src
-        arr = self.dtm.array.astype(float)
+        # Large DTMs hold no full array in RAM — use the bounded display overview.
+        base = self.dtm.array if self.dtm.array is not None else self.dtm.overview_array()[0]
+        arr = base.astype(float)
         if self.dtm.nodata is not None:
             arr[arr == self.dtm.nodata] = np.nan
 

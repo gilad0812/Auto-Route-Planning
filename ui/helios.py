@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 
 from helios_integration import run_feedback_loop          # noqa: E402
 from terrain_converter import dtm_to_obj                  # noqa: E402
+from dtm import DTM                                        # noqa: E402
 from helios_setup import find_helios_binary               # noqa: E402
 from helios_config import DEFAULT_SCANNER_REF, DEFAULT_PLATFORM_REF  # noqa: E402
 
@@ -72,6 +73,19 @@ class HeliosWorker(QThread):
 
             self.log.emit('Running HELIOS++ simulation…')
             region = list(self.polygon.exterior.coords)
+            # DTM for the density comparison. A small DTM is fully in RAM (numpy — safe
+            # to read from this worker thread while the UI reads it too). A large DTM
+            # holds no full array, so open our OWN handle here (GDAL datasets aren't
+            # thread-safe to share) and take the native AOI window.
+            if getattr(self.dtm, 'array', None) is not None:
+                cmp_dtm = self.dtm
+            else:
+                cmp_dtm = DTM(self.dtm_path).read_window(
+                    self.polygon.bounds, margin_m=swath_m)
+            # A large CHM (no full array, no path plumbed here) is dropped for the
+            # comparison rather than dereferenced — HELIOS still runs, just unmasked.
+            cmp_chm = self.chm if (self.chm is None
+                                   or getattr(self.chm, 'array', None) is not None) else None
             res = run_feedback_loop(
                 route=self.route, helios_bin=self.helios_bin,
                 scene_obj_path=obj, work_dir=self.work_dir, is_geo=self.is_geo,
@@ -79,8 +93,8 @@ class HeliosWorker(QThread):
                 min_points=int(p.min_points), speed_ms=float(p.speed_ms),
                 pulse_freq_hz=int(p.pulse_freq_hz), scan_freq_hz=float(p.scan_freq_hz),
                 scan_angle_deg=half, scanner_ref=DEFAULT_SCANNER_REF,
-                platform_ref=DEFAULT_PLATFORM_REF, dtm=self.dtm,
-                region_polygon=region, chm=self.chm,
+                platform_ref=DEFAULT_PLATFORM_REF, dtm=cmp_dtm,
+                region_polygon=region, chm=cmp_chm,
                 veg_penetration=float(p.veg_penetration),
                 log=lambda m: self.log.emit(m), stop_event=self._stop,
             )

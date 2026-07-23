@@ -14,7 +14,7 @@ from matplotlib import colors as mcolors
 
 from PySide6.QtCore import Qt, Signal, QPointF, QRectF
 from PySide6.QtGui import (
-    QImage, QPixmap, QPainter, QPen, QColor, QBrush, QPolygonF, QCursor,
+    QImage, QPixmap, QPainter, QPen, QColor, QBrush, QPolygonF, QCursor, QTransform,
 )
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGraphicsView, QGraphicsScene,
@@ -129,6 +129,7 @@ class CanvasMap(QWidget):
         self.dtm = None
         self.chm = None
         self._inv = None                 # world -> pixel
+        self._disp_transform = None      # scene(overview) pixel -> world; None until loaded
         self.drawing = False
         self.drawing_pass = False
         self._verts = []                 # scene QPointF vertices in progress
@@ -179,26 +180,44 @@ class CanvasMap(QWidget):
     # ----------------------------------------------------------- data
     def set_dtm(self, dtm, dtm_path=None, chm=None, chm_path=None):
         self.dtm = dtm; self.chm = chm
-        self._inv = ~dtm.transform
         self.scene.clear()
         self._aoi_item = self._route_group = self._density_item = None
         self._helios_item = self._chm_item = None; self._home_item = None
         self._verts = []; self._draw_items = []; self._pass_segs = []
         self._pass_anchor = None; self._pass_preview = None
+        self._disp_transform = None; self._inv = None
         self.drawing_pass = False; self.btn_pass.setChecked(False)
         self.btn_pass.setEnabled(False)
 
-        self._relief = _shaded_relief(dtm.array, dtm.nodata)
+        # DISPLAY only: a bounded, decimated whole-extent overview (read once). The scene
+        # IS this overview's pixel grid; the full-resolution raster is never rendered, so
+        # a giga-pixel DTM shows and pans like a small one with bounded memory. Planning
+        # still reads native resolution (planning._aoi_native). For a large DTM this read
+        # scans the whole file once — a few seconds at load, then the map is static.
+        self._render_overview(*dtm.overview_array(), chm)
+
+    def _render_overview(self, disp, disp_t, stride, chm):
+        """Build the static relief pixmap (+ CHM overlay) from the display overview and
+        set up the scene coordinate system. Runs on the GUI thread."""
+        self._disp_transform = disp_t
+        self._disp_stride = stride
+        self._inv = ~disp_t
+        self._relief = _shaded_relief(disp, self.dtm.nodata)
         h, w, _ = self._relief.shape
         img = QImage(self._relief.data, w, h, 3 * w, QImage.Format_RGB888)
         self.scene.addItem(QGraphicsPixmapItem(QPixmap.fromImage(img)))
         self.scene.setSceneRect(QRectF(0, 0, w, h))
 
         if chm is not None:
-            self._chm_rgba = _chm_rgba(chm.array, chm.nodata)
+            # CHM's own bounded overview; a transform places it in the DTM scene grid so
+            # it lands correctly even at a different resolution/extent.
+            cdisp, chm_t, _cs = chm.overview_array()
+            self._chm_rgba = _chm_rgba(cdisp, chm.nodata)
             ch, cw, _ = self._chm_rgba.shape
             cimg = QImage(self._chm_rgba.data, cw, ch, 4 * cw, QImage.Format_RGBA8888)
             self._chm_item = QGraphicsPixmapItem(QPixmap.fromImage(cimg))
+            m = self._inv * chm_t
+            self._chm_item.setTransform(QTransform(m.a, m.d, m.b, m.e, m.c, m.f))
             self._chm_item.setVisible(self.btn_chm.isChecked())
             self.scene.addItem(self._chm_item)
             self.btn_chm.setEnabled(True)
@@ -212,7 +231,7 @@ class CanvasMap(QWidget):
 
     # ----------------------------------------------------------- coords
     def _world(self, sp):
-        x, y = self.dtm.transform * (sp.x(), sp.y())
+        x, y = self._disp_transform * (sp.x(), sp.y())
         return x, y
 
     def _scene(self, lon, lat):
@@ -361,7 +380,7 @@ class CanvasMap(QWidget):
     def clear(self):
         """Full reset to the empty state (used when the DTM is cleared)."""
         self.scene.clear()
-        self.dtm = None; self.chm = None; self._inv = None
+        self.dtm = None; self.chm = None; self._inv = None; self._disp_transform = None
         self._aoi_item = self._route_group = self._density_item = None
         self._helios_item = self._chm_item = None; self._home_item = None
         self._verts = []; self._draw_items = []; self._pass_segs = []
@@ -523,9 +542,11 @@ class CanvasMap(QWidget):
         grp.addToGroup(m)
 
     def _pixel_m(self):
+        # metres per SCENE pixel = stride native pixels (the scene is the display overview).
+        s = getattr(self, '_disp_stride', 1)
         rx, ry = abs(self.dtm.src.res[0]), abs(self.dtm.src.res[1])
         crs = self.dtm.src.crs
         if crs is not None and crs.is_geographic:
             lat0 = (self.dtm.src.bounds.bottom + self.dtm.src.bounds.top) / 2
-            return (rx * _LAT_M * math.cos(math.radians(lat0)) + ry * _LAT_M) / 2
-        return (rx + ry) / 2
+            return s * (rx * _LAT_M * math.cos(math.radians(lat0)) + ry * _LAT_M) / 2
+        return s * (rx + ry) / 2

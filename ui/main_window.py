@@ -19,7 +19,8 @@ from PySide6.QtWidgets import (
 
 from .planning import (PlanParams, compute_plan, load_dtm, chm_compatible,
                        scan_lines_for_square_pattern, build_manual_pass,
-                       estimate_for_route, _path_length_m, _LAT_M)
+                       estimate_for_route, polygon_area_m2, MAX_AOI_M2,
+                       _path_length_m, _LAT_M)
 
 try:
     from .canvasmap import CanvasMap, FAILURE_REASON_STYLE, FAILURE_REASON_LABEL
@@ -504,7 +505,7 @@ class MainWindow(QMainWindow):
         self.dtm_path = path
         crs = self.dtm.src.crs
         self.is_geo = crs.is_geographic if crs else True
-        h, w = self.dtm.array.shape
+        w, h = self.dtm.src.width, self.dtm.src.height     # native size (array may be windowed)
         self.lbl_dtm.setText(f'DTM: {path}\n{w}×{h} px · CRS {crs}')
         self.home = None; self.home_ground = float('nan')   # new area
         self.lbl_home.setText('Home: (none)')
@@ -651,6 +652,16 @@ class MainWindow(QMainWindow):
                 poly = poly.buffer(0)
         except Exception as e:
             self.statusBar().showMessage(f'Bad polygon: {e}'); return
+        area = polygon_area_m2(poly, self.is_geo)
+        if area > MAX_AOI_M2:
+            self.drawn_polygon = None
+            self.btn_compute.setEnabled(False)
+            self.lbl_aoi.setText(
+                f'⚠ AOI is {area / 1e6:.2f} km² — over the {MAX_AOI_M2 / 1e6:.0f} km² '
+                f'limit. Draw a smaller area.')
+            self.statusBar().showMessage(
+                f'AOI too large ({area / 1e6:.2f} km²); max {MAX_AOI_M2 / 1e6:.0f} km².')
+            return
         self.drawn_polygon = poly
         self._clear_results()                 # previous route no longer matches AOI
         self.lbl_aoi.setText('✓ AOI set from the drawn polygon.')
