@@ -7,6 +7,7 @@ the existing model and fills the Summary panel.
 import csv
 import json
 import math
+import os
 
 from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QAction
@@ -40,7 +41,8 @@ except Exception as _e:
         "gap": ("Not covered", "spacing / AOI edge"),
     }
 
-from shapely.geometry import shape as shapely_shape
+from shapely.geometry import shape as shapely_shape, box as shapely_box
+from shapely.wkt import loads as wkt_loads
 
 PULSE_FREQS = (150_000, 300_000, 600_000, 1_200_000, 1_800_000, 2_400_000)
 
@@ -110,6 +112,7 @@ class MainWindow(QMainWindow):
         self.survey_route = []           # survey waypoints (base for home legs)
         self.result = None               # effective result = survey + in-AOI home legs
         self.drawn_polygon = None        # shapely Polygon drawn on the map
+        self._map_focused = False        # map zoomed to the AOI (vs full-extent overview)
         self.home = None                 # takeoff/return-home (lon, lat) or None
         self.home_ground = float('nan')  # terrain elevation at home, if in the DTM
 
@@ -149,8 +152,11 @@ class MainWindow(QMainWindow):
         m = self.menuBar().addMenu('&File')
         a_dtm = QAction('Open DTM…', self); a_dtm.triggered.connect(self._open_dtm)
         a_chm = QAction('Open CHM…', self); a_chm.triggered.connect(self._open_chm)
+        a_wkt = QAction('Load AOI (.wkt)…', self)
+        a_wkt.triggered.connect(self._load_wkt_aoi)
         a_quit = QAction('Quit', self); a_quit.triggered.connect(self.close)
-        m.addAction(a_dtm); m.addAction(a_chm); m.addSeparator(); m.addAction(a_quit)
+        m.addAction(a_dtm); m.addAction(a_chm); m.addAction(a_wkt)
+        m.addSeparator(); m.addAction(a_quit)
 
         mv = self.menuBar().addMenu('&View')
         self.act_profile = QAction('Elevation profile', self, checkable=True)
@@ -413,6 +419,7 @@ class MainWindow(QMainWindow):
             self.mapview = CanvasMap()
             self.mapview.polygonDrawn.connect(self._on_polygon_drawn)
             self.mapview.passDrawn.connect(self._on_pass_drawn)
+            self.mapview.focusToggled.connect(self._on_map_focus_toggled)
             return self.mapview
         self.mapview = None
         return self._stub('🗺  Map canvas failed to load.\n' + (_MAPVIEW_ERR or ''))
@@ -584,6 +591,49 @@ class MainWindow(QMainWindow):
             return None
         return coords
 
+    def _load_wkt_aoi(self):
+        """Load an AOI polygon from a .wkt file (coordinates in the DTM's CRS) and focus
+        the map on it at native resolution — the way to view the relevant part of a huge
+        DTM sharply instead of the coarse whole-extent overview."""
+        if self.dtm is None:
+            QMessageBox.information(self, 'AOI', 'Open a DTM first.'); return
+        path, _ = QFileDialog.getOpenFileName(
+            self, 'Load AOI polygon', '', 'WKT (*.wkt *.txt);;All files (*)')
+        if not path:
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                geom = wkt_loads(f.read().strip())
+        except Exception as e:
+            QMessageBox.critical(self, 'AOI', f'Could not read WKT:\n{e}'); return
+        # Reduce to a single polygon.
+        if geom.geom_type == 'Polygon':
+            poly = geom
+        elif geom.geom_type in ('MultiPolygon', 'GeometryCollection'):
+            poly = geom.convex_hull                      # a valid single Polygon
+        else:
+            QMessageBox.warning(
+                self, 'AOI', f'WKT must be a polygon (got {geom.geom_type}).'); return
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+        if poly.is_empty or poly.geom_type != 'Polygon':
+            QMessageBox.warning(self, 'AOI', 'WKT polygon is empty or invalid.'); return
+        # WKT carries no CRS, so its coordinates must be in the DTM's frame; require overlap.
+        b = self.dtm.src.bounds
+        if not poly.intersects(shapely_box(b.left, b.bottom, b.right, b.top)):
+            QMessageBox.warning(
+                self, 'AOI', 'The polygon does not overlap the DTM.\nIts coordinates '
+                'must be in the same CRS as the DTM.'); return
+        # Reuse the drawn-polygon path: applies the 3 km² cap, sets state, enables Compute.
+        ext = [list(c) for c in poly.exterior.coords]
+        self._on_polygon_drawn({'type': 'Polygon', 'coordinates': [ext]})
+        if self.drawn_polygon is None:                   # rejected by the area cap
+            return
+        self._render_map(focus=True)                     # focus the map on the AOI
+        self.lbl_aoi.setText('✓ AOI loaded from WKT — map focused at native resolution.')
+        self.statusBar().showMessage(
+            f'AOI from {os.path.basename(path)}; map focused on the area.')
+
     def _open_chm(self):
         if self.dtm is None:
             QMessageBox.information(self, 'CHM', 'Open a DTM first.'); return
@@ -620,8 +670,43 @@ class MainWindow(QMainWindow):
             self._set_busy(True, 'Rendering terrain…')
             try:
                 self.mapview.set_dtm(self.dtm, self.dtm_path, self.chm, self.chm_path)
+                self._map_focused = False          # whole extent
+                self._sync_focus_button()
             finally:
                 self._set_busy(False)
+
+    def _sync_focus_button(self):
+        """Reflect the focus state on the map's ◎ AOI toggle without re-triggering it."""
+        if self.mapview is None:
+            return
+        b = self.mapview.btn_focus
+        b.blockSignals(True)
+        b.setChecked(self._map_focused)
+        b.setEnabled(self.drawn_polygon is not None)
+        b.blockSignals(False)
+
+    def _render_map(self, focus):
+        """Render the map base (focused on the AOI, or the full extent) and re-apply the
+        AOI outline + route/density/home overlays on top."""
+        if self.mapview is None or self.dtm is None:
+            return
+        self._map_focused = bool(focus and self.drawn_polygon is not None)
+        if self._map_focused:
+            area = polygon_area_m2(self.drawn_polygon, self.is_geo)
+            self.mapview.focus_on(self.drawn_polygon,
+                                  margin_m=max(200.0, 0.15 * math.sqrt(area)))
+        else:
+            self.mapview.show_full()
+        self._sync_focus_button()
+        if self.drawn_polygon is not None:
+            self.mapview.set_aoi_polygon(list(self.drawn_polygon.exterior.coords))
+        if self.result and self.result.route:
+            self._render_map_overlays(self.result)
+        else:
+            self._show_home()
+
+    def _on_map_focus_toggled(self, on):
+        self._render_map(focus=on)
 
     def _clear_results(self):
         """Drop the computed route/estimate and its on-screen traces, so stale
@@ -666,6 +751,11 @@ class MainWindow(QMainWindow):
         self._clear_results()                 # previous route no longer matches AOI
         self.lbl_aoi.setText('✓ AOI set from the drawn polygon.')
         self.btn_compute.setEnabled(True)
+        # If the map is focused, follow the new AOI; otherwise just enable the toggle.
+        if self._map_focused:
+            self._render_map(focus=True)
+        else:
+            self._sync_focus_button()
         self.statusBar().showMessage('AOI set from drawn polygon. Click Compute.')
 
     def _clear_aoi(self):

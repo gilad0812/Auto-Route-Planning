@@ -25,6 +25,13 @@ from PySide6.QtGui import QPainterPath
 
 _LAT_M = 111139.0
 
+# Display budget (cells) for a focused AOI window (Load AOI .wkt). Larger than the
+# whole-extent budget: a focused region is bounded, so we can afford to show it at (near)
+# native resolution. A 3 km² AOI at 0.5 m (~12M cells, +margin) lands under this, so it
+# renders native. Beyond it the region is decimated to fit (still far sharper than the
+# whole-extent view).
+_FOCUS_DISP_CELLS = 16_000_000
+
 # Under-density overlay palette, keyed by the estimator's failure CAUSE. Shared
 # with the summary legend so map colours and text agree. (hex, alpha).
 FAILURE_REASON_STYLE = {
@@ -123,12 +130,14 @@ class _View(QGraphicsView):
 class CanvasMap(QWidget):
     polygonDrawn = Signal(object)        # emits a GeoJSON Polygon geometry dict
     passDrawn = Signal(object)           # emits (lon,lat) — the END of a new pass (start = route end)
+    focusToggled = Signal(bool)          # Focus/Full toggle: True = focus on the AOI
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.dtm = None
         self.chm = None
         self._inv = None                 # world -> pixel
+        self._focus_polygon = None       # AOI the map is focused on, or None (full extent)
         self._disp_transform = None      # scene(overview) pixel -> world; None until loaded
         self.drawing = False
         self.drawing_pass = False
@@ -160,11 +169,16 @@ class CanvasMap(QWidget):
         self.btn_pass.clicked.connect(self._toggle_pass)
         self.btn_fit = QToolButton(); self.btn_fit.setText('⤢ Fit')
         self.btn_fit.clicked.connect(self._fit)
+        self.btn_focus = QToolButton(); self.btn_focus.setText('◎ AOI')
+        self.btn_focus.setCheckable(True); self.btn_focus.setEnabled(False)
+        self.btn_focus.setToolTip('Zoom the map to the AOI at native resolution; '
+                                  'toggle off to show the full DTM.')
+        self.btn_focus.toggled.connect(self.focusToggled)
         self.btn_chm = QToolButton(); self.btn_chm.setText('CHM')
         self.btn_chm.setCheckable(True); self.btn_chm.setEnabled(False)
         self.btn_chm.clicked.connect(self._toggle_chm)
         for b in (self.btn_draw, self.btn_finish, self.btn_pass,
-                  self.btn_fit, self.btn_chm):
+                  self.btn_fit, self.btn_focus, self.btn_chm):
             bar.addWidget(b)
         bar.addStretch(1)
         self.lbl_coord = QLabel(''); self.lbl_coord.setStyleSheet('color:#9aa0a6;')
@@ -178,8 +192,7 @@ class CanvasMap(QWidget):
         v.addWidget(self.view, 1)
 
     # ----------------------------------------------------------- data
-    def set_dtm(self, dtm, dtm_path=None, chm=None, chm_path=None):
-        self.dtm = dtm; self.chm = chm
+    def _reset_scene(self):
         self.scene.clear()
         self._aoi_item = self._route_group = self._density_item = None
         self._helios_item = self._chm_item = None; self._home_item = None
@@ -189,12 +202,41 @@ class CanvasMap(QWidget):
         self.drawing_pass = False; self.btn_pass.setChecked(False)
         self.btn_pass.setEnabled(False)
 
+    def set_dtm(self, dtm, dtm_path=None, chm=None, chm_path=None):
+        self.dtm = dtm; self.chm = chm
+        self._focus_polygon = None
+        self._reset_scene()
         # DISPLAY only: a bounded, decimated whole-extent overview (read once). The scene
         # IS this overview's pixel grid; the full-resolution raster is never rendered, so
         # a giga-pixel DTM shows and pans like a small one with bounded memory. Planning
         # still reads native resolution (planning._aoi_native). For a large DTM this read
         # scans the whole file once — a few seconds at load, then the map is static.
         self._render_overview(*dtm.overview_array(), chm)
+
+    def focus_on(self, polygon, margin_m=250.0):
+        """Render ONLY the DTM window around `polygon` (+ margin) at ~native resolution.
+        For a giga-pixel DTM this shows the relevant area SHARPLY (a bounded region fits
+        the display budget natively) instead of the coarse whole-extent overview. Renders
+        the base layer only; the caller re-applies the AOI + route overlays. `polygon` is
+        a shapely Polygon in the DTM's CRS."""
+        if self.dtm is None:
+            return
+        self._focus_polygon = polygon
+        self._reset_scene()
+        view = self.dtm.read_window(polygon.bounds, margin_m=margin_m)
+        self._render_overview(*view.overview_array(_FOCUS_DISP_CELLS), self.chm)
+        self._fit()
+
+    def show_full(self):
+        """Render the whole-extent overview (undo a focus). Base layer only; the caller
+        re-applies the AOI + route overlays. The overview is cached on the DTM, so this
+        is instant after the initial load."""
+        if self.dtm is None:
+            return
+        self._focus_polygon = None
+        self._reset_scene()
+        self._render_overview(*self.dtm.overview_array(), self.chm)
+        self._fit()
 
     def _render_overview(self, disp, disp_t, stride, chm):
         """Build the static relief pixmap (+ CHM overlay) from the display overview and
@@ -381,6 +423,7 @@ class CanvasMap(QWidget):
         """Full reset to the empty state (used when the DTM is cleared)."""
         self.scene.clear()
         self.dtm = None; self.chm = None; self._inv = None; self._disp_transform = None
+        self._focus_polygon = None
         self._aoi_item = self._route_group = self._density_item = None
         self._helios_item = self._chm_item = None; self._home_item = None
         self._verts = []; self._draw_items = []; self._pass_segs = []
@@ -388,6 +431,9 @@ class CanvasMap(QWidget):
         self.drawing = False; self.drawing_pass = False
         self.btn_draw.setChecked(False)
         self.btn_pass.setChecked(False); self.btn_pass.setEnabled(False)
+        self.btn_focus.blockSignals(True)
+        self.btn_focus.setChecked(False); self.btn_focus.setEnabled(False)
+        self.btn_focus.blockSignals(False)
         self.view.setDragMode(QGraphicsView.ScrollHandDrag)
         self.view.setCursor(Qt.ArrowCursor)
         self.btn_chm.setChecked(False); self.btn_chm.setEnabled(False)
