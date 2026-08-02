@@ -41,7 +41,7 @@ except Exception as _e:
         "gap": ("Not covered", "spacing / AOI edge"),
     }
 
-from shapely.geometry import shape as shapely_shape, box as shapely_box
+from shapely.geometry import shape as shapely_shape, box as shapely_box, MultiPoint
 from shapely.wkt import loads as wkt_loads
 
 PULSE_FREQS = (150_000, 300_000, 600_000, 1_200_000, 1_800_000, 2_400_000)
@@ -113,6 +113,9 @@ class MainWindow(QMainWindow):
         self.result = None               # effective result = survey + in-AOI home legs
         self.drawn_polygon = None        # shapely Polygon drawn on the map
         self._map_focused = False        # map zoomed to the AOI (vs full-extent overview)
+        self.loaded_route = None         # operator route from .wkt (list of waypoints), for pass selection
+        self._route_active = False       # a confirmed uploaded route is active (Compute re-estimates it)
+        self._pending_aoi = None         # AOI loaded before a DTM — crop to it on the next Open DTM
         self.home = None                 # takeoff/return-home (lon, lat) or None
         self.home_ground = float('nan')  # terrain elevation at home, if in the DTM
 
@@ -154,8 +157,10 @@ class MainWindow(QMainWindow):
         a_chm = QAction('Open CHM…', self); a_chm.triggered.connect(self._open_chm)
         a_wkt = QAction('Load AOI (.wkt)…', self)
         a_wkt.triggered.connect(self._load_wkt_aoi)
+        a_route = QAction('Load route (.wkt)…', self)
+        a_route.triggered.connect(self._load_wkt_route)
         a_quit = QAction('Quit', self); a_quit.triggered.connect(self.close)
-        m.addAction(a_dtm); m.addAction(a_chm); m.addAction(a_wkt)
+        m.addAction(a_dtm); m.addAction(a_chm); m.addAction(a_wkt); m.addAction(a_route)
         m.addSeparator(); m.addAction(a_quit)
 
         mv = self.menuBar().addMenu('&View')
@@ -420,6 +425,7 @@ class MainWindow(QMainWindow):
             self.mapview.polygonDrawn.connect(self._on_polygon_drawn)
             self.mapview.passDrawn.connect(self._on_pass_drawn)
             self.mapview.focusToggled.connect(self._on_map_focus_toggled)
+            self.mapview.passesConfirmed.connect(self._confirm_selected_passes)
             return self.mapview
         self.mapview = None
         return self._stub('🗺  Map canvas failed to load.\n' + (_MAPVIEW_ERR or ''))
@@ -516,13 +522,52 @@ class MainWindow(QMainWindow):
         self.lbl_dtm.setText(f'DTM: {path}\n{w}×{h} px · CRS {crs}')
         self.home = None; self.home_ground = float('nan')   # new area
         self.lbl_home.setText('Home: (none)')
+        self.loaded_route = None; self._set_route_mode(False)
+        self._clear_results()
+        if self._pending_aoi is not None:
+            poly, self._pending_aoi = self._pending_aoi, None
+            self._open_dtm_cropped(poly)
+        else:
+            self._open_dtm_full()
+
+    def _open_dtm_full(self):
+        """Show the whole-extent overview (default DTM view)."""
         self.drawn_polygon = None
         self.btn_compute.setEnabled(False)
         self.lbl_aoi.setText('Draw a polygon on the map to set the AOI.')
-        self._clear_results()
         self._refresh_map()
-        self.statusBar().showMessage('DTM loaded. Draw an AOI on the map, '
-                                     'then Compute.')
+        self.statusBar().showMessage('DTM loaded. Draw an AOI on the map, then Compute.')
+
+    def _open_dtm_cropped(self, poly):
+        """Render the just-opened DTM cropped to a pending AOI instead of the whole extent
+        — reads only that window, so a giga-pixel DTM opens without the slow full-extent
+        scan. Falls back to the full view if the AOI doesn't fit the DTM."""
+        b = self.dtm.src.bounds
+        area = polygon_area_m2(poly, self.is_geo)
+        if not poly.intersects(shapely_box(b.left, b.bottom, b.right, b.top)):
+            QMessageBox.warning(
+                self, 'AOI', 'The loaded AOI does not overlap this DTM — showing the full '
+                'extent. Its coordinates must be in the DTM CRS.')
+            self._open_dtm_full(); return
+        if area > MAX_AOI_M2:
+            QMessageBox.warning(
+                self, 'AOI', f'The loaded AOI is {area / 1e6:.2f} km² — over the '
+                f'{MAX_AOI_M2 / 1e6:.0f} km² limit; showing the full extent.')
+            self._open_dtm_full(); return
+        self.drawn_polygon = poly
+        self._map_focused = True
+        self._set_busy(True, 'Cropping the DTM to the AOI…')
+        try:
+            self.mapview.set_dtm(self.dtm, self.dtm_path, self.chm, self.chm_path,
+                                 focus_polygon=poly)
+            self.mapview.set_aoi_polygon(list(poly.exterior.coords))
+        finally:
+            self._set_busy(False)
+        self._sync_focus_button()
+        self.btn_compute.setEnabled(True)
+        self.lbl_aoi.setText('✓ AOI loaded — DTM cropped to it (map focused).')
+        self.statusBar().showMessage(
+            'DTM opened cropped to the AOI — full-extent render skipped.')
 
     def _clear_dtm(self):
         """Drop the loaded DTM (and the CHM/AOI/results that depend on it) and
@@ -531,6 +576,7 @@ class MainWindow(QMainWindow):
         self.chm = None; self.chm_path = None
         self.is_geo = True
         self.drawn_polygon = None
+        self.loaded_route = None; self._set_route_mode(False)
         self.home = None; self.home_ground = float('nan')
         self.lbl_dtm.setText('DTM: (none)')
         self.lbl_chm.setText('CHM: (none)')
@@ -592,11 +638,9 @@ class MainWindow(QMainWindow):
         return coords
 
     def _load_wkt_aoi(self):
-        """Load an AOI polygon from a .wkt file (coordinates in the DTM's CRS) and focus
-        the map on it at native resolution — the way to view the relevant part of a huge
-        DTM sharply instead of the coarse whole-extent overview."""
-        if self.dtm is None:
-            QMessageBox.information(self, 'AOI', 'Open a DTM first.'); return
+        """Load an AOI polygon from a .wkt file (coordinates in the DTM's CRS). With a DTM
+        open, focus the map on it at native resolution. WITHOUT a DTM, remember it and crop
+        the DTM to it on the next Open DTM — skipping the slow whole-extent render."""
         path, _ = QFileDialog.getOpenFileName(
             self, 'Load AOI polygon', '', 'WKT (*.wkt *.txt);;All files (*)')
         if not path:
@@ -618,13 +662,20 @@ class MainWindow(QMainWindow):
             poly = poly.buffer(0)
         if poly.is_empty or poly.geom_type != 'Polygon':
             QMessageBox.warning(self, 'AOI', 'WKT polygon is empty or invalid.'); return
+        if self.dtm is None:
+            # No DTM yet — remember it; Open DTM will crop to it (CRS is checked then).
+            self._pending_aoi = poly
+            self.lbl_aoi.setText('AOI loaded — open a DTM to crop straight to it.')
+            self.statusBar().showMessage(
+                'AOI stored. File > Open DTM to render only this area (skips the full map).')
+            return
         # WKT carries no CRS, so its coordinates must be in the DTM's frame; require overlap.
         b = self.dtm.src.bounds
         if not poly.intersects(shapely_box(b.left, b.bottom, b.right, b.top)):
             QMessageBox.warning(
                 self, 'AOI', 'The polygon does not overlap the DTM.\nIts coordinates '
                 'must be in the same CRS as the DTM.'); return
-        # Reuse the drawn-polygon path: applies the 3 km² cap, sets state, enables Compute.
+        # Reuse the drawn-polygon path: applies the area cap, sets state, enables Compute.
         ext = [list(c) for c in poly.exterior.coords]
         self._on_polygon_drawn({'type': 'Polygon', 'coordinates': [ext]})
         if self.drawn_polygon is None:                   # rejected by the area cap
@@ -633,6 +684,122 @@ class MainWindow(QMainWindow):
         self.lbl_aoi.setText('✓ AOI loaded from WKT — map focused at native resolution.')
         self.statusBar().showMessage(
             f'AOI from {os.path.basename(path)}; map focused on the area.')
+
+    def _passes_region(self, pts):
+        """A polygon covering `pts` [(lon,lat)] — the convex hull, buffered to a real
+        area when the points are collinear (a single straight pass)."""
+        hull = MultiPoint(list(pts)).convex_hull
+        if hull.geom_type != 'Polygon':
+            hull = hull.buffer(0.0005 if self.is_geo else 50.0)
+        return hull
+
+    def _load_wkt_route(self):
+        """Load an operator-built route from a 3D .wkt (each LINESTRING = one pass, with
+        Z = flight altitude), draw the passes on the map, and let the operator click the
+        ones relevant for point-cloud production; Confirm then runs the density estimate
+        over the CURRENT AOI exactly like an auto-computed plan. Requires an AOI first.
+        Coordinates must be in the DTM's CRS."""
+        if self.dtm is None:
+            QMessageBox.information(self, 'Route', 'Open a DTM first.'); return
+        if self.drawn_polygon is None:
+            QMessageBox.information(
+                self, 'Route', 'Set an AOI first (draw one, or Load AOI), then load a '
+                'route to estimate inside it.'); return
+        path, _ = QFileDialog.getOpenFileName(
+            self, 'Load route', '', 'WKT (*.wkt *.txt);;All files (*)')
+        if not path:
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                geom = wkt_loads(f.read().strip())
+        except Exception as e:
+            QMessageBox.critical(self, 'Route', f'Could not read WKT:\n{e}'); return
+        if geom.geom_type == 'LineString':
+            lines = [geom]
+        elif geom.geom_type == 'MultiLineString':
+            lines = list(geom.geoms)
+        elif geom.geom_type == 'GeometryCollection':
+            lines = [g for g in geom.geoms if g.geom_type == 'LineString']
+        else:
+            QMessageBox.warning(
+                self, 'Route', f'WKT must contain line passes (got {geom.geom_type}).')
+            return
+        lines = [ln for ln in lines if not ln.is_empty and len(ln.coords) >= 2]
+        if not lines:
+            QMessageBox.warning(self, 'Route', 'No valid passes (line strings) in the file.')
+            return
+        if not all(ln.has_z for ln in lines):
+            QMessageBox.warning(
+                self, 'Route', 'Route must be 3D — every vertex needs a Z (flight '
+                'altitude). Re-export the route with heights.')
+            return
+        # Each line -> one pass; its vertices' Z are the flight altitudes.
+        route, pass_pts = [], []
+        for pid, ln in enumerate(lines, start=1):
+            cs = list(ln.coords)                         # (x, y, z) tuples
+            for x, y, z in cs:
+                route.append({'x': x, 'y': y, 'z': float(z),
+                              'pass_id': pid, 'target_distance': None})
+            pass_pts.append((pid, [(x, y) for x, y, *_ in cs]))
+        allpts = [(wp['x'], wp['y']) for wp in route]
+        b = self.dtm.src.bounds
+        if not self._passes_region(allpts).intersects(
+                shapely_box(b.left, b.bottom, b.right, b.top)):
+            QMessageBox.warning(
+                self, 'Route', 'The route does not overlap the DTM.\nCoordinates must '
+                'be in the same CRS as the DTM.'); return
+        # Keep the AOI; drop any previous route/estimate. Show the AOI + passes and let
+        # the operator pick the relevant passes.
+        self.loaded_route = route
+        self._clear_results()
+        self._set_route_mode(False)          # active again once passes are confirmed
+        view = self._passes_region(list(self.drawn_polygon.exterior.coords) + allpts)
+        self._map_focused = True
+        self.mapview.focus_on(view, margin_m=150.0)
+        self._sync_focus_button()
+        self.mapview.set_aoi_polygon(list(self.drawn_polygon.exterior.coords))
+        self.mapview.show_route_passes(pass_pts)
+        self.lbl_aoi.setText('Route loaded — click the passes relevant for point-cloud '
+                             'production, then ✓ Confirm passes.')
+        self.statusBar().showMessage(
+            f'Route from {os.path.basename(path)}: {len(lines)} passes. '
+            f'Click the relevant ones on the map, then Confirm.')
+
+    def _confirm_selected_passes(self):
+        """Estimate the selected passes over the CURRENT AOI, then behave exactly like an
+        auto-computed plan (same result, summary, overlays, and enabled actions)."""
+        if not self.loaded_route or self.drawn_polygon is None:
+            return
+        ids = set(self.mapview.selected_pass_ids())
+        if not ids:
+            QMessageBox.information(
+                self, 'Passes', 'Click at least one pass on the map to select it, '
+                'then Confirm.'); return
+        route = [wp for wp in self.loaded_route if wp['pass_id'] in ids]
+        self.mapview.clear_route_passes()            # leave selection mode
+        self.lbl_aoi.setText(f'✓ AOI + {len(ids)} selected passes (uploaded route).')
+        self._estimate_uploaded_route(route)
+
+    def _estimate_uploaded_route(self, route):
+        """Estimate a fixed (uploaded/selected) route over the current AOI with the
+        CURRENT params, then present it exactly like an auto-computed plan. Runs on
+        Confirm and again on Compute after the operator changes params (speed, PRR, …)."""
+        self.verdict_banner.setVisible(False)
+        self._set_busy(True, 'Estimating density on the uploaded route…')
+        self.setEnabled(False)
+        try:
+            self.base_result = estimate_for_route(
+                self.dtm, self.drawn_polygon, route, self._params(),
+                chm=self.chm, is_geo=self.is_geo)
+            self.survey_route = route
+            self.result = self._effective_result()
+        except Exception as e:
+            self.setEnabled(True); self._set_busy(False)
+            QMessageBox.critical(self, 'Estimate', str(e))
+            self.statusBar().showMessage('Estimate failed.'); return
+        self._set_route_mode(True)
+        self._finish_result(
+            f'Done — {self.result.n_waypoints} waypoints (uploaded route, current params)')
 
     def _open_chm(self):
         if self.dtm is None:
@@ -749,6 +916,7 @@ class MainWindow(QMainWindow):
             return
         self.drawn_polygon = poly
         self._clear_results()                 # previous route no longer matches AOI
+        self.loaded_route = None; self._set_route_mode(False)   # new AOI -> auto-plan mode
         self.lbl_aoi.setText('✓ AOI set from the drawn polygon.')
         self.btn_compute.setEnabled(True)
         # If the map is focused, follow the new AOI; otherwise just enable the toggle.
@@ -760,6 +928,7 @@ class MainWindow(QMainWindow):
 
     def _clear_aoi(self):
         self.drawn_polygon = None
+        self.loaded_route = None; self._set_route_mode(False)
         self.btn_compute.setEnabled(False)
         self.lbl_aoi.setText('Draw a polygon on the map to set the AOI.')
         self._clear_results()
@@ -969,6 +1138,10 @@ class MainWindow(QMainWindow):
         if self.drawn_polygon is None:
             QMessageBox.information(self, 'AOI', 'Draw a polygon on the map first.')
             return
+        if self._route_active and self.survey_route:
+            # Uploaded route: re-run the estimate on the same passes with current params.
+            self._estimate_uploaded_route(self.survey_route)
+            return
         poly = self.drawn_polygon
         self.verdict_banner.setVisible(False)
         self.lbl_summary.setText(
@@ -987,11 +1160,23 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, 'Compute error', str(e))
             self.statusBar().showMessage('Compute failed.')
             return
+        self._finish_result()
+
+    def _set_route_mode(self, active):
+        """Enter/leave 'uploaded-route' mode. In this mode Compute re-estimates the
+        confirmed route with the current params instead of auto-planning a new one."""
+        self._route_active = active
+        self.btn_compute.setText('Re-estimate route' if active else 'Compute Route')
+
+    def _finish_result(self, status_msg=None):
+        """Render the summary + map overlays + profile for the current result and
+        enable the result-dependent actions. Shared by auto-compute and the loaded-route
+        path, so both end up in exactly the same state once a result exists."""
         self.setEnabled(True)
         self._render_summary(self.result)
         self._render_map_overlays(self.result)
         self._refresh_profile()
-        has_route = bool(self.result.route)
+        has_route = bool(self.result and self.result.route)
         self.btn_helios.setEnabled(has_route)
         self.btn_geojson.setEnabled(has_route)
         self.btn_csv.setEnabled(has_route)
@@ -1000,9 +1185,10 @@ class MainWindow(QMainWindow):
             if has_route:
                 self._update_pass_anchor()
         self._set_busy(False)
-        self.statusBar().showMessage(
-            f'Done — {self.result.n_waypoints} waypoints' if has_route
-            else 'Done — no route produced')
+        if status_msg is None:
+            status_msg = (f'Done — {self.result.n_waypoints} waypoints' if has_route
+                          else 'Done — no route produced')
+        self.statusBar().showMessage(status_msg)
 
     def _update_pass_anchor(self):
         """Point the map's pass-preview at the survey's current end (the start of

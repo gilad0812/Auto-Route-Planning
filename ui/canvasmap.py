@@ -115,6 +115,9 @@ class _View(QGraphicsView):
         if self._owner.drawing_pass and e.button() == Qt.LeftButton:
             self._owner.add_pass_vertex(self.mapToScene(e.position().toPoint()))
             e.accept(); return
+        if self._owner.selecting_passes and e.button() == Qt.LeftButton:
+            self._owner.toggle_pass_at(self.mapToScene(e.position().toPoint()))
+            e.accept(); return
         super().mousePressEvent(e)
 
     def mouseDoubleClickEvent(self, e):
@@ -131,6 +134,8 @@ class CanvasMap(QWidget):
     polygonDrawn = Signal(object)        # emits a GeoJSON Polygon geometry dict
     passDrawn = Signal(object)           # emits (lon,lat) — the END of a new pass (start = route end)
     focusToggled = Signal(bool)          # Focus/Full toggle: True = focus on the AOI
+    passSelectionChanged = Signal(int)   # # of route passes currently selected
+    passesConfirmed = Signal()           # operator confirmed the selected passes
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -138,6 +143,8 @@ class CanvasMap(QWidget):
         self.chm = None
         self._inv = None                 # world -> pixel
         self._focus_polygon = None       # AOI the map is focused on, or None (full extent)
+        self.selecting_passes = False     # route-pass selection mode (Load route .wkt)
+        self._route_passes = {}          # pass_id -> {'items','segs','selected'}
         self._disp_transform = None      # scene(overview) pixel -> world; None until loaded
         self.drawing = False
         self.drawing_pass = False
@@ -177,8 +184,13 @@ class CanvasMap(QWidget):
         self.btn_chm = QToolButton(); self.btn_chm.setText('CHM')
         self.btn_chm.setCheckable(True); self.btn_chm.setEnabled(False)
         self.btn_chm.clicked.connect(self._toggle_chm)
+        # Shown only while selecting passes from a loaded route (.wkt).
+        self.btn_confirm = QToolButton(); self.btn_confirm.setText('✓ Confirm passes')
+        self.btn_confirm.setEnabled(False); self.btn_confirm.setVisible(False)
+        self.btn_confirm.setToolTip('Run the density estimate on the selected passes.')
+        self.btn_confirm.clicked.connect(self.passesConfirmed)
         for b in (self.btn_draw, self.btn_finish, self.btn_pass,
-                  self.btn_fit, self.btn_focus, self.btn_chm):
+                  self.btn_fit, self.btn_focus, self.btn_chm, self.btn_confirm):
             bar.addWidget(b)
         bar.addStretch(1)
         self.lbl_coord = QLabel(''); self.lbl_coord.setStyleSheet('color:#9aa0a6;')
@@ -193,19 +205,90 @@ class CanvasMap(QWidget):
 
     # ----------------------------------------------------------- data
     def _reset_scene(self):
-        self.scene.clear()
+        self.scene.clear()                           # deletes all items, incl. route passes
         self._aoi_item = self._route_group = self._density_item = None
         self._helios_item = self._chm_item = None; self._home_item = None
         self._verts = []; self._draw_items = []; self._pass_segs = []
         self._pass_anchor = None; self._pass_preview = None
+        self._route_passes = {}; self.selecting_passes = False
+        self.btn_confirm.setVisible(False); self.btn_confirm.setEnabled(False)
         self._disp_transform = None; self._inv = None
         self.drawing_pass = False; self.btn_pass.setChecked(False)
         self.btn_pass.setEnabled(False)
 
-    def set_dtm(self, dtm, dtm_path=None, chm=None, chm_path=None):
+    # ------------------------------------------- loaded route: pass selection
+    def show_route_passes(self, passes):
+        """Draw a loaded route as individually SELECTABLE passes and enter selection
+        mode. `passes` = list of (pass_id, [(lon, lat), ...]). Passes start unselected
+        (dim); clicking one on the map toggles it. Requires a rendered map (focus first)."""
+        self.clear_route_passes()
+        if self._inv is None:
+            return
+        for pid, pts in passes:
+            sp = [self._scene(lon, lat) for lon, lat in pts]
+            if len(sp) < 2:
+                continue
+            path = QPainterPath(sp[0])
+            for p in sp[1:]:
+                path.lineTo(p)
+            item = QGraphicsPathItem(path); item.setZValue(10)
+            self.scene.addItem(item)
+            segs = [(sp[i].x(), sp[i].y(), sp[i + 1].x(), sp[i + 1].y())
+                    for i in range(len(sp) - 1)]
+            self._route_passes[pid] = {'item': item, 'segs': segs, 'selected': False}
+            self._style_pass(pid)
+        self.selecting_passes = True
+        self.btn_confirm.setVisible(True)
+        self.btn_confirm.setEnabled(False)
+        self.passSelectionChanged.emit(0)
+
+    def _style_pass(self, pid):
+        d = self._route_passes[pid]
+        pen = QPen(QColor('#3fb950' if d['selected'] else '#8c959f'),
+                   3 if d['selected'] else 2)
+        pen.setCosmetic(True)
+        d['item'].setPen(pen)
+
+    def toggle_pass_at(self, sp):
+        """Toggle the pass nearest the click point (within a few screen pixels)."""
+        if not self._route_passes:
+            return
+        scale = abs(self.view.transform().m11()) or 1.0
+        tol = 8.0 / scale
+        best_pid, best_d = None, tol
+        for pid, d in self._route_passes.items():
+            for ax, ay, bx, by in d['segs']:
+                dist = _point_seg_dist(sp.x(), sp.y(), ax, ay, bx, by)
+                if dist <= best_d:
+                    best_d, best_pid = dist, pid
+        if best_pid is None:
+            return
+        d = self._route_passes[best_pid]
+        d['selected'] = not d['selected']
+        self._style_pass(best_pid)
+        n = len(self.selected_pass_ids())
+        self.btn_confirm.setEnabled(n > 0)
+        self.passSelectionChanged.emit(n)
+
+    def selected_pass_ids(self):
+        return [pid for pid, d in self._route_passes.items() if d['selected']]
+
+    def clear_route_passes(self):
+        for d in self._route_passes.values():
+            self.scene.removeItem(d['item'])
+        self._route_passes = {}
+        self.selecting_passes = False
+        self.btn_confirm.setVisible(False); self.btn_confirm.setEnabled(False)
+
+    def set_dtm(self, dtm, dtm_path=None, chm=None, chm_path=None, focus_polygon=None):
         self.dtm = dtm; self.chm = chm
         self._focus_polygon = None
         self._reset_scene()
+        if focus_polygon is not None:
+            # Crop straight to the AOI — reads only that window, skipping the (slow)
+            # whole-extent overview read entirely.
+            self.focus_on(focus_polygon)
+            return
         # DISPLAY only: a bounded, decimated whole-extent overview (read once). The scene
         # IS this overview's pixel grid; the full-resolution raster is never rendered, so
         # a giga-pixel DTM shows and pans like a small one with bounded memory. Planning
@@ -424,6 +507,8 @@ class CanvasMap(QWidget):
         self.scene.clear()
         self.dtm = None; self.chm = None; self._inv = None; self._disp_transform = None
         self._focus_polygon = None
+        self._route_passes = {}; self.selecting_passes = False
+        self.btn_confirm.setVisible(False); self.btn_confirm.setEnabled(False)
         self._aoi_item = self._route_group = self._density_item = None
         self._helios_item = self._chm_item = None; self._home_item = None
         self._verts = []; self._draw_items = []; self._pass_segs = []

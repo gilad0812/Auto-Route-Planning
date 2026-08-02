@@ -25,7 +25,7 @@ _LAT_M = 111139.0
 
 # Max AOI area for one plan. A single drone survey is one flight; capping the AOI also
 # keeps the native window comfortably under the DTM cell cap, so it never decimates.
-MAX_AOI_M2 = 3_000_000  # 3 km²
+MAX_AOI_M2 = 6_000_000  # 6 km²
 
 # Scan (mirror) line rate is DERIVED for an isotropic point pattern from the flight
 # geometry + pulse rate (scanner.scan_lines_for_square_pattern), not anchored to a
