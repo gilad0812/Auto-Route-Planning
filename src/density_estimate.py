@@ -46,7 +46,7 @@ def estimate_density_grid(
 
     Args:
         route:       list of waypoint dicts {x(lon), y(lat), z(alt), pass_id}.
-        dtm:         DTM object exposing .array, .src.transform, .nodata.
+        dtm:         DTM object exposing .array, .transform, .nodata.
         region:      AOI as a list of (lon, lat) vertices, or None (whole bbox).
         scan_freq_hz: accepted for signature symmetry; cancels out of the model.
         cell_size_m: grid resolution (auto-coarsened to stay under max_cells).
@@ -108,16 +108,25 @@ def estimate_density_grid(
     E = (LON - (minlon + maxlon) / 2.0) * lon_m
     N = (LAT - (minlat + maxlat) / 2.0) * lat_m
 
-    # ── Terrain elevation per cell (vectorised raster lookup) ────────────────
+    # ── Terrain elevation per cell — BILINEAR at the DTM's native resolution ──
+    # Use dtm.transform (not dtm.src.transform): `dtm` may be a native AOI window whose
+    # array is offset from the whole raster, so the parent transform would mis-index it.
+    # Bilinear (not nearest-pixel) removes the staircase in the per-cell AGL; a nodata
+    # corner propagates to NaN so void-edge cells are treated as unsurveyed.
     arr = np.asarray(dtm.array, dtype=float)
-    t = dtm.src.transform
-    col = ((LON - t.c) / t.a)
-    row = ((LAT - t.f) / t.e)
-    col = np.clip(col.astype(int), 0, arr.shape[1] - 1)
-    row = np.clip(row.astype(int), 0, arr.shape[0] - 1)
-    terr = arr[row, col]
-    if dtm.nodata is not None:
-        terr = np.where(terr == dtm.nodata, np.nan, terr)
+    t = dtm.transform
+    inv = ~t
+    cf = inv.a * LON + inv.b * LAT + inv.c            # fractional pixel column
+    rf = inv.d * LON + inv.e * LAT + inv.f            # fractional pixel row
+    h_, w_ = arr.shape
+    col = np.clip(cf.astype(int), 0, w_ - 1)          # nearest index — for the slope lookup
+    row = np.clip(rf.astype(int), 0, h_ - 1)
+    am = np.where(arr == dtm.nodata, np.nan, arr) if dtm.nodata is not None else arr
+    j0 = np.clip(np.floor(cf).astype(int), 0, w_ - 2)
+    i0 = np.clip(np.floor(rf).astype(int), 0, h_ - 2)
+    dx = np.clip(cf - j0, 0.0, 1.0); dy = np.clip(rf - i0, 0.0, 1.0)
+    terr = ((am[i0, j0] * (1 - dx) + am[i0, j0 + 1] * dx) * (1 - dy)
+            + (am[i0 + 1, j0] * (1 - dx) + am[i0 + 1, j0 + 1] * dx) * dy)
 
     # Surface normal per cell from local slope — for the back-facing test (cos_i ≤ 0)
     # and per-surface density. Differentiate the DTM at NATIVE pixel resolution, not
@@ -194,7 +203,7 @@ def estimate_density_grid(
     # (the fraction of pulses reaching the ground through the canopy).
     if chm is not None:
         ca = np.asarray(chm.array, dtype=float)
-        ct = chm.src.transform
+        ct = chm.transform                           # matches chm.array (native AOI window)
         ccol = np.clip(((LON - ct.c) / ct.a).astype(int), 0, ca.shape[1] - 1)
         crow = np.clip(((LAT - ct.f) / ct.e).astype(int), 0, ca.shape[0] - 1)
         mask = ca[crow, ccol]
