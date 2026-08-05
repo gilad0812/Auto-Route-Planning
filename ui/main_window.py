@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 from .planning import (PlanParams, compute_plan, load_dtm, chm_compatible,
                        scan_lines_for_square_pattern, build_manual_pass,
                        estimate_for_route, polygon_area_m2, MAX_AOI_M2,
-                       _path_length_m, _LAT_M)
+                       _pass_altitude, band_pass_altitudes, _path_length_m, _LAT_M)
 
 try:
     from .canvasmap import CanvasMap, FAILURE_REASON_STYLE, FAILURE_REASON_LABEL
@@ -84,6 +84,19 @@ def _locate_wkt_column(rows):
         if any(_looks_like_wkt(cell(r)) for r in rows[1:3]):
             return i, rows[1:]
     return None, rows
+
+
+def _densify_polyline(xy, step):
+    """Sample points along a polyline `xy` [(x,y)] at ~`step` spacing (map units), so a
+    two-vertex pass gets enough terrain samples for the altitude rule."""
+    if len(xy) < 2 or step <= 0:
+        return list(xy)
+    out = [xy[0]]
+    for (x0, y0), (x1, y1) in zip(xy, xy[1:]):
+        n = max(1, int(math.ceil(math.hypot(x1 - x0, y1 - y0) / step)))
+        out.extend((x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n)
+                   for i in range(1, n + 1))
+    return out
 
 
 def _read_wkt_geoms(path):
@@ -175,6 +188,7 @@ class MainWindow(QMainWindow):
         self.drawn_polygon = None        # shapely Polygon drawn on the map
         self._map_focused = False        # map zoomed to the AOI (vs full-extent overview)
         self.loaded_route = None         # operator route from .wkt (list of waypoints), for pass selection
+        self._route_auto_alt = False     # loaded route had no Z (altitudes auto-assigned -> band on confirm)
         self._route_active = False       # a confirmed uploaded route is active (Compute re-estimates it)
         self._pending_aoi = None         # AOI loaded before a DTM — crop to it on the next Open DTM
         self.home = None                 # takeoff/return-home (lon, lat) or None
@@ -756,11 +770,12 @@ class MainWindow(QMainWindow):
         return hull
 
     def _load_wkt_route(self):
-        """Load an operator-built route from a 3D .wkt or a .csv with a WKT column (each
-        LINESTRING = one pass, with Z = flight altitude), draw the passes on the map, and
-        let the operator click the ones relevant for point-cloud production; Confirm then
-        runs the density estimate over the CURRENT AOI exactly like an auto-computed plan.
-        Requires an AOI first. Coordinates must be in the DTM's CRS."""
+        """Load an operator-built route from a .wkt or a .csv with a WKT column (each
+        LINESTRING = one pass). If vertices carry Z, that's the flight altitude; a 2D
+        route gets automatic altitudes the same way the planner does (mean terrain + the
+        sidebar AGL, floored to clear the pass's peak). Draw the passes; the operator
+        clicks the relevant ones and Confirm runs the density estimate over the CURRENT
+        AOI exactly like an auto-computed plan. Requires an AOI first; coords in DTM CRS."""
         if self.dtm is None:
             QMessageBox.information(self, 'Route', 'Open a DTM first.'); return
         if self.drawn_polygon is None:
@@ -789,19 +804,37 @@ class MainWindow(QMainWindow):
         if not lines:
             QMessageBox.warning(self, 'Route', 'No line passes found in the file.')
             return
-        if not all(ln.has_z for ln in lines):
-            QMessageBox.warning(
-                self, 'Route', 'Route must be 3D — every vertex needs a Z (flight '
-                'altitude). Re-export the route with heights.')
-            return
-        # Each line -> one pass; its vertices' Z are the flight altitudes.
-        route, pass_pts = [], []
+        # 3D route -> use each vertex's Z as the flight altitude. 2D route -> assign each
+        # pass an automatic altitude the same way the planner does (mean terrain + the
+        # sidebar AGL, floored to clear the pass's highest point).
+        have_z = all(ln.has_z for ln in lines)
+        params = self._params()
+        to_m = _LAT_M if self.is_geo else 1.0
+        step_map = params.step_m / to_m
+        res_map = min(abs(self.dtm.src.res[0]), abs(self.dtm.src.res[1]))
+        elev_step = min(step_map, res_map)
+        route, pass_pts, auto, skipped = [], [], 0, 0
         for pid, ln in enumerate(lines, start=1):
-            cs = list(ln.coords)                         # (x, y, z) tuples
-            for x, y, z in cs:
-                route.append({'x': x, 'y': y, 'z': float(z),
-                              'pass_id': pid, 'target_distance': None})
-            pass_pts.append((pid, [(x, y) for x, y, *_ in cs]))
+            xy = [(float(c[0]), float(c[1])) for c in ln.coords]
+            if have_z:
+                for (x, y), c in zip(xy, ln.coords):
+                    route.append({'x': x, 'y': y, 'z': float(c[2]),
+                                  'pass_id': pid, 'target_distance': None})
+            else:
+                z = _pass_altitude(self.dtm, _densify_polyline(xy, step_map),
+                                   params.altitude_m, step_map, elev_step,
+                                   params.min_peak_clearance_m)
+                if math.isnan(z):                        # no valid terrain under this pass
+                    skipped += 1; continue
+                auto += 1
+                for x, y in xy:
+                    route.append({'x': x, 'y': y, 'z': z, 'pass_id': pid,
+                                  'target_distance': params.altitude_m})
+            pass_pts.append((pid, xy))
+        if not route:
+            QMessageBox.warning(
+                self, 'Route', 'No passes with valid terrain under them '
+                '(coordinates off the DTM, or in the wrong CRS).'); return
         allpts = [(wp['x'], wp['y']) for wp in route]
         b = self.dtm.src.bounds
         if not self._passes_region(allpts).intersects(
@@ -812,6 +845,7 @@ class MainWindow(QMainWindow):
         # Keep the AOI; drop any previous route/estimate. Show the AOI + passes and let
         # the operator pick the relevant passes.
         self.loaded_route = route
+        self._route_auto_alt = not have_z    # band the altitudes on confirm (2D route only)
         self._clear_results()
         self._set_route_mode(False)          # active again once passes are confirmed
         view = self._passes_region(list(self.drawn_polygon.exterior.coords) + allpts)
@@ -820,11 +854,14 @@ class MainWindow(QMainWindow):
         self._sync_focus_button()
         self.mapview.set_aoi_polygon(list(self.drawn_polygon.exterior.coords))
         self.mapview.show_route_passes(pass_pts)
+        alt_note = (f'altitude from Z' if have_z
+                    else f'auto altitude at {params.altitude_m:.0f} m AGL')
+        skip_note = f' ({skipped} skipped — off terrain)' if skipped else ''
         self.lbl_aoi.setText('Route loaded — click the passes relevant for point-cloud '
                              'production, then ✓ Confirm passes.')
         self.statusBar().showMessage(
-            f'Route from {os.path.basename(path)}: {len(lines)} passes. '
-            f'Click the relevant ones on the map, then Confirm.')
+            f'Route from {os.path.basename(path)}: {len(pass_pts)} passes, {alt_note}'
+            f'{skip_note}. Click the relevant ones, then Confirm.')
 
     def _confirm_selected_passes(self):
         """Estimate the selected passes over the CURRENT AOI, then behave exactly like an
@@ -836,7 +873,15 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self, 'Passes', 'Click at least one pass on the map to select it, '
                 'then Confirm.'); return
-        route = [wp for wp in self.loaded_route if wp['pass_id'] in ids]
+        # Copy the waypoints (banding rewrites z in place) so the stored route stays
+        # intact for re-selection.
+        route = [dict(wp) for wp in self.loaded_route if wp['pass_id'] in ids]
+        if self._route_auto_alt:
+            # Auto-altitude route: group consecutive passes onto shared heights the same
+            # way the planner does (only raises; fewer z-calibrations). 3D routes keep
+            # the operator's altitudes untouched.
+            route = band_pass_altitudes(route, self.dtm, self._params().altitude_m,
+                                        is_geo=self.is_geo)
         self.mapview.clear_route_passes()            # leave selection mode
         self.lbl_aoi.setText(f'✓ AOI + {len(ids)} selected passes (uploaded route).')
         self._estimate_uploaded_route(route)
