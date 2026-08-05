@@ -123,6 +123,12 @@ def _path_length_m(route, is_geo):
     lat_m = _LAT_M if is_geo else 1.0
     tot = 0.0
     for a, b in zip(wps, wps[1:]):
+        pa, pb = a.get('pass_id'), b.get('pass_id')
+        # Sum along-pass distance only; skip the jump between two distinct survey passes
+        # (not a flown leg for independent/uploaded passes). Home ferry legs (pass_id
+        # 'home') are kept.
+        if isinstance(pa, int) and isinstance(pb, int) and pa != pb:
+            continue
         tot += math.hypot((b['x'] - a['x']) * lon_m, (b['y'] - a['y']) * lat_m)
     return tot
 

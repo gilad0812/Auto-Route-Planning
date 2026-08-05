@@ -531,7 +531,7 @@ class CanvasMap(QWidget):
     # ----------------------------------------------------------- overlays
     def show_plan(self, route_wps, density_cells, density_color='#ff9900',
                   density_radius_m=3.0, max_density_pts=20000,
-                  cells_by_reason=None):
+                  cells_by_reason=None, connect_passes=True):
         if self.dtm is None:
             return
         # clear previous overlays
@@ -561,6 +561,10 @@ class CanvasMap(QWidget):
             zs = [w['z'] for w in wps]; zmin, zmax = min(zs), max(zs)
             cmap = plt.get_cmap('cool')
             for a, b in zip(wps, wps[1:]):
+                same_pass = (a.get('pass_id') is not None
+                             and a.get('pass_id') == b.get('pass_id'))
+                if not same_pass and not connect_passes:
+                    continue                 # independent passes — don't draw a connector
                 t = (a['z'] - zmin) / max(zmax - zmin, 1e-9)
                 pa = self._scene(a['x'], a['y']); pb = self._scene(b['x'], b['y'])
                 seg = QPainterPath(pa); seg.lineTo(pb)
@@ -569,7 +573,7 @@ class CanvasMap(QWidget):
                 item.setPen(pen); grp.addToGroup(item)
                 # remember the pass lines (both ends same pass_id) for hover readout;
                 # skip the inter-pass connector legs.
-                if a.get('pass_id') is not None and a.get('pass_id') == b.get('pass_id'):
+                if same_pass:
                     self._pass_segs.append((pa.x(), pa.y(), pb.x(), pb.y(), a['z']))
             self._marker(grp, self._scene(wps[0]['x'], wps[0]['y']), '#1a7f37')
             self._marker(grp, self._scene(wps[-1]['x'], wps[-1]['y']), '#cf222e')

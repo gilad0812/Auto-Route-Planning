@@ -804,33 +804,35 @@ class MainWindow(QMainWindow):
         if not lines:
             QMessageBox.warning(self, 'Route', 'No line passes found in the file.')
             return
-        # 3D route -> use each vertex's Z as the flight altitude. 2D route -> assign each
-        # pass an automatic altitude the same way the planner does (mean terrain + the
-        # sidebar AGL, floored to clear the pass's highest point).
+        # Each straight segment (vertex A -> vertex B) is one selectable pass, so a
+        # multi-vertex line is split into its individual passes. 3D -> vertex Z is the
+        # flight altitude; 2D -> automatic altitude per pass (mean terrain + sidebar AGL,
+        # floored to clear the pass peak), same rule as the planner.
         have_z = all(ln.has_z for ln in lines)
         params = self._params()
         to_m = _LAT_M if self.is_geo else 1.0
         step_map = params.step_m / to_m
         res_map = min(abs(self.dtm.src.res[0]), abs(self.dtm.src.res[1]))
         elev_step = min(step_map, res_map)
-        route, pass_pts, auto, skipped = [], [], 0, 0
-        for pid, ln in enumerate(lines, start=1):
-            xy = [(float(c[0]), float(c[1])) for c in ln.coords]
-            if have_z:
-                for (x, y), c in zip(xy, ln.coords):
-                    route.append({'x': x, 'y': y, 'z': float(c[2]),
-                                  'pass_id': pid, 'target_distance': None})
-            else:
-                z = _pass_altitude(self.dtm, _densify_polyline(xy, step_map),
-                                   params.altitude_m, step_map, elev_step,
-                                   params.min_peak_clearance_m)
-                if math.isnan(z):                        # no valid terrain under this pass
-                    skipped += 1; continue
-                auto += 1
-                for x, y in xy:
+        route, pass_pts, auto, skipped, pid = [], [], 0, 0, 0
+        for ln in lines:
+            cs = list(ln.coords)
+            for a, b in zip(cs, cs[1:]):
+                seg = [(float(a[0]), float(a[1])), (float(b[0]), float(b[1]))]
+                if have_z:
+                    zs, td = [float(a[2]), float(b[2])], None
+                else:
+                    zc = _pass_altitude(self.dtm, _densify_polyline(seg, step_map),
+                                        params.altitude_m, step_map, elev_step,
+                                        params.min_peak_clearance_m)
+                    if math.isnan(zc):                   # no valid terrain under this pass
+                        skipped += 1; continue
+                    auto += 1; zs, td = [zc, zc], params.altitude_m
+                pid += 1
+                for (x, y), z in zip(seg, zs):
                     route.append({'x': x, 'y': y, 'z': z, 'pass_id': pid,
-                                  'target_distance': params.altitude_m})
-            pass_pts.append((pid, xy))
+                                  'target_distance': td})
+                pass_pts.append((pid, seg))
         if not route:
             QMessageBox.warning(
                 self, 'Route', 'No passes with valid terrain under them '
@@ -1477,13 +1479,17 @@ class MainWindow(QMainWindow):
                if not (isinstance(w['z'], float) and math.isnan(w['z']))]
         est = r.estimate or {}
         rad = max(float(est.get('cell_size_m', 2.0)), 3.0)
+        # An uploaded route is a set of INDEPENDENT passes — don't draw connectors
+        # between them (the auto-planned route stays connected in flight order).
+        connect = not self._route_active
         by_reason = est.get('failing_cells_by_reason')
         if by_reason:
             self.mapview.show_plan(wps, None, density_radius_m=rad,
-                                   cells_by_reason=by_reason)
+                                   cells_by_reason=by_reason, connect_passes=connect)
         else:                       # older result shape: single-colour fallback
             self.mapview.show_plan(wps, est.get('failing_cells_geo', []),
-                                   density_color='#ff9900', density_radius_m=rad)
+                                   density_color='#ff9900', density_radius_m=rad,
+                                   connect_passes=connect)
         self.mapview.show_home(self.home, wps)
 
     # ---------------------------------------------------------------- render
