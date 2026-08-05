@@ -194,12 +194,6 @@ class MainWindow(QMainWindow):
         self.home = None                 # takeoff/return-home (lon, lat) or None
         self.home_ground = float('nan')  # terrain elevation at home, if in the DTM
 
-        # mission-feasibility inputs (edited via the Feasibility menu)
-        from feasibility import ETA_DEFAULT
-        # site elevation is auto-derived from the route/home, not stored here
-        self.feas = {'payload_kg': 3.0, 'temp_c': 15.0,
-                     'eta': ETA_DEFAULT, 'calibrated': False}
-
         self._build_menu()
         self._build_body()
         self._update_scan_freq()                 # derive the initial scan freq
@@ -244,11 +238,6 @@ class MainWindow(QMainWindow):
         self.act_profile.setShortcut('Ctrl+E')
         self.act_profile.toggled.connect(self._toggle_profile)
         mv.addAction(self.act_profile)
-
-        mf = self.menuBar().addMenu('&Feasibility')
-        a_feas = QAction('Mission conditions & calibration…', self)
-        a_feas.triggered.connect(self._open_feasibility)
-        mf.addAction(a_feas)
 
     def _build_body(self):
         top = QSplitter(Qt.Horizontal)
@@ -456,10 +445,6 @@ class MainWindow(QMainWindow):
         s.setValue('scan/speed', self.sp_speed.value())
         s.setValue('scan/pulse_freq', self.cmb_pulse.currentData())
         s.setValue('scan/veg', self.sp_veg.value())
-        s.setValue('feas/payload_kg', self.feas['payload_kg'])
-        s.setValue('feas/temp_c', self.feas['temp_c'])
-        s.setValue('feas/eta', self.feas['eta'])           # measured — worth keeping
-        s.setValue('feas/calibrated', self.feas['calibrated'])
         s.setValue('window/geometry', self.saveGeometry())
 
     def _load_settings(self):
@@ -479,12 +464,6 @@ class MainWindow(QMainWindow):
         if idx >= 0:
             self.cmb_pulse.setCurrentIndex(idx)           # re-derives the scan freq
         self.sp_veg.setValue(s.value('scan/veg', self.sp_veg.value(), type=float))
-        self.feas['payload_kg'] = s.value(
-            'feas/payload_kg', self.feas['payload_kg'], type=float)
-        self.feas['temp_c'] = s.value('feas/temp_c', self.feas['temp_c'], type=float)
-        self.feas['eta'] = s.value('feas/eta', self.feas['eta'], type=float)
-        self.feas['calibrated'] = s.value(
-            'feas/calibrated', self.feas['calibrated'], type=bool)
         geo = s.value('window/geometry')
         if geo is not None:
             self.restoreGeometry(geo)
@@ -509,39 +488,16 @@ class MainWindow(QMainWindow):
         panel = QWidget(); sv = QVBoxLayout(panel)
         title = QLabel('<b>Results</b>')
 
-        # Feasibility verdict banner — the redesign's headline element. Colour-coded
-        # (success / warning / danger via a dynamic "state" property) so the go/no-go
-        # answer is scannable before any other metric. Hidden until a route exists.
-        self.verdict_banner = QFrame(); self.verdict_banner.setObjectName('verdictBanner')
-        vb = QVBoxLayout(self.verdict_banner)
-        vb.setContentsMargins(14, 12, 14, 12); vb.setSpacing(6)
-        self.verdict_headline = QLabel(); self.verdict_headline.setObjectName('verdictHeadline')
-        self.verdict_reason = QLabel(); self.verdict_reason.setObjectName('verdictReason')
-        self.verdict_reason.setWordWrap(True)
-        self.energy_bar = QProgressBar(); self.energy_bar.setObjectName('energyBar')
-        self.energy_bar.setTextVisible(False); self.energy_bar.setRange(0, 100)
-        self.energy_bar.setFixedHeight(6)
-        vb.addWidget(self.verdict_headline); vb.addWidget(self.verdict_reason)
-        vb.addWidget(self.energy_bar)
-        self.verdict_banner.setVisible(False)
-
         self.lbl_summary = QLabel('Compute a route to see results.')
         self.lbl_summary.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.lbl_summary.setTextFormat(Qt.RichText)
         self.lbl_summary.setWordWrap(True)
-        sv.addWidget(title); sv.addWidget(self.verdict_banner)
+        sv.addWidget(title)
         sv.addWidget(self.lbl_summary); sv.addStretch(1)
         scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(panel)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)  # wrap, don't scroll sideways
         scroll.setMinimumWidth(260)
         return scroll
-
-    @staticmethod
-    def _set_state(widget, state):
-        """Set the dynamic 'state' property (success/warning/danger) and re-polish
-        so the QSS attribute selectors re-apply."""
-        widget.setProperty('state', state)
-        widget.style().unpolish(widget); widget.style().polish(widget)
 
     def _update_workflow(self):
         """Flip the ✓ on the numbered workflow groups as each step is satisfied, so
@@ -892,7 +848,6 @@ class MainWindow(QMainWindow):
         """Estimate a fixed (uploaded/selected) route over the current AOI with the
         CURRENT params, then present it exactly like an auto-computed plan. Runs on
         Confirm and again on Compute after the operator changes params (speed, PRR, …)."""
-        self.verdict_banner.setVisible(False)
         self._set_busy(True, 'Estimating density on the uploaded route…')
         self.setEnabled(False)
         try:
@@ -991,8 +946,6 @@ class MainWindow(QMainWindow):
         self.survey_route = []
         self.lbl_summary.setText(self._empty_summary_html())
         self._update_workflow()
-        if getattr(self, 'verdict_banner', None) is not None:
-            self.verdict_banner.setVisible(False)
         if self.mapview is not None:
             self.mapview.clear_overlays()
             self._show_home()                 # keep the marker, drop stale ferry legs
@@ -1251,7 +1204,6 @@ class MainWindow(QMainWindow):
             self._estimate_uploaded_route(self.survey_route)
             return
         poly = self.drawn_polygon
-        self.verdict_banner.setVisible(False)
         self.lbl_summary.setText(
             '<i style="color:#8b96a3;">Computing route + density estimate…</i>')
         self._set_busy(True, 'Computing route + density estimate…')
@@ -1344,49 +1296,6 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f'Pass added at {new_pass[0]["z"]:.0f} m — {self.result.n_waypoints} '
             f'waypoints. Click to add another or untick Add Pass.')
-
-    # ------------------------------------------------------------- feasibility
-    def _open_feasibility(self):
-        from .feasibility_ui import FeasibilityDialog
-        air, _ = self._feas_elevations()          # for the calibration air density
-        dlg = FeasibilityDialog(self, self.feas['payload_kg'], self.feas['temp_c'],
-                                self.feas['eta'], self.feas['calibrated'], air)
-        if dlg.exec():                     # Accepted == 1 (truthy), Rejected == 0
-            self.feas = dlg.values()
-            if self.result is not None:
-                self._render_summary(self.result)
-
-    def _feas_elevations(self):
-        """(operating_amsl, takeoff_amsl) auto-derived: operating = mean flight
-        altitude of the route (drives air density). takeoff = home ground only when
-        a home is set (drives the MTOW derate); None otherwise — with no home the
-        estimate is based purely on the polygon route and the MTOW gate falls back
-        to the operating altitude. (0, None) when there's no route."""
-        if not (self.result and self.result.route and self.dtm):
-            return 0.0, None
-        wps = [w for w in self._route_with_home()
-               if not (isinstance(w['z'], float) and math.isnan(w['z']))]
-        if not wps:
-            return 0.0, None
-        air = sum(w['z'] for w in wps) / len(wps)
-        takeoff = (self.home_ground
-                   if self.home is not None and not math.isnan(self.home_ground)
-                   else None)
-        return air, takeoff
-
-    def _feasibility(self):
-        """FeasibilityResult for the current flown route, or None if no route."""
-        if not (self.result and self.result.route and self.dtm):
-            return None
-        import feasibility as F
-        air, takeoff = self._feas_elevations()
-        return F.estimate_feasibility(
-            self._route_with_home(), is_geo=self.is_geo,
-            payload_kg=self.feas['payload_kg'], cruise_ms=self.sp_speed.value(),
-            site_elev_m=air, temp_c=self.feas['temp_c'],
-            eta=self.feas['eta'],
-            home=self.home, terrain_at=self.dtm.elevation_at,
-            takeoff_elev_m=takeoff)
 
     # ---------------------------------------------------------------- profile
     def _toggle_profile(self, on):
@@ -1546,48 +1455,8 @@ class MainWindow(QMainWindow):
                     (f'<span style="color:{hexc}">■</span> {label}',
                      f'{n:,} cells · <i>{lever}</i>'))
 
-        fr = self._feasibility()
-        if fr is not None:
-            batt = (f'{fr.batteries_needed} batteries'
-                    if fr.batteries_needed > 1 else '1 battery')
-            cal = 'calibrated' if self.feas['calibrated'] else 'uncalibrated ±band'
-            # ── verdict banner ──
-            if fr.robust:
-                state, head = 'success', '✓ Feasible'
-            elif fr.feasible:
-                state, head = 'warning', '~ Feasible (nominal only)'
-            else:
-                state, head = 'danger', '✗ Over energy budget'
-            self._set_state(self.verdict_banner, state)
-            self._set_state(self.verdict_headline, state)
-            self._set_state(self.energy_bar, state)
-            self.verdict_headline.setText(head)
-            self.verdict_reason.setText(
-                f'Needs {fr.energy_wh:.0f} Wh vs {fr.usable_wh:.0f} Wh usable on '
-                f'{batt} — {fr.margin_pct:+.0f}% margin.')
-            self.energy_bar.setValue(
-                int(min(100, round(100.0 * fr.energy_wh / max(fr.usable_wh, 1.0)))))
-            self.verdict_banner.setVisible(True)
-            # ── supporting detail (demoted below the banner) ──
-            rows += [
-                ('<b>Feasibility (Thor)</b>', ''),
-                ('Flight time', f'{fr.flight_time_s / 60:.0f} min'),
-                ('Payload', f"{self.feas['payload_kg']:.1f} kg"),
-            ]
-            if self.home is not None:      # takeoff ground only matters with a home
-                rows.append(('Takeoff alt', f'{fr.takeoff_elev_m:.0f} m'))
-            rows += [
-                ('Energy need', f'{fr.energy_wh:.0f} Wh ({cal})'),
-                ('Usable / batteries', f'{fr.usable_wh:.0f} Wh · {batt}'),
-            ]
-        else:
-            self.verdict_banner.setVisible(False)
-
         html = ['<table cellspacing=6>']
         for k, val in rows:
             html.append(f'<tr><td>{k}</td><td><b>{val}</b></td></tr>')
         html.append('</table>')
-        if fr is not None and fr.gates:
-            html.append('<div style="color:#e6c98a;margin-top:6px;">⚠ '
-                        + '<br>⚠ '.join(fr.gates) + '</div>')
         self.lbl_summary.setText(''.join(html))
