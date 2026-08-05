@@ -57,6 +57,67 @@ _TRANSIT_BUFFER_M = 20.0
 # exposed in the UI) — it's a safety clearance, not a routine tuning knob.
 _MIN_PEAK_CLEARANCE_M = 50.0
 
+# Column names an exported CSV might use for the WKT geometry.
+_WKT_COLUMNS = {'wkt', 'geometry', 'geom', 'the_geom', 'wkt_geom', 'wkt_geometry',
+                'shape', 'well_known_text'}
+
+
+def _looks_like_wkt(s):
+    return s.upper().lstrip().startswith((
+        'POLYGON', 'MULTIPOLYGON', 'LINESTRING', 'MULTILINESTRING',
+        'POINT', 'MULTIPOINT', 'GEOMETRYCOLLECTION', 'LINEARRING'))
+
+
+def _locate_wkt_column(rows):
+    """(column index, data rows) for the WKT column in parsed CSV `rows`, or (None, rows).
+    Prefers a known header name; otherwise finds a column whose values look like WKT
+    (treating the first row as data if it is itself WKT — a header-less file)."""
+    header = rows[0]
+    for i, h in enumerate(header):
+        if (h or '').strip().lower() in _WKT_COLUMNS:
+            return i, rows[1:]
+    ncol = max(len(r) for r in rows)
+    for i in range(ncol):
+        cell = lambda r: (r[i] if i < len(r) else '').strip()
+        if _looks_like_wkt(cell(header)):
+            return i, rows                      # header row was actually data
+        if any(_looks_like_wkt(cell(r)) for r in rows[1:3]):
+            return i, rows[1:]
+    return None, rows
+
+
+def _read_wkt_geoms(path):
+    """Geometries from a `.wkt` (plain text, one geometry) or a `.csv` with a WKT column
+    (one geometry per row). Raises ValueError with a clear message on failure."""
+    if os.path.splitext(path)[1].lower() != '.csv':
+        with open(path, 'r', encoding='utf-8') as f:
+            txt = f.read().strip()
+        if not txt:
+            raise ValueError('File is empty.')
+        return [wkt_loads(txt)]
+    with open(path, 'r', encoding='utf-8-sig', newline='') as f:
+        content = f.read()
+    if not content.strip():
+        raise ValueError('CSV is empty.')
+    lines = content.splitlines()
+    for delim in (',', ';', '\t', '|'):         # pick the delimiter that yields a WKT column
+        rows = [r for r in csv.reader(lines, delimiter=delim)
+                if any((c or '').strip() for c in r)]
+        if not rows:
+            continue
+        col, data_rows = _locate_wkt_column(rows)
+        if col is None:
+            continue
+        geoms = []
+        for r in data_rows:
+            v = (r[col] if col < len(r) else '').strip()
+            if v:
+                geoms.append(wkt_loads(v))
+        if geoms:
+            return geoms
+    raise ValueError('No WKT column found (expected a "WKT"/"geometry" column, or WKT '
+                     'text in a column).')
+
 
 def _hr():
     line = QFrame()
@@ -155,9 +216,9 @@ class MainWindow(QMainWindow):
         m = self.menuBar().addMenu('&File')
         a_dtm = QAction('Open DTM…', self); a_dtm.triggered.connect(self._open_dtm)
         a_chm = QAction('Open CHM…', self); a_chm.triggered.connect(self._open_chm)
-        a_wkt = QAction('Load AOI (.wkt)…', self)
+        a_wkt = QAction('Load AOI (.wkt/.csv)…', self)
         a_wkt.triggered.connect(self._load_wkt_aoi)
-        a_route = QAction('Load route (.wkt)…', self)
+        a_route = QAction('Load route (.wkt/.csv)…', self)
         a_route.triggered.connect(self._load_wkt_route)
         a_quit = QAction('Quit', self); a_quit.triggered.connect(self.close)
         m.addAction(a_dtm); m.addAction(a_chm); m.addAction(a_wkt); m.addAction(a_route)
@@ -638,30 +699,31 @@ class MainWindow(QMainWindow):
         return coords
 
     def _load_wkt_aoi(self):
-        """Load an AOI polygon from a .wkt file (coordinates in the DTM's CRS). With a DTM
-        open, focus the map on it at native resolution. WITHOUT a DTM, remember it and crop
-        the DTM to it on the next Open DTM — skipping the slow whole-extent render."""
+        """Load an AOI polygon from a .wkt file or a .csv with a WKT column (coordinates in
+        the DTM's CRS). With a DTM open, focus the map on it at native resolution. WITHOUT a
+        DTM, remember it and crop the DTM to it on the next Open DTM."""
         path, _ = QFileDialog.getOpenFileName(
-            self, 'Load AOI polygon', '', 'WKT (*.wkt *.txt);;All files (*)')
+            self, 'Load AOI polygon', '',
+            'WKT or CSV (*.wkt *.csv *.txt);;All files (*)')
         if not path:
             return
         try:
-            with open(path, 'r', encoding='utf-8') as f:
-                geom = wkt_loads(f.read().strip())
+            geoms = _read_wkt_geoms(path)
         except Exception as e:
-            QMessageBox.critical(self, 'AOI', f'Could not read WKT:\n{e}'); return
-        # Reduce to a single polygon.
-        if geom.geom_type == 'Polygon':
-            poly = geom
-        elif geom.geom_type in ('MultiPolygon', 'GeometryCollection'):
-            poly = geom.convex_hull                      # a valid single Polygon
-        else:
-            QMessageBox.warning(
-                self, 'AOI', f'WKT must be a polygon (got {geom.geom_type}).'); return
+            QMessageBox.critical(self, 'AOI', f'Could not read the file:\n{e}'); return
+        # Reduce to a single polygon (first polygonal geometry in the file).
+        poly = None
+        for g in geoms:
+            if g.geom_type == 'Polygon':
+                poly = g; break
+            if g.geom_type in ('MultiPolygon', 'GeometryCollection'):
+                poly = g.convex_hull; break          # a valid single Polygon
+        if poly is None:
+            QMessageBox.warning(self, 'AOI', 'No polygon found in the file.'); return
         if not poly.is_valid:
             poly = poly.buffer(0)
         if poly.is_empty or poly.geom_type != 'Polygon':
-            QMessageBox.warning(self, 'AOI', 'WKT polygon is empty or invalid.'); return
+            QMessageBox.warning(self, 'AOI', 'The polygon is empty or invalid.'); return
         if self.dtm is None:
             # No DTM yet — remember it; Open DTM will crop to it (CRS is checked then).
             self._pending_aoi = poly
@@ -694,11 +756,11 @@ class MainWindow(QMainWindow):
         return hull
 
     def _load_wkt_route(self):
-        """Load an operator-built route from a 3D .wkt (each LINESTRING = one pass, with
-        Z = flight altitude), draw the passes on the map, and let the operator click the
-        ones relevant for point-cloud production; Confirm then runs the density estimate
-        over the CURRENT AOI exactly like an auto-computed plan. Requires an AOI first.
-        Coordinates must be in the DTM's CRS."""
+        """Load an operator-built route from a 3D .wkt or a .csv with a WKT column (each
+        LINESTRING = one pass, with Z = flight altitude), draw the passes on the map, and
+        let the operator click the ones relevant for point-cloud production; Confirm then
+        runs the density estimate over the CURRENT AOI exactly like an auto-computed plan.
+        Requires an AOI first. Coordinates must be in the DTM's CRS."""
         if self.dtm is None:
             QMessageBox.information(self, 'Route', 'Open a DTM first.'); return
         if self.drawn_polygon is None:
@@ -706,27 +768,26 @@ class MainWindow(QMainWindow):
                 self, 'Route', 'Set an AOI first (draw one, or Load AOI), then load a '
                 'route to estimate inside it.'); return
         path, _ = QFileDialog.getOpenFileName(
-            self, 'Load route', '', 'WKT (*.wkt *.txt);;All files (*)')
+            self, 'Load route', '', 'WKT or CSV (*.wkt *.csv *.txt);;All files (*)')
         if not path:
             return
         try:
-            with open(path, 'r', encoding='utf-8') as f:
-                geom = wkt_loads(f.read().strip())
+            geoms = _read_wkt_geoms(path)
         except Exception as e:
-            QMessageBox.critical(self, 'Route', f'Could not read WKT:\n{e}'); return
-        if geom.geom_type == 'LineString':
-            lines = [geom]
-        elif geom.geom_type == 'MultiLineString':
-            lines = list(geom.geoms)
-        elif geom.geom_type == 'GeometryCollection':
-            lines = [g for g in geom.geoms if g.geom_type == 'LineString']
-        else:
-            QMessageBox.warning(
-                self, 'Route', f'WKT must contain line passes (got {geom.geom_type}).')
-            return
+            QMessageBox.critical(self, 'Route', f'Could not read the file:\n{e}'); return
+        # Collect every pass: LINESTRINGs directly, and the parts of MULTILINESTRINGs
+        # (a route CSV may put one MULTILINESTRING in a row, or one LINESTRING per row).
+        lines = []
+        for g in geoms:
+            if g.geom_type == 'LineString':
+                lines.append(g)
+            elif g.geom_type == 'MultiLineString':
+                lines.extend(g.geoms)
+            elif g.geom_type == 'GeometryCollection':
+                lines.extend(x for x in g.geoms if x.geom_type == 'LineString')
         lines = [ln for ln in lines if not ln.is_empty and len(ln.coords) >= 2]
         if not lines:
-            QMessageBox.warning(self, 'Route', 'No valid passes (line strings) in the file.')
+            QMessageBox.warning(self, 'Route', 'No line passes found in the file.')
             return
         if not all(ln.has_z for ln in lines):
             QMessageBox.warning(
