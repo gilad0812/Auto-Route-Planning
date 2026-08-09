@@ -16,13 +16,19 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 _LAT_M = 111139.0
 
 
-def route_profile(route, dtm, is_geo=True, sample_step_m=None):
+def route_profile(route, dtm, is_geo=True, sample_step_m=None, join_passes=True):
     """Sample terrain + flight altitude along the flown route (ordered waypoints
-    with x, y, z). Returns (dist_m, terrain_m, flight_m) as lists in metres.
+    with x, y, z, pass_id). Returns (dist_m, terrain_m, flight_m) as lists in metres.
 
     NaN-z waypoints are dropped; flight altitude is linear between kept waypoints —
     flat within a pass (equal endpoint z) and a climb/descent across a turn. Terrain
-    is NaN where the path leaves the DTM (e.g. a ferry outside the tile)."""
+    is NaN where the path leaves the DTM (e.g. a ferry outside the tile).
+
+    join_passes=False (independent uploaded passes): the leg between two DIFFERENT
+    passes is dropped — no pseudo-pass connector (the flight line does not link them)
+    and no gap: the line just breaks and the next pass is laid right after this one.
+    join_passes=True keeps the route continuous (auto-planned routes, where the
+    turnaround/ferry clearance matters)."""
     wps = [w for w in route
            if not (isinstance(w['z'], float) and math.isnan(w['z']))]
     if len(wps) < 2:
@@ -36,9 +42,16 @@ def route_profile(route, dtm, is_geo=True, sample_step_m=None):
     dist, terr, flight, acc = [], [], [], 0.0
     for a, b in zip(wps, wps[1:]):
         seg_m = math.hypot((b['x'] - a['x']) * lon_m, (b['y'] - a['y']) * lat_m)
+        if not join_passes and a.get('pass_id') != b.get('pass_id'):
+            # Independent passes: drop the connector leg. Break the line (NaN) but
+            # DON'T advance the x-axis — the next pass sits directly after this one.
+            dist.append(acc); terr.append(float('nan')); flight.append(float('nan'))
+            continue
         n = max(1, min(2000, int(seg_m / step)))
         for i in range(n + 1):
-            if i == 0 and dist:            # skip the point shared with the last segment
+            # skip the point shared with the previous same-pass segment; but after a
+            # break (terr[-1] is NaN) keep i==0 — it starts the next pass.
+            if i == 0 and dist and not math.isnan(terr[-1]):
                 continue
             f = i / n
             x = a['x'] + (b['x'] - a['x']) * f

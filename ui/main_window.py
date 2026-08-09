@@ -1317,8 +1317,11 @@ class MainWindow(QMainWindow):
             self.profile_panel.clear()
             return
         from .profile import route_profile
+        # Uploaded independent passes: break the profile between them (no pseudo-pass
+        # connector line); auto-planned routes stay continuous for ferry clearance.
         dist, terr, flight = route_profile(
-            self._route_with_home(), self.dtm, self.is_geo)
+            self._route_with_home(), self.dtm, self.is_geo,
+            join_passes=not self._route_active)
         self.profile_panel.update_profile(dist, terr, flight, agl=self.sp_alt.value())
 
     # ---------------------------------------------------------------- HELIOS
