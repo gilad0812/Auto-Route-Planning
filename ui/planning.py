@@ -151,7 +151,7 @@ def compute_plan(dtm, polygon, params: PlanParams, chm=None, is_geo=True):
     area = polygon_area_m2(polygon, is_geo)
     if area > MAX_AOI_M2:
         raise ValueError(
-            f'AOI is {area / 1e6:.2f} km² — over the {MAX_AOI_M2 / 1e6:.0f} km² limit '
+            f'Polygon is {area / 1e6:.2f} km² — over the {MAX_AOI_M2 / 1e6:.0f} km² limit '
             f'for one plan. Draw a smaller area.')
     to_m = _LAT_M if is_geo else 1.0
     step_map = params.step_m / to_m

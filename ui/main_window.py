@@ -222,7 +222,7 @@ class MainWindow(QMainWindow):
         m = self.menuBar().addMenu('&File')
         a_dtm = QAction('Open DTM…', self); a_dtm.triggered.connect(self._open_dtm)
         a_chm = QAction('Open CHM…', self); a_chm.triggered.connect(self._open_chm)
-        a_wkt = QAction('Load AOI (.wkt/.csv)…', self)
+        a_wkt = QAction('Load polygon (.wkt/.csv)…', self)
         a_wkt.triggered.connect(self._load_wkt_aoi)
         a_route = QAction('Load route (.wkt/.csv)…', self)
         a_route.triggered.connect(self._load_wkt_route)
@@ -291,11 +291,11 @@ class MainWindow(QMainWindow):
         # ── AOI ── (workflow step ②)
         self.gb_aoi = gb_aoi = QGroupBox('② Survey area')
         al = QVBoxLayout(gb_aoi)
-        self.lbl_aoi = QLabel('Draw a polygon on the map to set the AOI.')
+        self.lbl_aoi = QLabel('Draw a polygon on the map.')
         self.lbl_aoi.setWordWrap(True); self.lbl_aoi.setStyleSheet('color:#888;')
         b_enter_aoi = QPushButton('Enter coordinates…')
         b_enter_aoi.clicked.connect(self._enter_aoi_coords)
-        b_clear_aoi = QPushButton('Clear drawn AOI')
+        b_clear_aoi = QPushButton('Clear drawn polygon')
         b_clear_aoi.clicked.connect(self._clear_aoi)
         al.addWidget(self.lbl_aoi); al.addWidget(b_enter_aoi); al.addWidget(b_clear_aoi)
         v.addWidget(gb_aoi)
@@ -320,10 +320,10 @@ class MainWindow(QMainWindow):
         self.sp_alt = self._dspin(1, 1000, 100, ' m', 5)
         self.sp_overlap = self._dspin(20, 50, 20, ' %', 1)
         self.cb_adaptive = QCheckBox('Terrain-adaptive spacing'); self.cb_adaptive.setChecked(True)
-        self.cb_edge_margin = QCheckBox('Edge fly-past (cover AOI rim)')
+        self.cb_edge_margin = QCheckBox('Edge fly-past (cover polygon rim)')
         self.cb_edge_margin.setToolTip(
-            'Extend passes one pass-pitch beyond the AOI so edge cells get full '
-            'overlap (removes the boundary coverage gap). Flies slightly outside the AOI.')
+            'Extend passes one pass-pitch beyond the polygon so edge cells get full '
+            'overlap (removes the boundary coverage gap). Flies slightly outside the polygon.')
         fl.addRow('Altitude AGL', self.sp_alt)
         fl.addRow('Overlap', self.sp_overlap)
         fl.addRow(self.cb_adaptive)               # span both columns → hug the left edge
@@ -563,9 +563,9 @@ class MainWindow(QMainWindow):
         """Show the whole-extent overview (default DTM view)."""
         self.drawn_polygon = None
         self.btn_compute.setEnabled(False)
-        self.lbl_aoi.setText('Draw a polygon on the map to set the AOI.')
+        self.lbl_aoi.setText('Draw a polygon on the map.')
         self._refresh_map()
-        self.statusBar().showMessage('DTM loaded. Draw an AOI on the map, then Compute.')
+        self.statusBar().showMessage('DTM loaded. Draw an polygon on the map, then Compute.')
 
     def _open_dtm_cropped(self, poly):
         """Render the just-opened DTM cropped to a pending AOI instead of the whole extent
@@ -575,17 +575,17 @@ class MainWindow(QMainWindow):
         area = polygon_area_m2(poly, self.is_geo)
         if not poly.intersects(shapely_box(b.left, b.bottom, b.right, b.top)):
             QMessageBox.warning(
-                self, 'AOI', 'The loaded AOI does not overlap this DTM — showing the full '
+                self, 'Polygon', 'The loaded polygon does not overlap this DTM — showing the full '
                 'extent. Its coordinates must be in the DTM CRS.')
             self._open_dtm_full(); return
         if area > MAX_AOI_M2:
             QMessageBox.warning(
-                self, 'AOI', f'The loaded AOI is {area / 1e6:.2f} km² — over the '
+                self, 'Polygon', f'The loaded polygon is {area / 1e6:.2f} km² — over the '
                 f'{MAX_AOI_M2 / 1e6:.0f} km² limit; showing the full extent.')
             self._open_dtm_full(); return
         self.drawn_polygon = poly
         self._map_focused = True
-        self._set_busy(True, 'Cropping the DTM to the AOI…')
+        self._set_busy(True, 'Cropping the DTM to the polygon…')
         try:
             self.mapview.set_dtm(self.dtm, self.dtm_path, self.chm, self.chm_path,
                                  focus_polygon=poly)
@@ -594,9 +594,9 @@ class MainWindow(QMainWindow):
             self._set_busy(False)
         self._sync_focus_button()
         self.btn_compute.setEnabled(True)
-        self.lbl_aoi.setText('✓ AOI loaded — DTM cropped to it (map focused).')
+        self.lbl_aoi.setText('✓ polygon loaded — DTM cropped to it (map focused).')
         self.statusBar().showMessage(
-            'DTM opened cropped to the AOI — full-extent render skipped.')
+            'DTM opened cropped to the polygon — full-extent render skipped.')
 
     def _clear_dtm(self):
         """Drop the loaded DTM (and the CHM/AOI/results that depend on it) and
@@ -610,7 +610,7 @@ class MainWindow(QMainWindow):
         self.lbl_dtm.setText('DTM: (none)')
         self.lbl_chm.setText('CHM: (none)')
         self.lbl_home.setText('Home: (none)')
-        self.lbl_aoi.setText('Draw a polygon on the map to set the AOI.')
+        self.lbl_aoi.setText('Draw a polygon on the map.')
         self.btn_compute.setEnabled(False)
         self._clear_results()
         if self.mapview is not None:
@@ -620,9 +620,9 @@ class MainWindow(QMainWindow):
     def _enter_aoi_coords(self):
         """Set the AOI from manually-typed vertices instead of drawing on the map."""
         if self.dtm is None:
-            QMessageBox.information(self, 'AOI', 'Open a DTM first.'); return
+            QMessageBox.information(self, 'Polygon', 'Open a DTM first.'); return
         from PySide6.QtWidgets import QDialog, QPlainTextEdit, QDialogButtonBox
-        dlg = QDialog(self); dlg.setWindowTitle('Enter AOI polygon')
+        dlg = QDialog(self); dlg.setWindowTitle('Enter polygon')
         lay = QVBoxLayout(dlg)
         info = QLabel('One vertex per line as  <b>lat, lon</b>  (matching the map '
                       'readout). At least 3 vertices; the polygon is closed '
@@ -642,7 +642,7 @@ class MainWindow(QMainWindow):
         geom = {'type': 'Polygon', 'coordinates': [coords + [coords[0]]]}
         self.mapview.set_aoi_polygon(coords)
         self._on_polygon_drawn(geom)
-        self.lbl_aoi.setText('✓ AOI set from entered coordinates.')
+        self.lbl_aoi.setText('✓ polygon set from entered coordinates.')
 
     def _parse_coords(self, text):
         """Parse 'lat, lon' lines into a list of [lon, lat] vertices, or None."""
@@ -653,16 +653,16 @@ class MainWindow(QMainWindow):
                 continue
             parts = ln.replace(',', ' ').split()
             if len(parts) < 2:
-                QMessageBox.warning(self, 'AOI', f'Bad line: "{ln}"\nUse: lat, lon')
+                QMessageBox.warning(self, 'Polygon', f'Bad line: "{ln}"\nUse: lat, lon')
                 return None
             try:
                 lat, lon = float(parts[0]), float(parts[1])
             except ValueError:
-                QMessageBox.warning(self, 'AOI', f'Not numbers: "{ln}"')
+                QMessageBox.warning(self, 'Polygon', f'Not numbers: "{ln}"')
                 return None
             coords.append([lon, lat])
         if len(coords) < 3:
-            QMessageBox.warning(self, 'AOI', 'Enter at least 3 vertices.')
+            QMessageBox.warning(self, 'Polygon', 'Enter at least 3 vertices.')
             return None
         return coords
 
@@ -671,14 +671,14 @@ class MainWindow(QMainWindow):
         the DTM's CRS). With a DTM open, focus the map on it at native resolution. WITHOUT a
         DTM, remember it and crop the DTM to it on the next Open DTM."""
         path, _ = QFileDialog.getOpenFileName(
-            self, 'Load AOI polygon', '',
+            self, 'Load polygon', '',
             'WKT or CSV (*.wkt *.csv *.txt);;All files (*)')
         if not path:
             return
         try:
             geoms = _read_wkt_geoms(path)
         except Exception as e:
-            QMessageBox.critical(self, 'AOI', f'Could not read the file:\n{e}'); return
+            QMessageBox.critical(self, 'Polygon', f'Could not read the file:\n{e}'); return
         # Reduce to a single polygon (first polygonal geometry in the file).
         poly = None
         for g in geoms:
@@ -687,23 +687,23 @@ class MainWindow(QMainWindow):
             if g.geom_type in ('MultiPolygon', 'GeometryCollection'):
                 poly = g.convex_hull; break          # a valid single Polygon
         if poly is None:
-            QMessageBox.warning(self, 'AOI', 'No polygon found in the file.'); return
+            QMessageBox.warning(self, 'Polygon', 'No polygon found in the file.'); return
         if not poly.is_valid:
             poly = poly.buffer(0)
         if poly.is_empty or poly.geom_type != 'Polygon':
-            QMessageBox.warning(self, 'AOI', 'The polygon is empty or invalid.'); return
+            QMessageBox.warning(self, 'Polygon', 'The polygon is empty or invalid.'); return
         if self.dtm is None:
             # No DTM yet — remember it; Open DTM will crop to it (CRS is checked then).
             self._pending_aoi = poly
-            self.lbl_aoi.setText('AOI loaded — open a DTM to crop straight to it.')
+            self.lbl_aoi.setText('Polygon loaded — open a DTM to crop straight to it.')
             self.statusBar().showMessage(
-                'AOI stored. File > Open DTM to render only this area (skips the full map).')
+                'Polygon stored. File > Open DTM to render only this area (skips the full map).')
             return
         # WKT carries no CRS, so its coordinates must be in the DTM's frame; require overlap.
         b = self.dtm.src.bounds
         if not poly.intersects(shapely_box(b.left, b.bottom, b.right, b.top)):
             QMessageBox.warning(
-                self, 'AOI', 'The polygon does not overlap the DTM.\nIts coordinates '
+                self, 'Polygon', 'The polygon does not overlap the DTM.\nIts coordinates '
                 'must be in the same CRS as the DTM.'); return
         # Reuse the drawn-polygon path: applies the area cap, sets state, enables Compute.
         ext = [list(c) for c in poly.exterior.coords]
@@ -711,9 +711,9 @@ class MainWindow(QMainWindow):
         if self.drawn_polygon is None:                   # rejected by the area cap
             return
         self._render_map(focus=True)                     # focus the map on the AOI
-        self.lbl_aoi.setText('✓ AOI loaded from WKT — map focused at native resolution.')
+        self.lbl_aoi.setText('✓ polygon loaded from WKT — map focused at native resolution.')
         self.statusBar().showMessage(
-            f'AOI from {os.path.basename(path)}; map focused on the area.')
+            f'Polygon from {os.path.basename(path)}; map focused on the area.')
 
     def _passes_region(self, pts):
         """A polygon covering `pts` [(lon,lat)] — the convex hull, buffered to a real
@@ -734,7 +734,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, 'Route', 'Open a DTM first.'); return
         if self.drawn_polygon is None:
             QMessageBox.information(
-                self, 'Route', 'Set an AOI first (draw one, or Load AOI), then load a '
+                self, 'Route', 'Set a polygon first (draw one, or Load polygon), then load a '
                 'route to estimate inside it.'); return
         path, _ = QFileDialog.getOpenFileName(
             self, 'Load route', '', 'WKT or CSV (*.wkt *.csv *.txt);;All files (*)')
@@ -839,7 +839,7 @@ class MainWindow(QMainWindow):
             route = band_pass_altitudes(route, self.dtm, self._params().altitude_m,
                                         is_geo=self.is_geo)
         self.mapview.clear_route_passes()            # leave selection mode
-        self.lbl_aoi.setText(f'✓ AOI + {len(ids)} selected passes (uploaded route).')
+        self.lbl_aoi.setText(f'✓ polygon + {len(ids)} selected passes (uploaded route).')
         self._estimate_uploaded_route(route)
 
     def _estimate_uploaded_route(self, route):
@@ -968,28 +968,28 @@ class MainWindow(QMainWindow):
             self.drawn_polygon = None
             self.btn_compute.setEnabled(False)
             self.lbl_aoi.setText(
-                f'⚠ AOI is {area / 1e6:.2f} km² — over the {MAX_AOI_M2 / 1e6:.0f} km² '
+                f'⚠ Polygon is {area / 1e6:.2f} km² — over the {MAX_AOI_M2 / 1e6:.0f} km² '
                 f'limit. Draw a smaller area.')
             self.statusBar().showMessage(
-                f'AOI too large ({area / 1e6:.2f} km²); max {MAX_AOI_M2 / 1e6:.0f} km².')
+                f'Polygon too large ({area / 1e6:.2f} km²); max {MAX_AOI_M2 / 1e6:.0f} km².')
             return
         self.drawn_polygon = poly
         self._clear_results()                 # previous route no longer matches AOI
         self.loaded_route = None; self._set_route_mode(False)   # new AOI -> auto-plan mode
-        self.lbl_aoi.setText('✓ AOI set from the drawn polygon.')
+        self.lbl_aoi.setText('✓ polygon set.')
         self.btn_compute.setEnabled(True)
         # If the map is focused, follow the new AOI; otherwise just enable the toggle.
         if self._map_focused:
             self._render_map(focus=True)
         else:
             self._sync_focus_button()
-        self.statusBar().showMessage('AOI set from drawn polygon. Click Compute.')
+        self.statusBar().showMessage('Polygon set. Click Compute.')
 
     def _clear_aoi(self):
         self.drawn_polygon = None
         self.loaded_route = None; self._set_route_mode(False)
         self.btn_compute.setEnabled(False)
-        self.lbl_aoi.setText('Draw a polygon on the map to set the AOI.')
+        self.lbl_aoi.setText('Draw a polygon on the map.')
         self._clear_results()
         self._refresh_map()
 
@@ -1195,7 +1195,7 @@ class MainWindow(QMainWindow):
         if self.dtm is None:
             return
         if self.drawn_polygon is None:
-            QMessageBox.information(self, 'AOI', 'Draw a polygon on the map first.')
+            QMessageBox.information(self, 'Polygon', 'Draw a polygon on the map first.')
             return
         if self._route_active and self.survey_route:
             # Uploaded route: re-run the estimate on the same passes with current params.
@@ -1402,7 +1402,7 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------------- render
     def _render_summary(self, r):
         if not r.route:
-            self.lbl_summary.setText('No route produced (AOI too small or off the DTM).')
+            self.lbl_summary.setText('No route produced (polygon too small or off the DTM).')
             return
         est = r.estimate or {}
         area = (f'{r.area_m2 / 1e6:.3f} km²' if r.area_m2 >= 1e6

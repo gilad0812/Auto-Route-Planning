@@ -165,10 +165,9 @@ class CanvasMap(QWidget):
         barw.setStyleSheet('#mapbar { background:#232629; '
                            'border-bottom:1px solid #383c42; }')
         bar = QHBoxLayout(barw); bar.setContentsMargins(8, 6, 8, 6); bar.setSpacing(6)
-        self.btn_draw = QToolButton(); self.btn_draw.setText('✎ Draw AOI')
+        self.btn_draw = QToolButton(); self.btn_draw.setText('✎ Draw polygon')
         self.btn_draw.setCheckable(True); self.btn_draw.clicked.connect(self._toggle_draw)
-        self.btn_finish = QToolButton(); self.btn_finish.setText('Finish')
-        self.btn_finish.clicked.connect(self.finish_draw)
+        self.btn_draw.setToolTip('Click to add vertices; double-click to close the polygon.')
         self.btn_pass = QToolButton(); self.btn_pass.setText('✚ Add Pass')
         self.btn_pass.setCheckable(True); self.btn_pass.setEnabled(False)
         self.btn_pass.setToolTip('Click two points to add a flight pass; its height '
@@ -176,21 +175,26 @@ class CanvasMap(QWidget):
         self.btn_pass.clicked.connect(self._toggle_pass)
         self.btn_fit = QToolButton(); self.btn_fit.setText('⤢ Fit')
         self.btn_fit.clicked.connect(self._fit)
-        self.btn_focus = QToolButton(); self.btn_focus.setText('◎ AOI')
+        self.btn_focus = QToolButton(); self.btn_focus.setText('◎ polygon')
         self.btn_focus.setCheckable(True); self.btn_focus.setEnabled(False)
-        self.btn_focus.setToolTip('Zoom the map to the AOI at native resolution; '
+        self.btn_focus.setToolTip('Zoom the map to the polygon at native resolution; '
                                   'toggle off to show the full DTM.')
         self.btn_focus.toggled.connect(self.focusToggled)
         self.btn_chm = QToolButton(); self.btn_chm.setText('CHM')
         self.btn_chm.setCheckable(True); self.btn_chm.setEnabled(False)
         self.btn_chm.clicked.connect(self._toggle_chm)
         # Shown only while selecting passes from a loaded route (.wkt).
+        self.btn_all = QToolButton(); self.btn_all.setText('Select all')
+        self.btn_all.setEnabled(False); self.btn_all.setVisible(False)
+        self.btn_all.setToolTip('Select every pass in the loaded route (toggles to Clear all).')
+        self.btn_all.clicked.connect(self._toggle_select_all)
         self.btn_confirm = QToolButton(); self.btn_confirm.setText('✓ Confirm passes')
         self.btn_confirm.setEnabled(False); self.btn_confirm.setVisible(False)
         self.btn_confirm.setToolTip('Run the density estimate on the selected passes.')
         self.btn_confirm.clicked.connect(self.passesConfirmed)
-        for b in (self.btn_draw, self.btn_finish, self.btn_pass,
-                  self.btn_fit, self.btn_focus, self.btn_chm, self.btn_confirm):
+        for b in (self.btn_draw, self.btn_pass,
+                  self.btn_fit, self.btn_focus, self.btn_chm,
+                  self.btn_all, self.btn_confirm):
             bar.addWidget(b)
         bar.addStretch(1)
         self.lbl_coord = QLabel(''); self.lbl_coord.setStyleSheet('color:#9aa0a6;')
@@ -212,6 +216,7 @@ class CanvasMap(QWidget):
         self._pass_anchor = None; self._pass_preview = None
         self._route_passes = {}; self.selecting_passes = False
         self.btn_confirm.setVisible(False); self.btn_confirm.setEnabled(False)
+        self.btn_all.setVisible(False); self.btn_all.setEnabled(False)
         self._disp_transform = None; self._inv = None
         self.drawing_pass = False; self.btn_pass.setChecked(False)
         self.btn_pass.setEnabled(False)
@@ -240,6 +245,9 @@ class CanvasMap(QWidget):
         self.selecting_passes = True
         self.btn_confirm.setVisible(True)
         self.btn_confirm.setEnabled(False)
+        self.btn_all.setVisible(True)
+        self.btn_all.setEnabled(bool(self._route_passes))
+        self._sync_all_button()
         self.passSelectionChanged.emit(0)
 
     def _style_pass(self, pid):
@@ -268,7 +276,28 @@ class CanvasMap(QWidget):
         self._style_pass(best_pid)
         n = len(self.selected_pass_ids())
         self.btn_confirm.setEnabled(n > 0)
+        self._sync_all_button()
         self.passSelectionChanged.emit(n)
+
+    def _toggle_select_all(self):
+        """Select every pass at once — or clear all when they're already all selected —
+        so the operator isn't forced to click each pass of a loaded route by hand."""
+        if not self._route_passes:
+            return
+        want = not all(d['selected'] for d in self._route_passes.values())
+        for pid, d in self._route_passes.items():
+            d['selected'] = want
+            self._style_pass(pid)
+        n = len(self.selected_pass_ids())
+        self.btn_confirm.setEnabled(n > 0)
+        self._sync_all_button()
+        self.passSelectionChanged.emit(n)
+
+    def _sync_all_button(self):
+        """Label the toggle for the action it will perform next."""
+        all_sel = bool(self._route_passes) and all(
+            d['selected'] for d in self._route_passes.values())
+        self.btn_all.setText('Clear all' if all_sel else 'Select all')
 
     def selected_pass_ids(self):
         return [pid for pid, d in self._route_passes.items() if d['selected']]
@@ -279,6 +308,7 @@ class CanvasMap(QWidget):
         self._route_passes = {}
         self.selecting_passes = False
         self.btn_confirm.setVisible(False); self.btn_confirm.setEnabled(False)
+        self.btn_all.setVisible(False); self.btn_all.setEnabled(False)
 
     def set_dtm(self, dtm, dtm_path=None, chm=None, chm_path=None, focus_polygon=None):
         self.dtm = dtm; self.chm = chm
@@ -509,6 +539,7 @@ class CanvasMap(QWidget):
         self._focus_polygon = None
         self._route_passes = {}; self.selecting_passes = False
         self.btn_confirm.setVisible(False); self.btn_confirm.setEnabled(False)
+        self.btn_all.setVisible(False); self.btn_all.setEnabled(False)
         self._aoi_item = self._route_group = self._density_item = None
         self._helios_item = self._chm_item = None; self._home_item = None
         self._verts = []; self._draw_items = []; self._pass_segs = []
