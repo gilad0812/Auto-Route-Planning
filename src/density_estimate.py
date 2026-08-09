@@ -240,8 +240,16 @@ def estimate_density_grid(
         r, c = np.where(m)
         return list(zip(LON[r, c].tolist(), LAT[r, c].tolist()))
 
+    # One coverage/density gradient for the cells whose problem IS low coverage — thin
+    # (reached but sparse) AND gap (never in a swath): density / target in [0, 1], so
+    # 0 (empty / uncovered) draws red and target draws yellow. `range` and `shadow` stay
+    # their own colours — their fix isn't more coverage (scanner range / occlusion).
+    _under = _thin | _gap
+    _ur, _uc = np.where(_under)
+    _ufrac = np.clip(density[_ur, _uc] / max(float(min_points), 1e-9), 0.0, 1.0)
     by_reason = {"range": _geo(_range), "shadow": _geo(_shadow),
-                 "thin": _geo(_thin), "gap": _geo(_gap)}
+                 "thin": list(zip(LON[_ur, _uc].tolist(), LAT[_ur, _uc].tolist(),
+                                  _ufrac.tolist()))}
 
     in_vals = density[inside]
     return {

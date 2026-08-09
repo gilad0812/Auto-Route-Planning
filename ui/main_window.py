@@ -31,14 +31,12 @@ except Exception as _e:
     _MAPVIEW_ERR = str(_e)
     # Qt-free fallback so the summary legend still renders without the map backend.
     FAILURE_REASON_STYLE = {
-        "range": ("#e5484d", 130), "shadow": ("#8250df", 120),
-        "thin": ("#ff9900", 95), "gap": ("#8c959f", 120),
+        "range": ("#8c959f", 130), "shadow": ("#8250df", 120), "thin": ("#ff9900", 95),
     }
     FAILURE_REASON_LABEL = {
         "range": ("Beyond scanner range", "lower AGL or PRR"),
         "shadow": ("Occlusion shadow", "needs a cross-pass, or accept"),
-        "thin": ("Thin (under target)", "lower AGL / tighter AOI"),
-        "gap": ("Not covered", "spacing / AOI edge"),
+        "thin": ("Under target", "lower AGL / tighter spacing"),
     }
 
 from shapely.geometry import shape as shapely_shape, box as shapely_box, MultiPoint
@@ -1439,21 +1437,27 @@ class MainWindow(QMainWindow):
         ]
         # Failure breakdown by CAUSE — swatch colours match the map overlay, so the
         # operator reads why each patch is orange/red/etc. and what lever fixes it.
+        # 'thin' folds in the uncovered (gap) cells — both are "under target coverage"
+        # and share the density gradient; range & shadow stay distinct causes.
         _reason_counts = {'range': est.get('n_beyond_range', 0),
                           'shadow': est.get('n_shadow', 0),
-                          'thin': est.get('n_thin', 0),
-                          'gap': est.get('n_gap', 0)}
+                          'thin': est.get('n_thin', 0) + est.get('n_gap', 0)}
         if any(_reason_counts.values()):
             rows.append(('<b>Why cells fail</b>', ''))
-            for key in ('range', 'shadow', 'thin', 'gap'):
+            for key in ('range', 'shadow', 'thin'):
                 n = _reason_counts[key]
                 if not n:
                     continue
-                hexc = FAILURE_REASON_STYLE[key][0]
                 label, lever = FAILURE_REASON_LABEL[key]
-                rows.append(
-                    (f'<span style="color:{hexc}">■</span> {label}',
-                     f'{n:,} cells · <i>{lever}</i>'))
+                if key == 'thin':
+                    # gradient swatch: red (empty / uncovered) → yellow (at target)
+                    swatch = ('<span style="color:#ff0000">■</span>'
+                              '<span style="color:#ff9900">■</span>'
+                              '<span style="color:#ffee00">■</span>')
+                    label = 'Under target (empty → target)'
+                else:
+                    swatch = f'<span style="color:{FAILURE_REASON_STYLE[key][0]}">■</span>'
+                rows.append((f'{swatch} {label}', f'{n:,} cells · <i>{lever}</i>'))
 
         html = ['<table cellspacing=6>']
         for k, val in rows:

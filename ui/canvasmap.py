@@ -35,18 +35,18 @@ _FOCUS_DISP_CELLS = 16_000_000
 # Under-density overlay palette, keyed by the estimator's failure CAUSE. Shared
 # with the summary legend so map colours and text agree. (hex, alpha).
 FAILURE_REASON_STYLE = {
-    "range": ("#e5484d", 130),    # beyond scanner max range — lower AGL/PRR
-    "shadow": ("#8250df", 120),   # occlusion shadow — cross-pass or accept
-    "thin": ("#ff9900", 95),      # reached but under target — AGL/edge thinning
-    "gap": ("#8c959f", 120),      # never in a swath — spacing / AOI-edge gap
+    "range": ("#8c959f", 130),    # beyond scanner max range — lower AGL/PRR (grey)
+    "shadow": ("#8250df", 120),   # occlusion shadow — cross-pass or accept (purple)
+    "thin": ("#ff9900", 95),      # under target (incl. uncovered) — drawn as a gradient
 }
 # Human labels + the operator's lever, for the legend.
 FAILURE_REASON_LABEL = {
     "range": ("Beyond scanner range", "lower AGL or PRR"),
     "shadow": ("Occlusion shadow", "needs a cross-pass, or accept"),
-    "thin": ("Thin (under target)", "lower AGL / tighter AOI"),
-    "gap": ("Not covered", "spacing / AOI edge"),
+    "thin": ("Under target", "lower AGL / tighter spacing"),
 }
+# Under-target cells (thin + uncovered) are shaded by density/target: 0 → red, target → yellow.
+_THIN_CMAP = plt.get_cmap('autumn')
 
 
 def _point_seg_dist(px, py, ax, ay, bx, by):
@@ -544,10 +544,12 @@ class CanvasMap(QWidget):
         # Prefer the cause-coloured breakdown when the estimate provides it; fall
         # back to a single colour for older results / callers.
         if cells_by_reason:
+            # thin cells are drawn as a density gradient (see _paint_cell_layers), the
+            # rest as their flat cause colour.
             layers = [(cells_by_reason.get(k, []), hexc, alpha)
-                      for k, (hexc, alpha) in FAILURE_REASON_STYLE.items()]
+                      for k, (hexc, alpha) in FAILURE_REASON_STYLE.items() if k != 'thin']
             self._density_item = self._paint_cell_layers(
-                layers, density_radius_m, max_density_pts)
+                layers, cells_by_reason.get('thin', []), density_radius_m, max_density_pts)
         elif density_cells:
             self._density_item = self._paint_cells(
                 density_cells, density_color, 90, density_radius_m, max_density_pts)
@@ -599,26 +601,40 @@ class CanvasMap(QWidget):
         self.scene.addItem(item)
         return item
 
-    def _paint_cell_layers(self, layers, radius_m, max_pts=20000):
-        """Paint several (cells, color_hex, alpha) layers onto ONE overlay image
-        so cause-coloured failure cells share a single scene item. Each layer is
-        down-sampled independently to keep the draw bounded."""
+    def _paint_cell_layers(self, layers, thin_cells, radius_m, max_pts=20000):
+        """Paint the flat-colour cause layers plus the THIN cells as a density gradient
+        onto ONE overlay image. `layers` = [(cells[(lon,lat)], color_hex, alpha), …];
+        `thin_cells` = [(lon, lat, frac), …] with frac = density/target in [0,1] — drawn
+        via a red→yellow heat map (0 = empty, target = yellow), so the operator sees HOW
+        thin, not just that a cell is thin. Each set is down-sampled to keep it bounded."""
         h, w, _ = self._relief.shape
         ov = QImage(w, h, QImage.Format_RGBA8888); ov.fill(0)
         p = QPainter(ov)
         p.setPen(QPen(Qt.NoPen))
         rad_px = max(1.0, radius_m / self._pixel_m())
+
+        def _sub(cells):
+            if len(cells) <= max_pts:
+                return cells
+            step = len(cells) / max_pts
+            return [cells[int(i * step)] for i in range(max_pts)]
+
         for cells, color_hex, alpha in layers:
             if not cells:
                 continue
-            if len(cells) > max_pts:
-                step = len(cells) / max_pts
-                cells = [cells[int(i * step)] for i in range(max_pts)]
             col = QColor(color_hex); col.setAlpha(alpha)
             p.setBrush(QBrush(col))
-            for lon, lat in cells:
+            for lon, lat in _sub(cells):
                 c, r = self._inv * (lon, lat)
                 p.drawEllipse(QPointF(c, r), rad_px, rad_px)
+
+        if thin_cells:
+            for lon, lat, frac in _sub(thin_cells):
+                rr, gg, bb, _a = _THIN_CMAP(float(frac))   # 0→red, 1(target)→yellow
+                p.setBrush(QBrush(QColor(int(rr * 255), int(gg * 255), int(bb * 255), 150)))
+                c, r = self._inv * (lon, lat)
+                p.drawEllipse(QPointF(c, r), rad_px, rad_px)
+
         p.end()
         item = QGraphicsPixmapItem(QPixmap.fromImage(ov))
         self.scene.addItem(item)
