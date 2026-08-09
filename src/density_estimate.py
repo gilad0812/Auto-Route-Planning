@@ -9,9 +9,16 @@ the derivation, so it doesn't affect average density. Per-cell density sums ρ o
 every pass whose swath covers it — capturing swath-edge thinning (cos²θ), range²
 thinning over valleys, coverage gaps, and the FOV cut-off.
 
-Occlusion is modelled by a line-of-sight march; a CHM thins vegetated cells by
-`veg_penetration`. Multiple returns are not modelled — an estimator for iterating,
-confirmed by one HELIOS++ run.
+VUX-120 "NFB": the beam alternates nadir / +forward / −backward (datasheet: ±10° at
+swath centre, up to ±15° at the swath edges), transverse to the cross-track scan, so
+each pass is three looks sharing the pulse budget (~1/3 each). Modelling all three
+lets steep/occluded faces that the nadir look misses be covered from the fore or aft
+angle — the sensor's whole point on "vertical surfaces and narrow canyons". Total
+density is conserved (pulses split, not added). Toggle with `nfb`.
+
+Occlusion is modelled by a line-of-sight march (per look); a CHM thins vegetated
+cells by `veg_penetration`. Multiple returns are not modelled — an estimator for
+iterating, confirmed by one HELIOS++ run.
 """
 
 import math
@@ -39,7 +46,7 @@ def estimate_density_grid(
     route, dtm, region, *,
     pulse_freq_hz, scan_freq_hz, scan_half_angle_deg, speed_ms, min_points,
     is_geo=True, cell_size_m=1.0, max_cells=3_000_000,
-    occlusion=True, occ_margin_m=2.0,
+    occlusion=True, occ_margin_m=2.0, nfb=True,
     chm=None, veg_penetration=0.4,
 ):
     """Estimate per-cell point density for `route` over `dtm`.
@@ -148,9 +155,14 @@ def estimate_density_grid(
         return arr[rq, cq]
 
     # ── Accumulate density from every pass ───────────────────────────────────
+    # NFB looks: (along-track sign, pulse-budget fraction). The beam alternates
+    # nadir/forward/backward (datasheet), so each carries ~1/3 of the pulses — a
+    # cell seen by all three gets 3·(1/3) = the same total (density conserved).
+    looks = ((0.0, 1.0 / 3.0), (1.0, 1.0 / 3.0), (-1.0, 1.0 / 3.0)) if nfb \
+        else ((0.0, 1.0),)
     density = np.zeros((ny, nx), dtype=float)
     range_hit = np.zeros((ny, nx), dtype=bool)   # in-FOV but beyond max range
-    any_fov = np.zeros((ny, nx), dtype=bool)     # in some pass's FOV (any range)
+    any_fov = np.zeros((ny, nx), dtype=bool)     # in some look's FOV (any range)
     any_covered = np.zeros((ny, nx), dtype=bool)  # in-FOV AND in-range (pre-occlusion)
     for pts in passes:
         z_pass = float(pts[0]["z"])
@@ -162,42 +174,51 @@ def estimate_density_grid(
         L2 = dx * dx + dy * dy
         if L2 < 1e-9:
             fx, fy = ax, ay
+            ux, uy = 1.0, 0.0
         else:
             tt = np.clip(((E - ax) * dx + (N - ay) * dy) / L2, 0.0, 1.0)
             fx, fy = ax + tt * dx, ay + tt * dy
-        ox, oy = E - fx, N - fy                     # horizontal aircraft→cell offset
+            _pl = math.sqrt(L2); ux, uy = dx / _pl, dy / _pl   # along-track unit vector
+        ox, oy = E - fx, N - fy                     # cross-track aircraft→cell offset
         d = np.hypot(ox, oy)
         h = z_pass - terr                           # AGL above each cell
         with np.errstate(invalid="ignore"):
-            R = np.sqrt(d * d + h * h)              # slant range
-            # cos(incidence) of ray vs surface normal; flat ground → h/R.
-            cos_i = (h + ox * g_e + oy * g_n) / (np.maximum(R, 1e-6) * nrm)
-            in_fov = (np.isfinite(h) & (h > 1.0)
-                      & (d <= h * tan_half) & (cos_i > 0.0))
-            range_hit |= in_fov & (R > rng_max)   # emitted, but no return
-            covered = in_fov & (R <= rng_max)
-            # cos_i / R → points per tilted SURFACE m² (survey-quality metric);
-            # HELIOS normalises the same way, so estimate and sim are comparable.
-            contrib = np.where(
-                covered,
-                pulse_freq_hz * cos_i / (speed_ms * np.maximum(R, 1.0) * fov),
-                0.0,
-            )
-        # Occlusion: march the sight-line from the pass down to the cell; terrain
-        # rising above it blocks the beam (shadowed gully floor / lee face). The
-        # dominant effect HELIOS sees that pure scan geometry misses.
-        if occlusion:
-            with np.errstate(invalid="ignore"):
-                blocked = np.zeros_like(h, dtype=bool)
-                for tf in (0.25, 0.45, 0.65, 0.82, 0.93):
-                    Em = E - (1.0 - tf) * ox        # march point foot→cell
-                    Nm = N - (1.0 - tf) * oy
-                    los = z_pass - tf * h           # straight sight-line altitude
-                    blocked |= covered & (_terr_EN(Em, Nm) > los + occ_margin_m)
-            contrib = np.where(blocked, 0.0, contrib)
-        any_fov |= in_fov
-        any_covered |= covered
-        density += contrib
+            in_swath = np.isfinite(h) & (h > 1.0) & (d <= h * tan_half)   # cross-track FOV
+            # Fore/aft along-track tilt grows 10° (swath centre) → 15° (edge); the
+            # along-track ground reach of that tilt at this AGL is a_f.
+            _frac = np.clip(d / np.maximum(h * tan_half, 1e-6), 0.0, 1.0)
+            a_f = h * np.tan(np.radians(10.0 + 5.0 * _frac))
+            for sgn, wgt in looks:
+                px = ox + sgn * a_f * ux             # this look's horizontal offset to cell
+                py = oy + sgn * a_f * uy
+                R = np.sqrt(px * px + py * py + h * h)   # slant range for this look
+                # cos(incidence) of THIS look's ray vs surface normal; flat ground → h/R.
+                cos_i = (h + px * g_e + py * g_n) / (np.maximum(R, 1e-6) * nrm)
+                in_fov = in_swath & (cos_i > 0.0)
+                range_hit |= in_fov & (R > rng_max)   # emitted, but no return
+                covered = in_fov & (R <= rng_max)
+                # cos_i / R → points per tilted SURFACE m² (survey-quality metric);
+                # HELIOS normalises the same way, so estimate and sim are comparable.
+                contrib = np.where(
+                    covered,
+                    wgt * pulse_freq_hz * cos_i / (speed_ms * np.maximum(R, 1.0) * fov),
+                    0.0,
+                )
+                # Occlusion: march THIS look's sight-line from the sensor down to the
+                # cell; terrain rising above it blocks the beam. Fore/aft looks see under
+                # ridges the nadir look can't — the recovery NFB is meant to give.
+                if occlusion:
+                    with np.errstate(invalid="ignore"):
+                        blocked = np.zeros_like(h, dtype=bool)
+                        for tf in (0.25, 0.45, 0.65, 0.82, 0.93):
+                            Em = E - (1.0 - tf) * px    # march point sensor→cell
+                            Nm = N - (1.0 - tf) * py
+                            los = z_pass - tf * h       # straight sight-line altitude
+                            blocked |= covered & (_terr_EN(Em, Nm) > los + occ_margin_m)
+                    contrib = np.where(blocked, 0.0, contrib)
+                any_fov |= in_fov
+                any_covered |= covered
+                density += contrib
 
     # Canopy: vegetated cells keep only `veg_penetration` of the bare-earth density
     # (the fraction of pulses reaching the ground through the canopy).
