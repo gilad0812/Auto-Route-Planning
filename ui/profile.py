@@ -9,6 +9,7 @@ redraws whenever the route changes.
 import math
 
 import numpy as np
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -18,7 +19,10 @@ _LAT_M = 111139.0
 
 def route_profile(route, dtm, is_geo=True, sample_step_m=None, join_passes=True):
     """Sample terrain + flight altitude along the flown route (ordered waypoints
-    with x, y, z, pass_id). Returns (dist_m, terrain_m, flight_m) as lists in metres.
+    with x, y, z, pass_id). Returns (dist_m, terrain_m, flight_m, spans), lists in
+    metres plus `spans` = [(start_dist, end_dist, pass_id)] — the x-range each pass
+    occupies, so a click on the profile maps back to a pass. Turnaround/connector
+    samples get pass_id None (not clickable).
 
     NaN-z waypoints are dropped; flight altitude is linear between kept waypoints —
     flat within a pass (equal endpoint z) and a climb/descent across a turn. Terrain
@@ -32,21 +36,24 @@ def route_profile(route, dtm, is_geo=True, sample_step_m=None, join_passes=True)
     wps = [w for w in route
            if not (isinstance(w['z'], float) and math.isnan(w['z']))]
     if len(wps) < 2:
-        return [], [], []
+        return [], [], [], []
     lat0 = sum(w['y'] for w in wps) / len(wps)
     lon_m = _LAT_M * math.cos(math.radians(lat0)) if is_geo else 1.0
     lat_m = _LAT_M if is_geo else 1.0
     res_m = min(abs(dtm.src.res[0]), abs(dtm.src.res[1])) * (lat_m if is_geo else 1.0)
     step = sample_step_m or max(res_m, 2.0)
 
-    dist, terr, flight, acc = [], [], [], 0.0
+    dist, terr, flight, pids, acc = [], [], [], [], 0.0
     for a, b in zip(wps, wps[1:]):
         seg_m = math.hypot((b['x'] - a['x']) * lon_m, (b['y'] - a['y']) * lat_m)
-        if not join_passes and a.get('pass_id') != b.get('pass_id'):
+        same_pass = a.get('pass_id') == b.get('pass_id')
+        if not join_passes and not same_pass:
             # Independent passes: drop the connector leg. Break the line (NaN) but
             # DON'T advance the x-axis — the next pass sits directly after this one.
             dist.append(acc); terr.append(float('nan')); flight.append(float('nan'))
+            pids.append(None)
             continue
+        seg_pid = a.get('pass_id') if same_pass else None   # None = turnaround/connector
         n = max(1, min(2000, int(seg_m / step)))
         for i in range(n + 1):
             # skip the point shared with the previous same-pass segment; but after a
@@ -59,16 +66,33 @@ def route_profile(route, dtm, is_geo=True, sample_step_m=None, join_passes=True)
             dist.append(acc + seg_m * f)
             terr.append(dtm.elevation_at(x, y))
             flight.append(a['z'] + (b['z'] - a['z']) * f)
+            pids.append(seg_pid)
         acc += seg_m
-    return dist, terr, flight
+
+    # coalesce consecutive same-pass samples into (start, end, pass_id) spans.
+    spans = []
+    for dd, pid in zip(dist, pids):
+        if pid is None:
+            continue
+        if spans and spans[-1][2] == pid:
+            spans[-1] = (spans[-1][0], dd, pid)
+        else:
+            spans.append((dd, dd, pid))
+    return dist, terr, flight, spans
 
 
 class ProfilePanel(QWidget):
     """Full-width strip: terrain silhouette, flight line, target-AGL line, and any
-    below-ground clearance. Call update_profile() when the route changes."""
+    below-ground clearance. Call update_profile() when the route changes. Clicking a
+    pass emits passClicked(pass_id) so the map can highlight it."""
+
+    passClicked = Signal(object)          # pass_id of the clicked pass
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._spans = []                  # [(start_dist, end_dist, pass_id)]
+        self._selected_pid = None
+        self._sel_artist = None           # axvspan shading the selected pass
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, 4, 8, 4)
         lay.setSpacing(2)
@@ -81,10 +105,38 @@ class ProfilePanel(QWidget):
         self.fig.patch.set_facecolor('#232629')
         self.fig.subplots_adjust(left=0.06, right=0.995, top=0.97, bottom=0.22)
         self.canvas = FigureCanvas(self.fig)
+        self.canvas.mpl_connect('button_press_event', self._on_click)
         lay.addWidget(self.canvas)
         self.ax = self.fig.add_subplot(111)
         self._style_axes()
         self.canvas.draw()
+
+    def _on_click(self, event):
+        """Map a click's x (distance) to a pass and announce it."""
+        if event.inaxes is not self.ax or event.xdata is None:
+            return
+        x = event.xdata
+        for s, e, pid in self._spans:
+            if s <= x <= e:
+                # clicking the already-selected pass toggles the highlight off
+                self._selected_pid = None if pid == self._selected_pid else pid
+                self._draw_selection()
+                self.passClicked.emit(self._selected_pid)
+                return
+
+    def _draw_selection(self):
+        if self._sel_artist is not None:
+            try:
+                self._sel_artist.remove()
+            except (ValueError, AttributeError):
+                pass
+            self._sel_artist = None
+        for s, e, pid in self._spans:
+            if pid == self._selected_pid:
+                self._sel_artist = self.ax.axvspan(s, e, color='#ffd400', alpha=0.18,
+                                                   linewidth=0, zorder=0)
+                break
+        self.canvas.draw_idle()
 
     def _style_axes(self):
         ax = self.ax
@@ -102,11 +154,14 @@ class ProfilePanel(QWidget):
         self.lbl.setText('Elevation profile — compute a route to populate.')
         self.canvas.draw_idle()
 
-    def update_profile(self, dist, terr, flight, agl=None, tol=50.0):
+    def update_profile(self, dist, terr, flight, agl=None, tol=50.0, spans=None):
         # tol defaults to ±50 so the 50–150 m AGL band is drawn as a reference
         # corridor even though the route itself isn't constrained to it.
-        self.ax.clear()
+        self.ax.clear()                 # drops the old selection artist too
         self._style_axes()
+        self._spans = spans or []
+        self._selected_pid = None
+        self._sel_artist = None
         if not dist:
             self.lbl.setText('Elevation profile — no route.')
             self.canvas.draw_idle()

@@ -156,6 +156,7 @@ class CanvasMap(QWidget):
         self._route_group = None
         self._density_item = None
         self._helios_item = None
+        self._pass_highlight_item = None  # one pass highlighted from the elevation profile
         self._chm_item = None
         self._home_item = None           # takeoff/return marker + ferry legs
         self._pass_segs = []             # [(ax, ay, bx, by, z)] scene coords, for hover
@@ -212,6 +213,7 @@ class CanvasMap(QWidget):
         self.scene.clear()                           # deletes all items, incl. route passes
         self._aoi_item = self._route_group = self._density_item = None
         self._helios_item = self._chm_item = None; self._home_item = None
+        self._pass_highlight_item = None
         self._verts = []; self._draw_items = []; self._pass_segs = []
         self._pass_anchor = None; self._pass_preview = None
         self._route_passes = {}; self.selecting_passes = False
@@ -542,6 +544,7 @@ class CanvasMap(QWidget):
         self.btn_all.setVisible(False); self.btn_all.setEnabled(False)
         self._aoi_item = self._route_group = self._density_item = None
         self._helios_item = self._chm_item = None; self._home_item = None
+        self._pass_highlight_item = None
         self._verts = []; self._draw_items = []; self._pass_segs = []
         self._pass_anchor = None; self._pass_preview = None
         self.drawing = False; self.drawing_pass = False
@@ -678,6 +681,26 @@ class CanvasMap(QWidget):
         if cells:
             self._helios_item = self._paint_cells(cells, '#e5484d', 130, radius_m)
 
+    def highlight_pass(self, coords):
+        """Bright-outline one pass on the map (from an elevation-profile click). `coords`
+        is the pass's [(lon, lat), …]; pass [] or None to clear. Replaces any previous
+        highlight, drawn above the route so it reads clearly."""
+        if self._pass_highlight_item is not None:
+            self.scene.removeItem(self._pass_highlight_item)
+            self._pass_highlight_item = None
+        if self.dtm is None or self._inv is None or not coords or len(coords) < 2:
+            return
+        pts = [self._scene(lon, lat) for lon, lat in coords]
+        path = QPainterPath(pts[0])
+        for p in pts[1:]:
+            path.lineTo(p)
+        item = QGraphicsPathItem(path)
+        pen = QPen(QColor('#ffd400'), 5); pen.setCosmetic(True)
+        pen.setCapStyle(Qt.RoundCap); pen.setJoinStyle(Qt.RoundJoin)
+        item.setPen(pen); item.setZValue(20)          # above the route polylines
+        self.scene.addItem(item)
+        self._pass_highlight_item = item
+
     def show_home(self, home, wps):
         """Draw the takeoff/return-home point (entered as a coordinate) and dashed
         ferry legs to the first and last survey waypoints. `home` is (lon, lat);
@@ -709,7 +732,8 @@ class CanvasMap(QWidget):
     def clear_overlays(self):
         """Remove route + density + HELIOS overlays (keeps the DTM and drawn AOI).
         The home marker is managed separately via show_home so it persists."""
-        for attr in ('_route_group', '_density_item', '_helios_item'):
+        for attr in ('_route_group', '_density_item', '_helios_item',
+                     '_pass_highlight_item'):
             it = getattr(self, attr, None)
             if it is not None:
                 self.scene.removeItem(it)

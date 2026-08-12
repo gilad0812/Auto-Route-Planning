@@ -255,6 +255,7 @@ class MainWindow(QMainWindow):
         from .profile import ProfilePanel
         self.profile_panel = ProfilePanel()            # full-width strip below
         self.profile_panel.setVisible(False)           # opened on demand via View menu
+        self.profile_panel.passClicked.connect(self._highlight_pass_on_map)
 
         outer = QSplitter(Qt.Vertical)
         outer.addWidget(top)
@@ -1319,10 +1320,23 @@ class MainWindow(QMainWindow):
         from .profile import route_profile
         # Uploaded independent passes: break the profile between them (no pseudo-pass
         # connector line); auto-planned routes stay continuous for ferry clearance.
-        dist, terr, flight = route_profile(
+        dist, terr, flight, spans = route_profile(
             self._route_with_home(), self.dtm, self.is_geo,
             join_passes=not self._route_active)
-        self.profile_panel.update_profile(dist, terr, flight, agl=self.sp_alt.value())
+        self.profile_panel.update_profile(dist, terr, flight, agl=self.sp_alt.value(),
+                                          spans=spans)
+
+    def _highlight_pass_on_map(self, pass_id):
+        """A pass was clicked in the elevation profile — outline it on the map, or clear
+        the outline when pass_id is None (the pass was toggled off)."""
+        if self.mapview is None or not (self.result and self.result.route):
+            return
+        if pass_id is None:
+            self.mapview.highlight_pass([]); return
+        coords = [(w['x'], w['y']) for w in self._route_with_home()
+                  if w.get('pass_id') == pass_id
+                  and not (isinstance(w['z'], float) and math.isnan(w['z']))]
+        self.mapview.highlight_pass(coords)
 
     # ---------------------------------------------------------------- HELIOS
     def _open_helios(self):
