@@ -164,39 +164,75 @@ def estimate_density_grid(
     range_hit = np.zeros((ny, nx), dtype=bool)   # in-FOV but beyond max range
     any_fov = np.zeros((ny, nx), dtype=bool)     # in some look's FOV (any range)
     any_covered = np.zeros((ny, nx), dtype=bool)  # in-FOV AND in-range (pre-occlusion)
+    # Lowest terrain on the grid → the largest possible AGL, hence the widest possible
+    # cross-track swath any pass can reach. Used to bound each pass to a sub-window.
+    gmin_terr = float(np.nanmin(terr)) if np.isfinite(terr).any() else 0.0
     for pts in passes:
         z_pass = float(pts[0]["z"])
-        ax = (pts[0]["x"] - cu) * lon_m
-        ay = (pts[0]["y"] - cvv) * lat_m
-        bx = (pts[-1]["x"] - cu) * lon_m
-        by = (pts[-1]["y"] - cvv) * lat_m
+        # ── Restrict this pass to its swath's bounding box ───────────────────
+        # A cell is only ever reached if d ≤ h·tan_half (cross-track FOV). With h
+        # bounded by z_pass − gmin_terr, no cell farther than `reach` from the pass
+        # segment can pass that test, so cells outside this box contribute exactly 0.
+        # Working on the sub-window is identical maths on far fewer cells.
+        max_h = z_pass - gmin_terr
+        if max_h <= 1.0:
+            continue                                # aircraft below/at the terrain — no swath
+        reach = max_h * tan_half
+        x0, x1 = pts[0]["x"], pts[-1]["x"]
+        y0, y1 = pts[0]["y"], pts[-1]["y"]
+        c0 = max(0, int(np.searchsorted(lon, min(x0, x1) - reach / lon_m, "left")))
+        c1 = min(nx, int(np.searchsorted(lon, max(x0, x1) + reach / lon_m, "right")))
+        r0 = max(0, int(np.searchsorted(lat, min(y0, y1) - reach / lat_m, "left")))
+        r1 = min(ny, int(np.searchsorted(lat, max(y0, y1) + reach / lat_m, "right")))
+        if c0 >= c1 or r0 >= r1:
+            continue
+        rs, cs = slice(r0, r1), slice(c0, c1)
+        Ew, Nw = E[rs, cs], N[rs, cs]
+        g_ew, g_nw, nrmw = g_e[rs, cs], g_n[rs, cs], nrm[rs, cs]
+
+        ax = (x0 - cu) * lon_m
+        ay = (y0 - cvv) * lat_m
+        bx = (x1 - cu) * lon_m
+        by = (y1 - cvv) * lat_m
         dx, dy = bx - ax, by - ay
         L2 = dx * dx + dy * dy
         if L2 < 1e-9:
             fx, fy = ax, ay
             ux, uy = 1.0, 0.0
         else:
-            tt = np.clip(((E - ax) * dx + (N - ay) * dy) / L2, 0.0, 1.0)
+            tt = np.clip(((Ew - ax) * dx + (Nw - ay) * dy) / L2, 0.0, 1.0)
             fx, fy = ax + tt * dx, ay + tt * dy
             _pl = math.sqrt(L2); ux, uy = dx / _pl, dy / _pl   # along-track unit vector
-        ox, oy = E - fx, N - fy                     # cross-track aircraft→cell offset
+        ox, oy = Ew - fx, Nw - fy                   # cross-track aircraft→cell offset
         d = np.hypot(ox, oy)
-        h = z_pass - terr                           # AGL above each cell
+        h = z_pass - terr[rs, cs]                   # AGL above each cell
         with np.errstate(invalid="ignore"):
             in_swath = np.isfinite(h) & (h > 1.0) & (d <= h * tan_half)   # cross-track FOV
+        # Only the cells actually in the swath do any per-look / occlusion work — the
+        # rest of the window fails the FOV test and would contribute exactly 0. Gather
+        # them to 1-D so the expensive inner loop runs on a fraction of the cells (this
+        # is where the reach-bloated window on steep terrain gets its cells back).
+        wr, wc = np.where(in_swath)
+        if wr.size == 0:
+            continue
+        gr, gc = wr + r0, wc + c0                    # indices back into the full grid
+        ox_s, oy_s, d_s, h_s = ox[wr, wc], oy[wr, wc], d[wr, wc], h[wr, wc]
+        Es, Ns = Ew[wr, wc], Nw[wr, wc]
+        g_es, g_ns, nrm_s = g_ew[wr, wc], g_nw[wr, wc], nrmw[wr, wc]
+        with np.errstate(invalid="ignore"):
             # Fore/aft along-track tilt grows 10° (swath centre) → 15° (edge); the
             # along-track ground reach of that tilt at this AGL is a_f.
-            _frac = np.clip(d / np.maximum(h * tan_half, 1e-6), 0.0, 1.0)
-            a_f = h * np.tan(np.radians(10.0 + 5.0 * _frac))
+            _frac = np.clip(d_s / np.maximum(h_s * tan_half, 1e-6), 0.0, 1.0)
+            a_f = h_s * np.tan(np.radians(10.0 + 5.0 * _frac))
             for sgn, wgt in looks:
-                px = ox + sgn * a_f * ux             # this look's horizontal offset to cell
-                py = oy + sgn * a_f * uy
-                R = np.sqrt(px * px + py * py + h * h)   # slant range for this look
+                px = ox_s + sgn * a_f * ux           # this look's horizontal offset to cell
+                py = oy_s + sgn * a_f * uy
+                R = np.sqrt(px * px + py * py + h_s * h_s)   # slant range for this look
                 # cos(incidence) of THIS look's ray vs surface normal; flat ground → h/R.
-                cos_i = (h + px * g_e + py * g_n) / (np.maximum(R, 1e-6) * nrm)
-                in_fov = in_swath & (cos_i > 0.0)
-                range_hit |= in_fov & (R > rng_max)   # emitted, but no return
-                covered = in_fov & (R <= rng_max)
+                cos_i = (h_s + px * g_es + py * g_ns) / (np.maximum(R, 1e-6) * nrm_s)
+                facing = cos_i > 0.0                 # in_swath already holds for every cell
+                beyond = facing & (R > rng_max)      # emitted, but no return
+                covered = facing & (R <= rng_max)
                 # cos_i / R → points per tilted SURFACE m² (survey-quality metric);
                 # HELIOS normalises the same way, so estimate and sim are comparable.
                 contrib = np.where(
@@ -208,17 +244,21 @@ def estimate_density_grid(
                 # cell; terrain rising above it blocks the beam. Fore/aft looks see under
                 # ridges the nadir look can't — the recovery NFB is meant to give.
                 if occlusion:
-                    with np.errstate(invalid="ignore"):
-                        blocked = np.zeros_like(h, dtype=bool)
-                        for tf in (0.25, 0.45, 0.65, 0.82, 0.93):
-                            Em = E - (1.0 - tf) * px    # march point sensor→cell
-                            Nm = N - (1.0 - tf) * py
-                            los = z_pass - tf * h       # straight sight-line altitude
-                            blocked |= covered & (_terr_EN(Em, Nm) > los + occ_margin_m)
+                    blocked = np.zeros(wr.size, dtype=bool)
+                    for tf in (0.25, 0.45, 0.65, 0.82, 0.93):
+                        Em = Es - (1.0 - tf) * px   # march point sensor→cell
+                        Nm = Ns - (1.0 - tf) * py
+                        los = z_pass - tf * h_s     # straight sight-line altitude
+                        blocked |= covered & (_terr_EN(Em, Nm) > los + occ_margin_m)
                     contrib = np.where(blocked, 0.0, contrib)
-                any_fov |= in_fov
-                any_covered |= covered
-                density += contrib
+                # scatter the per-cell results back (indices are unique within a look).
+                if beyond.any():
+                    range_hit[gr[beyond], gc[beyond]] = True
+                if facing.any():
+                    any_fov[gr[facing], gc[facing]] = True   # any_fov == in_fov here
+                if covered.any():
+                    any_covered[gr[covered], gc[covered]] = True
+                density[gr, gc] += contrib
 
     # Canopy: vegetated cells keep only `veg_penetration` of the bare-earth density
     # (the fraction of pulses reaching the ground through the canopy).
