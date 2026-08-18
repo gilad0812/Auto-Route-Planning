@@ -10,7 +10,7 @@ import math
 import os
 
 from PySide6.QtCore import Qt, QSettings
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QFormLayout, QDoubleSpinBox, QSpinBox, QCheckBox, QComboBox, QGroupBox,
@@ -39,7 +39,8 @@ except Exception as _e:
         "thin": ("Under target", "lower AGL / tighter spacing"),
     }
 
-from shapely.geometry import shape as shapely_shape, box as shapely_box, MultiPoint
+from shapely.geometry import (shape as shapely_shape, box as shapely_box, MultiPoint,
+                              LineString, MultiLineString)
 from shapely.wkt import loads as wkt_loads
 
 PULSE_FREQS = (150_000, 300_000, 600_000, 1_200_000, 1_800_000, 2_400_000)
@@ -182,6 +183,8 @@ class MainWindow(QMainWindow):
         self.is_geo = True
         self.base_result = None          # survey-only result (no home legs)
         self.survey_route = []           # survey waypoints (base for home legs)
+        self._edit_undo = []             # snapshots of survey_route for undo (route edits)
+        self._edit_redo = []             # snapshots for redo
         self.result = None               # effective result = survey + in-AOI home legs
         self.drawn_polygon = None        # shapely Polygon drawn on the map
         self._map_focused = False        # map zoomed to the AOI (vs full-extent overview)
@@ -226,9 +229,25 @@ class MainWindow(QMainWindow):
         a_wkt.triggered.connect(self._load_wkt_aoi)
         a_route = QAction('Load route (.wkt/.csv)…', self)
         a_route.triggered.connect(self._load_wkt_route)
+        self.act_save_route = QAction('Save route (.wkt)…', self)
+        self.act_save_route.setEnabled(False)
+        self.act_save_route.triggered.connect(self._save_wkt_route)
         a_quit = QAction('Quit', self); a_quit.triggered.connect(self.close)
         m.addAction(a_dtm); m.addAction(a_chm); m.addAction(a_wkt); m.addAction(a_route)
+        m.addAction(self.act_save_route)
         m.addSeparator(); m.addAction(a_quit)
+
+        # Undo/redo of route edits — keyboard only (Ctrl+Z / Ctrl+Y), no menu. The
+        # actions are added to the window so their shortcuts fire application-wide.
+        self.act_undo = QAction('Undo route edit', self)
+        self.act_undo.setShortcut(QKeySequence.Undo)          # Ctrl+Z
+        self.act_undo.triggered.connect(self._undo_edit)
+        self.act_redo = QAction('Redo route edit', self)
+        self.act_redo.setShortcuts([QKeySequence.Redo,        # Ctrl+Y / Ctrl+Shift+Z
+                                    QKeySequence('Ctrl+Shift+Z')])
+        self.act_redo.triggered.connect(self._redo_edit)
+        self.addAction(self.act_undo); self.addAction(self.act_redo)
+        self._update_undo_actions()
 
         mv = self.menuBar().addMenu('&View')
         self.act_profile = QAction('Elevation profile', self, checkable=True)
@@ -479,6 +498,8 @@ class MainWindow(QMainWindow):
             self.mapview.passDrawn.connect(self._on_pass_drawn)
             self.mapview.focusToggled.connect(self._on_map_focus_toggled)
             self.mapview.passesConfirmed.connect(self._confirm_selected_passes)
+            self.mapview.passEditDelete.connect(self._on_edit_delete)
+            self.mapview.passEditGeom.connect(self._on_edit_geom)
             return self.mapview
         self.mapview = None
         return self._stub('🗺  Map canvas failed to load.\n' + (_MAPVIEW_ERR or ''))
@@ -943,6 +964,7 @@ class MainWindow(QMainWindow):
         self.result = None
         self.base_result = None
         self.survey_route = []
+        self._reset_edit_history()
         self.lbl_summary.setText(self._empty_summary_html())
         self._update_workflow()
         if self.mapview is not None:
@@ -951,9 +973,14 @@ class MainWindow(QMainWindow):
             self.mapview.btn_pass.setChecked(False)
             self.mapview._toggle_pass(False)
             self.mapview.btn_pass.setEnabled(False)
+            self.mapview.btn_edit.setChecked(False)
+            self.mapview._toggle_edit(False)
+            self.mapview.btn_edit.setEnabled(False)
+            self.mapview.set_editable_route([])
         self.btn_helios.setEnabled(False)
         self.btn_geojson.setEnabled(False)
         self.btn_csv.setEnabled(False)
+        self.act_save_route.setEnabled(False)
         if getattr(self, 'profile_panel', None) is not None:
             self.profile_panel.clear()
 
@@ -1202,6 +1229,13 @@ class MainWindow(QMainWindow):
             # Uploaded route: re-run the estimate on the same passes with current params.
             self._estimate_uploaded_route(self.survey_route)
             return
+        if self._edit_undo:          # net manual edits vs the last computed baseline
+            if QMessageBox.question(
+                    self, 'Re-plan route',
+                    'Auto-planning a new route will discard your manual edits '
+                    '(added / moved / deleted passes).\n\nContinue and replace them?',
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+                return
         poly = self.drawn_polygon
         self.lbl_summary.setText(
             '<i style="color:#8b96a3;">Computing route + density estimate…</i>')
@@ -1239,62 +1273,162 @@ class MainWindow(QMainWindow):
         self.btn_helios.setEnabled(has_route)
         self.btn_geojson.setEnabled(has_route)
         self.btn_csv.setEnabled(has_route)
+        self.act_save_route.setEnabled(has_route)
         if self.mapview is not None:
-            self.mapview.btn_pass.setEnabled(has_route)
-            if has_route:
-                self._update_pass_anchor()
+            self.mapview.btn_edit.setEnabled(has_route)   # Add Pass lives inside Edit Route
+            self.mapview.set_editable_route(self.survey_route if has_route else [])
+        self._reset_edit_history()                        # this route is a fresh baseline
         self._set_busy(False)
         if status_msg is None:
             status_msg = (f'Done — {self.result.n_waypoints} waypoints' if has_route
                           else 'Done — no route produced')
         self.statusBar().showMessage(status_msg)
 
-    def _update_pass_anchor(self):
-        """Point the map's pass-preview at the survey's current end (the start of
-        the next drawn pass — home legs are auto-generated and excluded)."""
-        if self.mapview is None:
+    def _on_pass_drawn(self, payload):
+        """Add Pass (Edit Route sub-tool): two free clicks define the pass — payload is
+        ((lon,lat) start, (lon,lat) end). Build it (altitude from terrain), append to the
+        survey with a fresh pass id, and re-estimate."""
+        if not (self.survey_route and self.dtm and self.drawn_polygon is not None):
             return
-        last = self._survey_end()
-        if last is not None:
-            self.mapview.set_pass_anchor(last['x'], last['y'])
-
-    def _on_pass_drawn(self, pt):
-        """A click in pass mode: build a pass from the survey's end (start) to the
-        clicked point (end), set altitude from terrain, append to the survey, and
-        rebuild the effective route + estimate."""
-        if not (self.base_result and self.survey_route and self.dtm
-                and self.drawn_polygon is not None):
-            return
-        params = self._params()
-        last = self._survey_end()
-        if last is None:
-            return
+        p0, p1 = payload
         pid = max((w.get('pass_id', 0) for w in self.survey_route
                    if isinstance(w.get('pass_id'), int)), default=-1) + 1
-        new_pass = build_manual_pass(self.dtm, (last['x'], last['y']), pt,
-                                     params, self.is_geo, pid)
+        new_pass = build_manual_pass(self.dtm, p0, p1, self._params(), self.is_geo, pid)
         if not new_pass:
             self.statusBar().showMessage('Drawn pass has no valid terrain — not added.')
             return
-        self._set_busy(True, 'Pass added — re-estimating density…')
+        pre = self._snapshot_route(self.survey_route)
+        if self._reestimate_survey(list(self.survey_route) + new_pass,
+                                   'Pass added — re-estimating density…'):
+            self._record_edit(pre)
+            self.statusBar().showMessage(
+                f'Pass added at {new_pass[0]["z"]:.0f} m — {self.result.n_waypoints} '
+                f'waypoints. Click two points for another, or untick Add Pass.')
+
+    # ------------------------------------------------------------- edit route
+    def _reestimate_survey(self, new_survey, busy_msg):
+        """Swap in an edited survey route, re-run the density estimate + effective
+        route, and repaint everything (summary, map, edit overlay, profile). Restores
+        the previous route on failure. Returns True on success. Shared by Edit Route."""
+        if not (self.dtm and self.drawn_polygon is not None):
+            return False
+        prev = self.survey_route
+        self._set_busy(True, busy_msg)
         try:
-            self.survey_route = self.survey_route + new_pass
+            self.survey_route = new_survey
             self.base_result = estimate_for_route(
                 self.dtm, self.drawn_polygon, self.survey_route,
-                params, chm=self.chm, is_geo=self.is_geo)
+                self._params(), chm=self.chm, is_geo=self.is_geo)
             self.result = self._effective_result()
         except Exception as e:
+            self.survey_route = prev
             QMessageBox.critical(self, 'Re-estimate error', str(e))
-            return
+            return False
         finally:
             self._set_busy(False)
         self._render_summary(self.result)
         self._render_map_overlays(self.result)
-        self._update_pass_anchor()
+        if self.mapview is not None:
+            self.mapview.set_editable_route(self.survey_route)
         self._refresh_profile()
-        self.statusBar().showMessage(
-            f'Pass added at {new_pass[0]["z"]:.0f} m — {self.result.n_waypoints} '
-            f'waypoints. Click to add another or untick Add Pass.')
+        return True
+
+    # ---- undo / redo of route edits (snapshot history of survey_route) ----
+    _EDIT_HISTORY_MAX = 50
+
+    def _snapshot_route(self, route):
+        """A shallow, independent copy of a route (waypoints are flat scalar dicts)."""
+        return [dict(w) for w in route]
+
+    def _record_edit(self, pre_edit_route):
+        """Push the pre-edit survey snapshot onto the undo stack and clear redo. Call
+        only after an edit has successfully re-estimated."""
+        self._edit_undo.append(pre_edit_route)
+        del self._edit_undo[:-self._EDIT_HISTORY_MAX]     # cap history depth
+        self._edit_redo.clear()
+        self._update_undo_actions()
+
+    def _reset_edit_history(self):
+        """Drop all edit history — a new baseline route makes old edits meaningless."""
+        self._edit_undo.clear(); self._edit_redo.clear()
+        self._update_undo_actions()
+
+    def _update_undo_actions(self):
+        if getattr(self, 'act_undo', None) is not None:
+            self.act_undo.setEnabled(bool(self._edit_undo))
+            self.act_redo.setEnabled(bool(self._edit_redo))
+
+    def _undo_edit(self):
+        if not self._edit_undo:
+            return
+        current = self._snapshot_route(self.survey_route)
+        target = self._snapshot_route(self._edit_undo[-1])
+        if self._reestimate_survey(target, 'Undoing route edit…'):
+            self._edit_undo.pop()
+            self._edit_redo.append(current)
+            self.statusBar().showMessage('Undo — route restored.')
+        self._update_undo_actions()
+
+    def _redo_edit(self):
+        if not self._edit_redo:
+            return
+        current = self._snapshot_route(self.survey_route)
+        target = self._snapshot_route(self._edit_redo[-1])
+        if self._reestimate_survey(target, 'Redoing route edit…'):
+            self._edit_redo.pop()
+            self._edit_undo.append(current)
+            self.statusBar().showMessage('Redo — route re-applied.')
+        self._update_undo_actions()
+
+    def _on_edit_delete(self, pids):
+        """Edit Route: delete the selected pass(es) from the survey and re-estimate."""
+        if not self.survey_route:
+            return
+        pidset = set(pids)
+        remaining = [w for w in self.survey_route if w.get('pass_id') not in pidset]
+        if len(remaining) == len(self.survey_route):
+            return                                   # nothing matched
+        if not remaining:
+            QMessageBox.information(self, 'Delete pass',
+                                    "That's the last pass — a route needs at least one.")
+            return
+        n = len(pidset)
+        pre = self._snapshot_route(self.survey_route)
+        if self._reestimate_survey(
+                remaining, f'Deleting {n} pass{"es" if n != 1 else ""} — re-estimating…'):
+            self._record_edit(pre)
+            left = len({w.get('pass_id') for w in self.survey_route})
+            self.statusBar().showMessage(
+                f'Deleted {n} pass{"es" if n != 1 else ""} — {left} passes, '
+                f'{self.result.n_waypoints} waypoints.')
+
+    def _on_edit_geom(self, payload):
+        """Edit Route: an endpoint was dragged — rebuild that pass (altitude re-derived
+        from terrain) in place and re-estimate. Snaps back if the new line has no terrain."""
+        pid, p0, p1 = payload
+        if not self.survey_route:
+            return
+        new_pass = build_manual_pass(self.dtm, p0, p1, self._params(), self.is_geo, pid)
+        if not new_pass:
+            self.statusBar().showMessage('Moved pass has no valid terrain — edit ignored.')
+            if self.mapview is not None:
+                self.mapview.set_editable_route(self.survey_route)   # snap handle back
+            return
+        new_survey, inserted = [], False
+        for w in self.survey_route:                  # splice in place, keep route order
+            if w.get('pass_id') == pid:
+                if not inserted:
+                    new_survey.extend(new_pass); inserted = True
+            else:
+                new_survey.append(w)
+        if not inserted:
+            new_survey.extend(new_pass)
+        pre = self._snapshot_route(self.survey_route)
+        if self._reestimate_survey(new_survey, 'Pass moved — re-estimating density…'):
+            self._record_edit(pre)
+            self.statusBar().showMessage(
+                f'Pass moved to {new_pass[0]["z"]:.0f} m — '
+                f'{self.result.n_waypoints} waypoints.')
 
     # ---------------------------------------------------------------- profile
     def _toggle_profile(self, on):
@@ -1395,6 +1529,45 @@ class MainWindow(QMainWindow):
                 wr.writerow([i, w['x'], w['y'], w['z'],
                              w.get('target_distance'), w.get('pass_id'), role])
         self.statusBar().showMessage(f'Wrote {len(wps)} waypoints → {path}')
+
+    def _survey_pass_lines(self):
+        """The survey passes as shapely LineString Z (one per pass, endpoint→endpoint),
+        in route order. Home ferry legs are auto-generated, so they're excluded."""
+        groups = {}
+        order = []
+        for w in self.survey_route:
+            if isinstance(w['z'], float) and math.isnan(w['z']):
+                continue
+            pid = w.get('pass_id')
+            if pid is None:
+                continue
+            if pid not in groups:
+                order.append(pid)
+            groups.setdefault(pid, []).append((w['x'], w['y'], w['z']))
+        return [LineString([groups[p][0], groups[p][-1]])
+                for p in order if len(groups[p]) >= 2]
+
+    def _save_wkt_route(self):
+        """Save the (possibly edited) survey passes as a WKT MULTILINESTRING Z — one
+        LINESTRING per pass, vertices carrying the flight altitude. This is exactly the
+        format Load route reads, so an edited route round-trips: edit → Save → Load."""
+        if not self.survey_route:
+            return
+        lines = self._survey_pass_lines()
+        if not lines:
+            QMessageBox.warning(self, 'Save route', 'No valid passes to save.')
+            return
+        path, _ = QFileDialog.getSaveFileName(self, 'Save route WKT',
+                                              'route.wkt', 'WKT (*.wkt)')
+        if not path:
+            return
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(MultiLineString(lines).wkt)
+        except OSError as e:
+            QMessageBox.critical(self, 'Save route', f'Could not write the file:\n{e}')
+            return
+        self.statusBar().showMessage(f'Saved {len(lines)} passes → {path}')
 
     def _render_map_overlays(self, r):
         if self.mapview is None:

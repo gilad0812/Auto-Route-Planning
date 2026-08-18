@@ -118,6 +118,9 @@ class _View(QGraphicsView):
         if self._owner.selecting_passes and e.button() == Qt.LeftButton:
             self._owner.toggle_pass_at(self.mapToScene(e.position().toPoint()))
             e.accept(); return
+        if self._owner.editing and e.button() == Qt.LeftButton:
+            if self._owner.edit_press(self.mapToScene(e.position().toPoint())):
+                e.accept(); return
         super().mousePressEvent(e)
 
     def mouseDoubleClickEvent(self, e):
@@ -127,15 +130,31 @@ class _View(QGraphicsView):
 
     def mouseMoveEvent(self, e):
         self._owner.on_hover(self.mapToScene(e.position().toPoint()))
+        if self._owner.editing and self._owner._edit_drag is not None:
+            self._owner.edit_drag_move(self.mapToScene(e.position().toPoint()))
+            e.accept(); return
         super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if self._owner.editing and self._owner._edit_drag is not None:
+            self._owner.edit_drag_release(self.mapToScene(e.position().toPoint()))
+            e.accept(); return
+        super().mouseReleaseEvent(e)
+
+    def keyPressEvent(self, e):
+        if self._owner.editing and e.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            self._owner._delete_selected_edit(); e.accept(); return
+        super().keyPressEvent(e)
 
 
 class CanvasMap(QWidget):
     polygonDrawn = Signal(object)        # emits a GeoJSON Polygon geometry dict
-    passDrawn = Signal(object)           # emits (lon,lat) — the END of a new pass (start = route end)
+    passDrawn = Signal(object)           # emits ((lon,lat) start, (lon,lat) end) for a new pass
     focusToggled = Signal(bool)          # Focus/Full toggle: True = focus on the AOI
     passSelectionChanged = Signal(int)   # # of route passes currently selected
     passesConfirmed = Signal()           # operator confirmed the selected passes
+    passEditDelete = Signal(object)      # list[int] pass_ids to delete (Edit Route mode)
+    passEditGeom = Signal(object)        # (pass_id, (lon0,lat0), (lon1,lat1)) after an endpoint drag
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -145,6 +164,11 @@ class CanvasMap(QWidget):
         self._focus_polygon = None       # AOI the map is focused on, or None (full extent)
         self.selecting_passes = False     # route-pass selection mode (Load route .wkt)
         self._route_passes = {}          # pass_id -> {'items','segs','selected'}
+        self.editing = False             # Edit Route mode (select / drag / delete passes)
+        self._edit_route = []            # route wps currently editable (survey passes)
+        self._edit_passes = {}           # pass_id -> {'item','handles','seg','coords','selected'}
+        self._edit_group = None          # scene group holding the edit overlay
+        self._edit_drag = None           # (pass_id, end_idx) while dragging an endpoint handle
         self._disp_transform = None      # scene(overview) pixel -> world; None until loaded
         self.drawing = False
         self.drawing_pass = False
@@ -171,9 +195,19 @@ class CanvasMap(QWidget):
         self.btn_draw.setToolTip('Click to add vertices; double-click to close the polygon.')
         self.btn_pass = QToolButton(); self.btn_pass.setText('✚ Add Pass')
         self.btn_pass.setCheckable(True); self.btn_pass.setEnabled(False)
-        self.btn_pass.setToolTip('Click two points to add a flight pass; its height '
-                                 'is set from the terrain. Stays on for more passes.')
+        self.btn_pass.setVisible(False)          # a sub-tool of Edit Route mode
+        self.btn_pass.setToolTip('Add a pass: click its start point, then its end point. '
+                                 'Height is set from the terrain. Stays on for more passes.')
         self.btn_pass.clicked.connect(self._toggle_pass)
+        self.btn_edit = QToolButton(); self.btn_edit.setText('✎ Edit Route')
+        self.btn_edit.setCheckable(True); self.btn_edit.setEnabled(False)
+        self.btn_edit.setToolTip('Edit the planned route: click a pass to select it, drag '
+                                 'its round endpoints to move it, press Delete to remove it.')
+        self.btn_edit.clicked.connect(self._toggle_edit)
+        self.btn_del = QToolButton(); self.btn_del.setText('🗑 Delete pass')
+        self.btn_del.setEnabled(False); self.btn_del.setVisible(False)
+        self.btn_del.setToolTip('Delete the selected pass from the route (or press Delete).')
+        self.btn_del.clicked.connect(self._delete_selected_edit)
         self.btn_fit = QToolButton(); self.btn_fit.setText('⤢ Fit')
         self.btn_fit.clicked.connect(self._fit)
         self.btn_focus = QToolButton(); self.btn_focus.setText('◎ polygon')
@@ -193,7 +227,7 @@ class CanvasMap(QWidget):
         self.btn_confirm.setEnabled(False); self.btn_confirm.setVisible(False)
         self.btn_confirm.setToolTip('Run the density estimate on the selected passes.')
         self.btn_confirm.clicked.connect(self.passesConfirmed)
-        for b in (self.btn_draw, self.btn_pass,
+        for b in (self.btn_draw, self.btn_edit, self.btn_pass, self.btn_del,
                   self.btn_fit, self.btn_focus, self.btn_chm,
                   self.btn_all, self.btn_confirm):
             bar.addWidget(b)
@@ -221,7 +255,11 @@ class CanvasMap(QWidget):
         self.btn_all.setVisible(False); self.btn_all.setEnabled(False)
         self._disp_transform = None; self._inv = None
         self.drawing_pass = False; self.btn_pass.setChecked(False)
-        self.btn_pass.setEnabled(False)
+        self.btn_pass.setEnabled(False); self.btn_pass.setVisible(False)
+        self._edit_group = None; self._edit_passes = {}; self._edit_drag = None
+        self._edit_route = []; self.editing = False
+        self.btn_edit.setChecked(False); self.btn_edit.setEnabled(False)
+        self.btn_del.setVisible(False); self.btn_del.setEnabled(False)
 
     # ------------------------------------------- loaded route: pass selection
     def show_route_passes(self, passes):
@@ -433,28 +471,32 @@ class CanvasMap(QWidget):
         if on:
             if self.drawing_pass:                       # AOI and pass draw are exclusive
                 self.btn_pass.setChecked(False); self._toggle_pass(False)
+            if self.editing:
+                self.btn_edit.setChecked(False); self._toggle_edit(False)
             self.clear_aoi()
 
     # ----------------------------------------------------------- manual passes
     def _toggle_pass(self, on):
+        """The Add Pass sub-tool of Edit Route mode: free two-click pass drawing. Keeps
+        edit mode on (they coexist); resets any half-drawn pass."""
         self.drawing_pass = on
         self.view.setDragMode(QGraphicsView.NoDrag if on else QGraphicsView.ScrollHandDrag)
         self.view.setCursor(Qt.CrossCursor if on else Qt.ArrowCursor)
-        if on and self.drawing:
-            self.btn_draw.setChecked(False); self._toggle_draw(False)
+        self._pass_anchor = None                 # drop any pending start point
         if not on:
             self._clear_pass_temp()
 
-    def set_pass_anchor(self, lon, lat):
-        """Where a drawn pass starts from — the route's current end. The preview
-        rubber-bands from here to the cursor."""
-        self._pass_anchor = (self._scene(lon, lat)
-                             if self.dtm is not None and lon is not None else None)
-
     def add_pass_vertex(self, sp):
-        """Single click: the click is the END of a new pass; its start is the route
-        end (anchor). Emits the clicked (lon, lat). Pass-draw stays on for chaining."""
-        self.passDrawn.emit(self._world(sp))
+        """Free two-click draw: 1st click = the pass START, 2nd click = the pass END.
+        Emits ((lon,lat) start, (lon,lat) end). Stays on for drawing more passes."""
+        if self._pass_anchor is None:
+            self._pass_anchor = sp               # start; the preview rubber-bands to the cursor
+            return
+        p0 = self._world(self._pass_anchor)
+        p1 = self._world(sp)
+        self._pass_anchor = None
+        self._clear_pass_temp()
+        self.passDrawn.emit((p0, p1))
 
     def _update_pass_preview(self, sp):
         if self._pass_anchor is None:
@@ -470,6 +512,150 @@ class CanvasMap(QWidget):
     def _clear_pass_temp(self):
         if self._pass_preview is not None:
             self.scene.removeItem(self._pass_preview); self._pass_preview = None
+
+    # ----------------------------------------------------------- edit route
+    def _toggle_edit(self, on):
+        """Enter/leave Edit Route mode. Add Pass and Delete are sub-tools of this mode,
+        shown only while it's on; polygon-drawing is exclusive with it."""
+        self.editing = on
+        self.view.setDragMode(QGraphicsView.NoDrag if on else QGraphicsView.ScrollHandDrag)
+        self.view.setCursor(Qt.ArrowCursor)
+        self.btn_del.setVisible(on)
+        self.btn_pass.setVisible(on); self.btn_pass.setEnabled(on)
+        if on:
+            if self.btn_draw.isChecked():        # polygon-draw is exclusive with editing
+                self.btn_draw.setChecked(False); self._toggle_draw(False)
+            self.view.setFocus()                 # so the Delete key reaches keyPressEvent
+            self._build_edit_overlay()
+        else:
+            if self.btn_pass.isChecked():        # leaving edit closes the Add Pass sub-tool
+                self.btn_pass.setChecked(False); self._toggle_pass(False)
+            self._edit_drag = None
+            self._clear_edit_overlay()
+        self.btn_del.setEnabled(on and bool(self._selected_edit_pids()))
+
+    def set_editable_route(self, route):
+        """Hand Edit Route mode the current survey passes (endpoint waypoints); rebuilds
+        the overlay in place when edit mode is on. Call after any route change."""
+        self._edit_route = list(route or [])
+        if self.editing:
+            self._build_edit_overlay()
+            self.btn_del.setEnabled(bool(self._selected_edit_pids()))
+
+    def _edit_pass_coords(self):
+        """{pass_id: [(lon,lat) start, (lon,lat) end]} from the editable route, using the
+        two endpoints of each pass (skips NaN-altitude / single-point passes)."""
+        groups = {}
+        for w in self._edit_route:
+            if isinstance(w.get('z'), float) and math.isnan(w['z']):
+                continue
+            pid = w.get('pass_id')
+            if pid is None:
+                continue
+            groups.setdefault(pid, []).append((w['x'], w['y']))
+        return {pid: [p[0], p[-1]] for pid, p in groups.items() if len(p) >= 2}
+
+    def _clear_edit_overlay(self):
+        if self._edit_group is not None:
+            self.scene.removeItem(self._edit_group); self._edit_group = None
+        self._edit_passes = {}
+
+    def _build_edit_overlay(self):
+        """Draw each editable pass as a thick clickable line with two round endpoint
+        handles, preserving the current selection across rebuilds."""
+        prev = set(self._selected_edit_pids())
+        self._clear_edit_overlay()
+        if self.dtm is None or self._inv is None:
+            return
+        grp = QGraphicsItemGroup(); grp.setZValue(25); self.scene.addItem(grp)
+        for pid, coords in self._edit_pass_coords().items():
+            pa = self._scene(*coords[0]); pb = self._scene(*coords[1])
+            path = QPainterPath(pa); path.lineTo(pb)
+            item = QGraphicsPathItem(path); grp.addToGroup(item)
+            handles = []
+            for _ in (0, 1):
+                h = QGraphicsEllipseItem(-5, -5, 10, 10)
+                h.setPen(QPen(Qt.black, 1.0))
+                h.setFlag(QGraphicsEllipseItem.ItemIgnoresTransformations)
+                grp.addToGroup(h); handles.append(h)
+            self._edit_passes[pid] = {
+                'item': item, 'handles': handles,
+                'seg': (pa.x(), pa.y(), pb.x(), pb.y()),
+                'coords': [coords[0], coords[1]], 'selected': pid in prev}
+            self._place_handles(pid); self._style_edit_pass(pid)
+        self._edit_group = grp
+
+    def _place_handles(self, pid):
+        d = self._edit_passes[pid]
+        ax, ay, bx, by = d['seg']
+        d['handles'][0].setPos(ax, ay); d['handles'][1].setPos(bx, by)
+
+    def _style_edit_pass(self, pid):
+        d = self._edit_passes[pid]
+        hexc = '#ffd400' if d['selected'] else '#3fb950'
+        pen = QPen(QColor(hexc), 4 if d['selected'] else 3)
+        pen.setCosmetic(True); pen.setCapStyle(Qt.RoundCap)
+        d['item'].setPen(pen)
+        for h in d['handles']:
+            h.setBrush(QBrush(QColor(hexc)))
+
+    def _selected_edit_pids(self):
+        return [pid for pid, d in self._edit_passes.items() if d['selected']]
+
+    def _select_only(self, pid):
+        for p, d in self._edit_passes.items():
+            d['selected'] = (p == pid); self._style_edit_pass(p)
+        self.btn_del.setEnabled(True)
+
+    def edit_press(self, sp):
+        """Left-click in edit mode: grab an endpoint handle to drag, else select the
+        nearest pass. Returns True when the click was consumed."""
+        scale = abs(self.view.transform().m11()) or 1.0
+        htol = 9.0 / scale
+        for pid, d in self._edit_passes.items():
+            ax, ay, bx, by = d['seg']
+            for idx, (hx, hy) in enumerate(((ax, ay), (bx, by))):
+                if math.hypot(sp.x() - hx, sp.y() - hy) <= htol:
+                    self._edit_drag = (pid, idx); self._select_only(pid)
+                    return True
+        tol = 8.0 / scale
+        best_pid, best_d = None, tol
+        for pid, d in self._edit_passes.items():
+            ax, ay, bx, by = d['seg']
+            dist = _point_seg_dist(sp.x(), sp.y(), ax, ay, bx, by)
+            if dist <= best_d:
+                best_d, best_pid = dist, pid
+        if best_pid is None:
+            return False
+        self._select_only(best_pid)
+        return True
+
+    def edit_drag_move(self, sp):
+        pid, idx = self._edit_drag
+        d = self._edit_passes.get(pid)
+        if d is None:
+            return
+        seg = list(d['seg'])
+        seg[2 * idx], seg[2 * idx + 1] = sp.x(), sp.y()
+        d['seg'] = tuple(seg)
+        path = QPainterPath(QPointF(seg[0], seg[1])); path.lineTo(QPointF(seg[2], seg[3]))
+        d['item'].setPath(path); self._place_handles(pid)
+
+    def edit_drag_release(self, sp):
+        pid, idx = self._edit_drag
+        self._edit_drag = None
+        d = self._edit_passes.get(pid)
+        if d is None:
+            return
+        moved = self._world(QPointF(d['seg'][2 * idx], d['seg'][2 * idx + 1]))
+        other = d['coords'][1 - idx]             # the untouched endpoint (lon,lat)
+        p0, p1 = (moved, other) if idx == 0 else (other, moved)
+        self.passEditGeom.emit((pid, p0, p1))
+
+    def _delete_selected_edit(self):
+        pids = self._selected_edit_pids()
+        if pids:
+            self.passEditDelete.emit(list(pids))
 
     def add_vertex(self, sp):
         self._verts.append(sp)
@@ -547,9 +733,14 @@ class CanvasMap(QWidget):
         self._pass_highlight_item = None
         self._verts = []; self._draw_items = []; self._pass_segs = []
         self._pass_anchor = None; self._pass_preview = None
-        self.drawing = False; self.drawing_pass = False
+        self.drawing = False; self.drawing_pass = False; self.editing = False
         self.btn_draw.setChecked(False)
         self.btn_pass.setChecked(False); self.btn_pass.setEnabled(False)
+        self.btn_pass.setVisible(False)
+        self.btn_edit.setChecked(False); self.btn_edit.setEnabled(False)
+        self.btn_del.setVisible(False)
+        self._edit_group = None; self._edit_passes = {}; self._edit_drag = None
+        self._edit_route = []
         self.btn_focus.blockSignals(True)
         self.btn_focus.setChecked(False); self.btn_focus.setEnabled(False)
         self.btn_focus.blockSignals(False)
