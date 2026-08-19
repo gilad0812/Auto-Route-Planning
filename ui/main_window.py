@@ -1402,33 +1402,39 @@ class MainWindow(QMainWindow):
                 f'Deleted {n} pass{"es" if n != 1 else ""} — {left} passes, '
                 f'{self.result.n_waypoints} waypoints.')
 
-    def _on_edit_geom(self, payload):
-        """Edit Route: an endpoint was dragged — rebuild that pass (altitude re-derived
-        from terrain) in place and re-estimate. Snaps back if the new line has no terrain."""
-        pid, p0, p1 = payload
-        if not self.survey_route:
+    def _on_edit_geom(self, updates):
+        """Edit Route: one or more endpoints were dragged — rebuild each affected pass
+        (altitude re-derived from terrain) and re-estimate once. A shared point moves
+        every pass meeting there as a joint, so `updates` may carry several passes.
+        Snaps back if any moved line has no valid terrain."""
+        if not self.survey_route or not updates:
             return
-        new_pass = build_manual_pass(self.dtm, p0, p1, self._params(), self.is_geo, pid)
-        if not new_pass:
-            self.statusBar().showMessage('Moved pass has no valid terrain — edit ignored.')
-            if self.mapview is not None:
-                self.mapview.set_editable_route(self.survey_route)   # snap handle back
-            return
-        new_survey, inserted = [], False
-        for w in self.survey_route:                  # splice in place, keep route order
-            if w.get('pass_id') == pid:
-                if not inserted:
-                    new_survey.extend(new_pass); inserted = True
+        rebuilt = {}                                 # pass_id -> new waypoints
+        for pid, p0, p1 in updates:
+            wps = build_manual_pass(self.dtm, p0, p1, self._params(), self.is_geo, pid)
+            if not wps:
+                self.statusBar().showMessage('Moved pass has no valid terrain — edit ignored.')
+                if self.mapview is not None:
+                    self.mapview.set_editable_route(self.survey_route)   # snap handles back
+                return
+            rebuilt[pid] = wps
+        new_survey, seen = [], set()
+        for w in self.survey_route:                  # splice each rebuilt pass in place
+            pid = w.get('pass_id')
+            if pid in rebuilt:
+                if pid not in seen:
+                    new_survey.extend(rebuilt[pid]); seen.add(pid)
             else:
                 new_survey.append(w)
-        if not inserted:
-            new_survey.extend(new_pass)
+        for pid, wps in rebuilt.items():             # any not already present (shouldn't happen)
+            if pid not in seen:
+                new_survey.extend(wps)
         pre = self._snapshot_route(self.survey_route)
         if self._reestimate_survey(new_survey, 'Pass moved — re-estimating density…'):
             self._record_edit(pre)
+            n = len(rebuilt)
             self.statusBar().showMessage(
-                f'Pass moved to {new_pass[0]["z"]:.0f} m — '
-                f'{self.result.n_waypoints} waypoints.')
+                f'Moved {n} pass{"es" if n != 1 else ""} — {self.result.n_waypoints} waypoints.')
 
     # ---------------------------------------------------------------- profile
     def _toggle_profile(self, on):

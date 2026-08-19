@@ -154,7 +154,8 @@ class CanvasMap(QWidget):
     passSelectionChanged = Signal(int)   # # of route passes currently selected
     passesConfirmed = Signal()           # operator confirmed the selected passes
     passEditDelete = Signal(object)      # list[int] pass_ids to delete (Edit Route mode)
-    passEditGeom = Signal(object)        # (pass_id, (lon0,lat0), (lon1,lat1)) after an endpoint drag
+    passEditGeom = Signal(object)        # list[(pass_id, (lon0,lat0), (lon1,lat1))] after a drag
+    #   (a shared endpoint moves every pass meeting there — a joint — in one batch)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -603,20 +604,36 @@ class CanvasMap(QWidget):
         return [pid for pid, d in self._edit_passes.items() if d['selected']]
 
     def _select_only(self, pid):
+        self._select_pids({pid})
+
+    def _select_pids(self, pids):
         for p, d in self._edit_passes.items():
-            d['selected'] = (p == pid); self._style_edit_pass(p)
-        self.btn_del.setEnabled(True)
+            d['selected'] = (p in pids); self._style_edit_pass(p)
+        self.btn_del.setEnabled(bool(pids))
+
+    def _joint_at(self, hx, hy, tol):
+        """Every (pass_id, endpoint_idx) whose handle sits on the scene point (hx, hy)
+        within `tol` — i.e. the passes meeting at that joint."""
+        group = []
+        for pid, d in self._edit_passes.items():
+            ax, ay, bx, by = d['seg']
+            for idx, (gx, gy) in enumerate(((ax, ay), (bx, by))):
+                if math.hypot(gx - hx, gy - hy) <= tol:
+                    group.append((pid, idx))
+        return group
 
     def edit_press(self, sp):
-        """Left-click in edit mode: grab an endpoint handle to drag, else select the
-        nearest pass. Returns True when the click was consumed."""
+        """Left-click in edit mode: grab an endpoint handle to drag — together with any
+        other pass endpoints sharing that point, so a joint moves as one — else select
+        the nearest pass. Returns True when the click was consumed."""
         scale = abs(self.view.transform().m11()) or 1.0
         htol = 9.0 / scale
         for pid, d in self._edit_passes.items():
             ax, ay, bx, by = d['seg']
             for idx, (hx, hy) in enumerate(((ax, ay), (bx, by))):
                 if math.hypot(sp.x() - hx, sp.y() - hy) <= htol:
-                    self._edit_drag = (pid, idx); self._select_only(pid)
+                    self._edit_drag = self._joint_at(hx, hy, htol)   # the whole joint
+                    self._select_pids({p for p, _ in self._edit_drag})
                     return True
         tol = 8.0 / scale
         best_pid, best_d = None, tol
@@ -631,26 +648,30 @@ class CanvasMap(QWidget):
         return True
 
     def edit_drag_move(self, sp):
-        pid, idx = self._edit_drag
-        d = self._edit_passes.get(pid)
-        if d is None:
-            return
-        seg = list(d['seg'])
-        seg[2 * idx], seg[2 * idx + 1] = sp.x(), sp.y()
-        d['seg'] = tuple(seg)
-        path = QPainterPath(QPointF(seg[0], seg[1])); path.lineTo(QPointF(seg[2], seg[3]))
-        d['item'].setPath(path); self._place_handles(pid)
+        for pid, idx in (self._edit_drag or []):     # move every endpoint at the joint
+            d = self._edit_passes.get(pid)
+            if d is None:
+                continue
+            seg = list(d['seg'])
+            seg[2 * idx], seg[2 * idx + 1] = sp.x(), sp.y()
+            d['seg'] = tuple(seg)
+            path = QPainterPath(QPointF(seg[0], seg[1])); path.lineTo(QPointF(seg[2], seg[3]))
+            d['item'].setPath(path); self._place_handles(pid)
 
     def edit_drag_release(self, sp):
-        pid, idx = self._edit_drag
+        group = self._edit_drag or []
         self._edit_drag = None
-        d = self._edit_passes.get(pid)
-        if d is None:
-            return
-        moved = self._world(QPointF(d['seg'][2 * idx], d['seg'][2 * idx + 1]))
-        other = d['coords'][1 - idx]             # the untouched endpoint (lon,lat)
-        p0, p1 = (moved, other) if idx == 0 else (other, moved)
-        self.passEditGeom.emit((pid, p0, p1))
+        updates = []
+        for pid, idx in group:
+            d = self._edit_passes.get(pid)
+            if d is None:
+                continue
+            moved = self._world(QPointF(d['seg'][2 * idx], d['seg'][2 * idx + 1]))
+            other = d['coords'][1 - idx]             # this pass's untouched endpoint (lon,lat)
+            p0, p1 = (moved, other) if idx == 0 else (other, moved)
+            updates.append((pid, p0, p1))
+        if updates:
+            self.passEditGeom.emit(updates)
 
     def _delete_selected_edit(self):
         pids = self._selected_edit_pids()
