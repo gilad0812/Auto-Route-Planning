@@ -952,6 +952,10 @@ class MainWindow(QMainWindow):
             self.mapview.set_aoi_polygon(list(self.drawn_polygon.exterior.coords))
         if self.result and self.result.route:
             self._render_map_overlays(self.result)
+            # set_dtm -> _reset_scene disabled the Edit button and dropped its overlay
+            # data; the route survived the re-render, so restore both.
+            self.mapview.btn_edit.setEnabled(True)
+            self.mapview.set_editable_route(self.survey_route)
         else:
             self._show_home()
 
