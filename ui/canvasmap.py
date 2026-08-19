@@ -48,6 +48,10 @@ FAILURE_REASON_LABEL = {
 # Under-target cells (thin + uncovered) are shaded by density/target: 0 → red, target → yellow.
 _THIN_CMAP = plt.get_cmap('autumn')
 
+# Edit Route: a drag shorter than this (in screen pixels) is treated as a click, not a
+# move — so a tap or tiny nudge on a joint doesn't trigger a re-estimate.
+_EDIT_DRAG_MIN_PX = 6.0
+
 
 def _point_seg_dist(px, py, ax, ay, bx, by):
     """Shortest distance from point (px,py) to segment (ax,ay)-(bx,by)."""
@@ -169,7 +173,8 @@ class CanvasMap(QWidget):
         self._edit_route = []            # route wps currently editable (survey passes)
         self._edit_passes = {}           # pass_id -> {'item','handles','seg','coords','selected'}
         self._edit_group = None          # scene group holding the edit overlay
-        self._edit_drag = None           # (pass_id, end_idx) while dragging an endpoint handle
+        self._edit_drag = None           # [(pass_id, end_idx), …] the joint being dragged
+        self._edit_drag_start = None     # scene point where the drag began (dead-zone test)
         self._disp_transform = None      # scene(overview) pixel -> world; None until loaded
         self.drawing = False
         self.drawing_pass = False
@@ -633,6 +638,7 @@ class CanvasMap(QWidget):
             for idx, (hx, hy) in enumerate(((ax, ay), (bx, by))):
                 if math.hypot(sp.x() - hx, sp.y() - hy) <= htol:
                     self._edit_drag = self._joint_at(hx, hy, htol)   # the whole joint
+                    self._edit_drag_start = QPointF(sp)              # for the dead-zone test
                     self._select_pids({p for p, _ in self._edit_drag})
                     return True
         tol = 8.0 / scale
@@ -660,7 +666,18 @@ class CanvasMap(QWidget):
 
     def edit_drag_release(self, sp):
         group = self._edit_drag or []
+        start = self._edit_drag_start
         self._edit_drag = None
+        self._edit_drag_start = None
+        if not group:
+            return
+        # Dead zone: a drag shorter than _EDIT_DRAG_MIN_PX on screen is a click, not a
+        # move — snap the handles back to where they were and don't re-estimate.
+        scale = abs(self.view.transform().m11()) or 1.0
+        if start is not None and \
+                math.hypot(sp.x() - start.x(), sp.y() - start.y()) * scale < _EDIT_DRAG_MIN_PX:
+            self.set_editable_route(self._edit_route)
+            return
         updates = []
         for pid, idx in group:
             d = self._edit_passes.get(pid)
