@@ -21,6 +21,25 @@ from density_estimate import estimate_density_grid       # noqa: E402
 from scanner import (                                      # noqa: E402
     max_range_m, scan_lines_for_square_pattern)
 
+# Numba fast path (fused, multithreaded kernel — ~10-30x). Optional: import fails
+# cleanly where numba isn't installed, and any runtime error falls back to the NumPy
+# reference. Both paths are validated bit-for-bit identical (tests/test_estimator_numba).
+try:
+    from density_estimate_nb import estimate_density_grid_nb as _estimate_nb  # noqa: E402
+except Exception:                                          # pragma: no cover
+    _estimate_nb = None
+
+
+def _estimate_density(*args, **kwargs):
+    """Density estimate via the numba fast path when available, else NumPy. A numba
+    runtime error falls back to the (identical) NumPy result rather than failing."""
+    if _estimate_nb is not None:
+        try:
+            return _estimate_nb(*args, **kwargs)
+        except Exception:                                 # pragma: no cover
+            pass
+    return estimate_density_grid(*args, **kwargs)
+
 _LAT_M = 111139.0
 
 # Max AOI area for one plan. A single drone survey is one flight; capping the AOI also
@@ -222,7 +241,7 @@ def estimate_for_route(dtm, polygon, route, params: PlanParams, chm=None, is_geo
     if not route:
         return res
 
-    res.estimate = estimate_density_grid(
+    res.estimate = _estimate_density(
         route, dtm, list(polygon.exterior.coords),
         pulse_freq_hz=int(params.pulse_freq_hz), scan_freq_hz=float(params.scan_freq_hz),
         scan_half_angle_deg=half, speed_ms=float(params.speed_ms),

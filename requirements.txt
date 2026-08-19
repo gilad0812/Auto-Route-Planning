@@ -1,6 +1,7 @@
 rasterio
 shapely
 numpy
+numba          # JIT-compiles the density estimate (~10-30x); NumPy fallback if absent
 pandas
 matplotlib
 Pillow

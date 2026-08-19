@@ -13,7 +13,10 @@ ICON = os.path.join('assets', 'app.ico')
 ICON = ICON if os.path.exists(ICON) else None
 
 datas, binaries, hiddenimports = [], [], []
-for pkg in ('rasterio', 'pyproj', 'shapely', 'laspy', 'lazrs', 'matplotlib'):
+# numba + llvmlite ship a bundled LLVM DLL and many dynamically-imported submodules;
+# collect_all grabs the binary + data files so the JIT works in the frozen app.
+for pkg in ('rasterio', 'pyproj', 'shapely', 'laspy', 'lazrs', 'matplotlib',
+            'numba', 'llvmlite'):
     try:
         d, b, h = collect_all(pkg)
         datas += d; binaries += b; hiddenimports += h
@@ -21,10 +24,12 @@ for pkg in ('rasterio', 'pyproj', 'shapely', 'laspy', 'lazrs', 'matplotlib'):
         pass
 
 hiddenimports += collect_submodules('rasterio')
+hiddenimports += collect_submodules('numba')
 # src/ modules imported dynamically (sys.path.insert) — name them explicitly.
 hiddenimports += [
-    'dtm', 'route_planner', 'density_estimate', 'helios_integration',
-    'terrain_converter', 'helios_setup', 'helios_config', 'patch_scanner',
+    'dtm', 'route_planner', 'density_estimate', 'density_estimate_nb',
+    'helios_integration', 'terrain_converter', 'helios_setup', 'helios_config',
+    'patch_scanner',
 ]
 
 a = Analysis(

@@ -13,6 +13,45 @@ import sys
 import math
 import tempfile
 
+# Give numba a WRITABLE on-disk JIT cache (set before anything imports numba). In the
+# frozen bundle the modules live in a read-only dir, so without this the kernel would
+# recompile on every launch; here it compiles once ever and reloads from cache.
+_nb_cache = os.path.join(os.environ.get('LOCALAPPDATA', tempfile.gettempdir()),
+                         'LidarRoutePlanner', 'numba_cache')
+try:
+    os.makedirs(_nb_cache, exist_ok=True)
+    os.environ.setdefault('NUMBA_CACHE_DIR', _nb_cache)
+except OSError:
+    pass
+
+
+def _prewarm_numba():
+    """Trigger the numba JIT compile on a tiny synthetic estimate, in the background,
+    so the operator's first real Compute isn't stalled by compilation. Silent + best
+    effort — any failure (no numba, etc.) just leaves the NumPy fallback in place."""
+    try:
+        import types
+        import numpy as np
+        from affine import Affine
+        _src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src')
+        if os.path.isdir(_src) and _src not in sys.path:
+            sys.path.insert(0, _src)                    # running from source
+        from density_estimate_nb import estimate_density_grid_nb
+        n = 24
+        arr = (300.0 + np.add.outer(np.arange(n) * 0.1, np.arange(n) * 0.1))
+        dtm = types.SimpleNamespace(array=arr,
+                                    transform=Affine(1.0, 0.0, 0.0, 0.0, -1.0, float(n)),
+                                    nodata=None)
+        region = [(2, 2), (20, 2), (20, 20), (2, 20), (2, 2)]
+        route = [{'x': 6.0, 'y': 4.0, 'z': 360.0, 'pass_id': 0},
+                 {'x': 6.0, 'y': 18.0, 'z': 360.0, 'pass_id': 0}]
+        estimate_density_grid_nb(
+            route, dtm, region, pulse_freq_hz=600_000, scan_freq_hz=224.4,
+            scan_half_angle_deg=50.0, speed_ms=6.0, min_points=50,
+            is_geo=False, cell_size_m=1.0)
+    except Exception:
+        pass
+
 
 def _helios_selftest(dtm_path):
     log_path = os.path.join(tempfile.gettempdir(), 'helios_selftest.log')
@@ -82,6 +121,10 @@ def main():
     apply_dark_theme(app)
     win = MainWindow()
     win.show()
+    # Compile the numba kernel in the background while the operator loads a DTM /
+    # draws the polygon, so the first Compute isn't stalled by JIT.
+    import threading
+    threading.Thread(target=_prewarm_numba, daemon=True).start()
     sys.exit(app.exec())
 
 
