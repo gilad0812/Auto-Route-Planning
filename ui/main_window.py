@@ -1630,19 +1630,38 @@ class MainWindow(QMainWindow):
             ('Area', area),
             ('<b>Route</b>', ''),
             ('Passes', f'{n_passes}'),
-            ('Waypoints', f'{r.n_waypoints}'),
             ('Path length', plen),
             ('Alt range', f'{r.alt_min:.0f} – {r.alt_max:.0f} m'),
         ]
-        if self.home is not None:
+        if self.home is not None and self.dtm is not None:
             rows.append(('Takeoff/Home',
-                         f'{self.home[1]:.5f}, {self.home[0]:.5f}'))
+                         fmt_utm(self.dtm.src.crs, self.home[0], self.home[1])))
         rows += [
             ('<b>Density estimate</b>', ''),
             ('Coverage', f'{cov:.1f}%'),
             ('Median density', f"{est.get('median_density', 0):.0f} pts/m²"),
-            ('Min density', f"{est.get('min_density', 0):.0f} pts/m²"),
+            ('Average density', f"{est.get('mean_density', 0):.0f} pts/m²"),
         ]
+        # Density bands: what fraction of AOI blocks fall in each 50-wide density band,
+        # anchored at the target (min_points). Answers "how much of the area is well over
+        # target vs just scraping it vs under."
+        vals = est.get('in_region_density')
+        thr = int(self._params().min_points)
+        if vals is not None and getattr(vals, 'size', 0) and thr > 0:
+            import numpy as np
+            edges = [0]
+            x = 50
+            while x < thr:
+                edges.append(x); x += 50
+            edges.append(thr)
+            counts, _ = np.histogram(vals, bins=edges + [np.inf])
+            total = int(vals.size)
+            rows.append((f'<b>Density bands</b> (target {thr})', ''))
+            rows.append((f'≥ {thr} pts/m²', f'{100.0 * counts[-1] / total:.1f}%'))
+            for i in range(len(counts) - 2, -1, -1):
+                lo, hi = edges[i], edges[i + 1]
+                lbl = f'below {hi}' if lo == 0 else f'{lo} – {hi}'
+                rows.append((lbl, f'{100.0 * counts[i] / total:.1f}%'))
         # Failure breakdown by CAUSE — swatch colours match the map overlay, so the
         # operator reads why each patch is orange/red/etc. and what lever fixes it.
         # 'thin' folds in the uncovered (gap) cells — both are "under target coverage"

@@ -327,7 +327,9 @@ def estimate_density_grid(
         # the tell that the AGL/PRR combo, not the geometry, is what's starving them.
         "n_range_limited": int((range_hit & fail_mask).sum()),
         "median_density": float(np.median(in_vals)) if in_vals.size else 0.0,
+        "mean_density": float(in_vals.mean()) if in_vals.size else 0.0,
         "min_density": float(in_vals.min()) if in_vals.size else 0.0,
+        "in_region_density": in_vals,   # per-cell densities inside the AOI (for band stats)
         "cell_size_m": cell,
         "estimate": True,
     }
