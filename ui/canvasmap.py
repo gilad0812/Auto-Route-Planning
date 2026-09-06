@@ -445,7 +445,12 @@ class CanvasMap(QWidget):
         lon, lat = self._world(sp)
         z = self.dtm.elevation_at(lon, lat)
         ztxt = f'{z:.0f} m' if z == z else '000 m'      # NaN check
-        self.lbl_coord.setText(f'{lat:.5f}, {lon:.5f}   ·   {ztxt}')
+        try:
+            from .geo import fmt_utm
+        except ImportError:                              # standalone import fallback
+            from geo import fmt_utm
+        crs = self.dtm.src.crs if self.dtm is not None else None
+        self.lbl_coord.setText(f'{fmt_utm(crs, lon, lat)}   ·   {ztxt}')
         if self.drawing_pass:
             self._update_pass_preview(sp)
         else:

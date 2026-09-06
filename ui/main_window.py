@@ -22,6 +22,7 @@ from .planning import (PlanParams, compute_plan, load_dtm, chm_compatible,
                        scan_lines_for_square_pattern, build_manual_pass,
                        estimate_for_route, polygon_area_m2, MAX_AOI_M2,
                        _pass_altitude, band_pass_altitudes, _path_length_m, _LAT_M)
+from .geo import from_utm, fmt_utm
 
 try:
     from .canvasmap import CanvasMap, FAILURE_REASON_STYLE, FAILURE_REASON_LABEL
@@ -646,12 +647,13 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QDialog, QPlainTextEdit, QDialogButtonBox
         dlg = QDialog(self); dlg.setWindowTitle('Enter polygon')
         lay = QVBoxLayout(dlg)
-        info = QLabel('One vertex per line as  <b>lat, lon</b>  (matching the map '
-                      'readout). At least 3 vertices; the polygon is closed '
-                      'automatically.')
+        info = QLabel('One vertex per line as  <b>easting, northing</b>  (UTM 36N, '
+                      'matching the map readout). At least 3 vertices; the polygon is '
+                      'closed automatically.')
         info.setWordWrap(True); info.setTextFormat(Qt.RichText)
         txt = QPlainTextEdit()
-        txt.setPlaceholderText('47.10, 8.30\n47.10, 8.40\n47.20, 8.40\n47.20, 8.30')
+        txt.setPlaceholderText('500000, 3450000\n500500, 3450000\n'
+                               '500500, 3450500\n500000, 3450500')
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
         lay.addWidget(info); lay.addWidget(txt); lay.addWidget(bb)
@@ -667,7 +669,9 @@ class MainWindow(QMainWindow):
         self.lbl_aoi.setText('✓ polygon set from entered coordinates.')
 
     def _parse_coords(self, text):
-        """Parse 'lat, lon' lines into a list of [lon, lat] vertices, or None."""
+        """Parse 'easting, northing' (UTM 36N) lines into a list of [lon, lat] vertices
+        in the DTM frame, or None."""
+        crs = self.dtm.src.crs if self.dtm is not None else None
         coords = []
         for ln in text.splitlines():
             ln = ln.strip()
@@ -675,13 +679,15 @@ class MainWindow(QMainWindow):
                 continue
             parts = ln.replace(',', ' ').split()
             if len(parts) < 2:
-                QMessageBox.warning(self, 'Polygon', f'Bad line: "{ln}"\nUse: lat, lon')
+                QMessageBox.warning(self, 'Polygon',
+                                    f'Bad line: "{ln}"\nUse: easting, northing')
                 return None
             try:
-                lat, lon = float(parts[0]), float(parts[1])
+                easting, northing = float(parts[0]), float(parts[1])
             except ValueError:
                 QMessageBox.warning(self, 'Polygon', f'Not numbers: "{ln}"')
                 return None
+            lon, lat = from_utm(crs, easting, northing)
             coords.append([lon, lat])
         if len(coords) < 3:
             QMessageBox.warning(self, 'Polygon', 'Enter at least 3 vertices.')
@@ -1031,20 +1037,22 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, 'Home', 'Open a DTM first.'); return
         from PySide6.QtWidgets import QInputDialog
         text, ok = QInputDialog.getText(
-            self, 'Set takeoff / home', 'Home coordinate as  lat, lon :')
+            self, 'Set takeoff / home', 'Home as UTM 36N  easting, northing :')
         if not ok or not text.strip():
             return
         parts = text.replace(',', ' ').split()
         try:
-            lat, lon = float(parts[0]), float(parts[1])
+            easting, northing = float(parts[0]), float(parts[1])
         except (ValueError, IndexError):
-            QMessageBox.warning(self, 'Home', f'Could not read "{text}".\nUse: lat, lon')
+            QMessageBox.warning(self, 'Home',
+                                f'Could not read "{text}".\nUse: easting, northing (UTM 36N)')
             return
+        lon, lat = from_utm(self.dtm.src.crs, easting, northing)
         self.home = (lon, lat)
         z = self.dtm.elevation_at(lon, lat)
         self.home_ground = z
         gtxt = f'ground {z:.0f} m' if z == z else 'outside DTM'
-        self.lbl_home.setText(f'Home: {lat:.5f}, {lon:.5f}  ({gtxt})')
+        self.lbl_home.setText(f'Home: {fmt_utm(self.dtm.src.crs, lon, lat)}  ({gtxt})')
         self._set_busy(True, 'Adding home — re-estimating…')
         try:
             self._rebuild_effective()

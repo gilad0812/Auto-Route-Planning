@@ -1,5 +1,6 @@
 rasterio
 shapely
+pyproj          # lon/lat <-> UTM for the coordinate readout + coordinate-entry dialogs
 numpy
 numba          # JIT-compiles the density estimate (~10-30x); NumPy fallback if absent
 pandas
