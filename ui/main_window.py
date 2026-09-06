@@ -397,12 +397,7 @@ class MainWindow(QMainWindow):
         self.btn_compute.clicked.connect(self._compute)
         v.addWidget(self.btn_compute)
 
-        self.btn_helios = QPushButton('Validate (HELIOS++)…')
-        self.btn_helios.setEnabled(False)
-        self.btn_helios.clicked.connect(self._open_helios)
-        v.addWidget(self.btn_helios)
-
-        gb_exp = QGroupBox('Export'); el = QHBoxLayout(gb_exp)
+        gb_exp = QGroupBox('Export lines'); el = QHBoxLayout(gb_exp)
         self.btn_geojson = QPushButton('GeoJSON'); self.btn_geojson.setEnabled(False)
         self.btn_geojson.clicked.connect(self._export_geojson)
         self.btn_csv = QPushButton('CSV'); self.btn_csv.setEnabled(False)
@@ -987,7 +982,6 @@ class MainWindow(QMainWindow):
             self.mapview._toggle_edit(False)
             self.mapview.btn_edit.setEnabled(False)
             self.mapview.set_editable_route([])
-        self.btn_helios.setEnabled(False)
         self.btn_geojson.setEnabled(False)
         self.btn_csv.setEnabled(False)
         self.act_save_route.setEnabled(False)
@@ -1282,7 +1276,6 @@ class MainWindow(QMainWindow):
         self._render_map_overlays(self.result)
         self._refresh_profile()
         has_route = bool(self.result and self.result.route)
-        self.btn_helios.setEnabled(has_route)
         self.btn_geojson.setEnabled(has_route)
         self.btn_csv.setEnabled(has_route)
         self.act_save_route.setEnabled(has_route)
@@ -1489,25 +1482,6 @@ class MainWindow(QMainWindow):
                   if w.get('pass_id') == pass_id
                   and not (isinstance(w['z'], float) and math.isnan(w['z']))]
         self.mapview.highlight_pass(coords)
-
-    # ---------------------------------------------------------------- HELIOS
-    def _open_helios(self):
-        if not (self.result and self.result.route and self.drawn_polygon is not None):
-            return
-        from .helios import HeliosDialog
-        dlg = HeliosDialog(self, dtm=self.dtm, dtm_path=self.dtm_path,
-                           route=self.result.route, polygon=self.drawn_polygon,
-                           params=self._params(), chm=self.chm, is_geo=self.is_geo)
-        dlg.resultReady.connect(self._on_helios_result)
-        self._helios_dlg = dlg          # keep a ref so it isn't GC'd
-        dlg.show()
-
-    def _on_helios_result(self, res):
-        if self.mapview is None or res.get('error'):
-            return
-        cells = res.get('failing_cells_geo', [])
-        rad = max(float((self.result.estimate or {}).get('cell_size_m', 2.0)), 3.0)
-        self.mapview.show_helios(cells, radius_m=rad)
 
     # ---------------------------------------------------------------- export
     def _export_geojson(self):
