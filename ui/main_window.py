@@ -13,7 +13,7 @@ from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
-    QFormLayout, QDoubleSpinBox, QSpinBox, QCheckBox, QComboBox, QGroupBox,
+    QFormLayout, QDoubleSpinBox, QSpinBox, QComboBox, QGroupBox,
     QSplitter, QScrollArea, QFileDialog, QMessageBox, QFrame, QProgressBar,
     QApplication, QAbstractSpinBox, QToolButton,
 )
@@ -340,15 +340,8 @@ class MainWindow(QMainWindow):
         fl.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)  # when the pane is narrow
         self.sp_alt = self._dspin(1, 1000, 100, ' m', 5)
         self.sp_overlap = self._dspin(20, 50, 20, ' %', 1)
-        self.cb_adaptive = QCheckBox('Terrain-adaptive spacing'); self.cb_adaptive.setChecked(True)
-        self.cb_edge_margin = QCheckBox('Edge fly-past (cover polygon rim)')
-        self.cb_edge_margin.setToolTip(
-            'Extend passes one pass-pitch beyond the polygon so edge cells get full '
-            'overlap (removes the boundary coverage gap). Flies slightly outside the polygon.')
         fl.addRow('Altitude AGL', self.sp_alt)
         fl.addRow('Overlap', self.sp_overlap)
-        fl.addRow(self.cb_adaptive)               # span both columns → hug the left edge
-        fl.addRow(self.cb_edge_margin)
         v.addWidget(gb_flight)
 
         # ── Scanner & density ── (workflow step ④) — routine knobs up top, the
@@ -453,8 +446,6 @@ class MainWindow(QMainWindow):
         s = self._settings()
         s.setValue('flight/agl', self.sp_alt.value())
         s.setValue('flight/overlap', self.sp_overlap.value())
-        s.setValue('flight/adaptive', self.cb_adaptive.isChecked())
-        s.setValue('flight/edge_margin', self.cb_edge_margin.isChecked())
         s.setValue('scan/min_points', self.sp_minpts.value())
         s.setValue('scan/speed', self.sp_speed.value())
         s.setValue('scan/pulse_freq', self.cmb_pulse.currentData())
@@ -466,10 +457,6 @@ class MainWindow(QMainWindow):
         self.sp_alt.setValue(s.value('flight/agl', self.sp_alt.value(), type=float))
         self.sp_overlap.setValue(
             s.value('flight/overlap', self.sp_overlap.value(), type=float))
-        self.cb_adaptive.setChecked(
-            s.value('flight/adaptive', self.cb_adaptive.isChecked(), type=bool))
-        self.cb_edge_margin.setChecked(
-            s.value('flight/edge_margin', self.cb_edge_margin.isChecked(), type=bool))
         self.sp_minpts.setValue(
             s.value('scan/min_points', self.sp_minpts.value(), type=int))
         self.sp_speed.setValue(s.value('scan/speed', self.sp_speed.value(), type=float))
@@ -1216,8 +1203,8 @@ class MainWindow(QMainWindow):
             altitude_m=self.sp_alt.value(),
             min_peak_clearance_m=_MIN_PEAK_CLEARANCE_M,
             overlap_pct=self.sp_overlap.value(),
-            adaptive_spacing=self.cb_adaptive.isChecked(),
-            edge_margin=self.cb_edge_margin.isChecked(),
+            adaptive_spacing=True,          # always on (no longer a UI option)
+            edge_margin=False,              # edge fly-past removed
             min_points=self.sp_minpts.value(),
             speed_ms=self.sp_speed.value(),
             pulse_freq_hz=self.cmb_pulse.currentData(),
