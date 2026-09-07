@@ -21,7 +21,8 @@ from PySide6.QtWidgets import (
 from .planning import (PlanParams, compute_plan, load_dtm, chm_compatible,
                        scan_lines_for_square_pattern, build_manual_pass,
                        estimate_for_route, polygon_area_m2, MAX_AOI_M2,
-                       _pass_altitude, band_pass_altitudes, _path_length_m, _LAT_M)
+                       _pass_altitude, band_pass_altitudes, band_route_altitudes,
+                       _path_length_m, _LAT_M)
 from .geo import from_utm, fmt_utm
 
 try:
@@ -1238,6 +1239,7 @@ class MainWindow(QMainWindow):
             self.base_result = compute_plan(self.dtm, poly, self._params(),
                                             chm=self.chm, is_geo=self.is_geo)
             self.survey_route = self.base_result.route
+            self._route_auto_alt = True     # program-assigned altitudes -> re-band on edits
             self.result = self._effective_result()
         except Exception as e:
             self.setEnabled(True)
@@ -1307,6 +1309,10 @@ class MainWindow(QMainWindow):
         prev = self.survey_route
         self._set_busy(True, busy_msg)
         try:
+            # Re-group the (possibly edited) passes onto the fewest shared altitudes —
+            # unless the route carries operator-supplied 3D altitudes, which we leave be.
+            if self._route_auto_alt:
+                band_route_altitudes(self.dtm, new_survey, self._params(), self.is_geo)
             self.survey_route = new_survey
             self.base_result = estimate_for_route(
                 self.dtm, self.drawn_polygon, self.survey_route,

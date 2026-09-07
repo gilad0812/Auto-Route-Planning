@@ -259,6 +259,40 @@ def estimate_for_route(dtm, polygon, route, params: PlanParams, chm=None, is_geo
     return res
 
 
+def band_route_altitudes(dtm, route, params: PlanParams, is_geo=True):
+    """RE-band a route after an edit: first re-derive each pass's base altitude from the
+    terrain (mean terrain + AGL, floored to clear its peak — the same rule the planner
+    and build_manual_pass use), THEN group globally into the fewest distinct heights.
+
+    Rebasing first is what stops altitudes ratcheting up over successive edits: band_pass_
+    altitudes only ever raises and rewrites z in place, so without resetting to the planned
+    floor each pass would keep its previously-banded (raised) height as the new floor.
+    Mutates z in place; returns route."""
+    to_m = _LAT_M if is_geo else 1.0
+    step_map = params.step_m / to_m
+    dtm_res_map = min(abs(dtm.src.res[0]), abs(dtm.src.res[1]))
+    elev_step_map = min(step_map, dtm_res_map)
+    groups = {}
+    for w in route:
+        groups.setdefault(w.get('pass_id'), []).append(w)
+    for wps in groups.values():
+        valid = [w for w in wps if not (isinstance(w['z'], float) and math.isnan(w['z']))]
+        if len(valid) < 2:
+            continue
+        (x0, y0), (x1, y1) = (valid[0]['x'], valid[0]['y']), (valid[-1]['x'], valid[-1]['y'])
+        dist = math.hypot(x1 - x0, y1 - y0)
+        n = max(1, int(math.ceil(dist / step_map))) if step_map > 0 else 1
+        pts = [(x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n) for i in range(n + 1)]
+        z = _pass_altitude(dtm, pts, params.altitude_m, step_map, elev_step_map,
+                           params.min_peak_clearance_m)
+        if not math.isnan(z):
+            for w in wps:
+                if not (isinstance(w['z'], float) and math.isnan(w['z'])):
+                    w['z'] = z
+    band_pass_altitudes(route, dtm, params.altitude_m, is_geo=is_geo)
+    return route
+
+
 def build_manual_pass(dtm, p0, p1, params: PlanParams, is_geo, pass_id):
     """Build waypoints for a hand-drawn straight pass between (lon,lat) endpoints
     p0→p1. Altitude is set automatically like any pass: mean terrain + AGL, floored so

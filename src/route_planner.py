@@ -82,20 +82,21 @@ def _pass_altitude(dtm, pts, agl, step, elev_sample_step=None, min_peak_clearanc
 
 
 def band_pass_altitudes(route, dtm, agl, is_geo=True, band_half_m=50.0):
-    """Merge consecutive passes onto a shared altitude wherever both can stay inside
-    the AGL corridor [AGL−band_half, AGL+band_half] (the ±band_half m band the
-    elevation profile draws around the target AGL), so passes that don't need a
-    distinct height don't get one — each shared height is one z-calibration instead
-    of one per pass.
+    """Give the passes the FEWEST distinct altitudes possible: group passes onto shared
+    heights wherever they can all stay inside the AGL corridor [AGL−band_half,
+    AGL+band_half] (the ±band_half m band the elevation profile draws around the target
+    AGL), so each shared height is one z-calibration instead of one per pass.
 
-    A pass keeps its planned altitude z_i as the floor (it is never LOWERED — that
-    would cut clearance and narrow the swath the spacing assumed). It may be RAISED
-    up to valley_i + AGL + band_half, the highest constant altitude keeping its
-    lowest ground under the band ceiling. Consecutive passes whose windows
-    [z_i, ceil_i] still share an altitude are flown together at the max of their
-    planned altitudes (the lowest height clearing all of them). Greedy over the
-    flight order — optimal for the fewest bands. Only ever raises, so clearance
-    improves and coverage only gains overlap. Rewrites z in place; returns route.
+    A pass keeps its planned altitude z_i as the floor (it is never LOWERED — that would
+    cut clearance and narrow the swath the spacing assumed). It may be RAISED up to
+    valley_i + AGL + band_half, the highest constant altitude keeping its lowest ground
+    under the band ceiling. Passes are grouped GLOBALLY, not just consecutive ones: this
+    is minimum interval stabbing over the windows [z_i, ceil_i] — the provably fewest
+    distinct altitudes — so two passes that fit the same band share a height even when
+    they aren't flown back-to-back. Each group flies at the max of its members' planned
+    altitudes (the lowest height clearing all of them). Only ever raises, so clearance
+    improves and coverage only gains overlap. Flight order is untouched; only z is
+    rewritten in place. Returns route.
     """
     from collections import OrderedDict
     groups = OrderedDict()
@@ -138,25 +139,26 @@ def band_pass_altitudes(route, dtm, agl, is_geo=True, band_half_m=50.0):
         ceil_i = float(ev.min()) + agl + band_half_m   # keep the lowest ground in-band
         windows.append((z_i, max(z_i, ceil_i), wps))   # ceiling ≥ floor (safety wins)
 
-    i = 0
-    while i < len(windows):
-        if windows[i] is None:
-            i += 1; continue
-        lo, hi, members = windows[i][0], windows[i][1], [windows[i][2]]
-        j = i + 1
-        while j < len(windows) and windows[j] is not None:
-            zj, cj, wj = windows[j]
-            nlo, nhi = max(lo, zj), min(hi, cj)
-            if nlo <= nhi:                         # a shared in-band altitude survives
-                lo, hi, = nlo, nhi
-                members.append(wj); j += 1
-            else:
-                break
-        for wps in members:                        # fly the band at its lowest common height
-            for w in wps:
+    # Minimum interval stabbing: repeatedly take the lowest ceiling among the not-yet-
+    # banded passes as a stab altitude, and band together every remaining pass whose
+    # window contains it (floor ≤ stab; ceiling ≥ stab holds by construction). Each band
+    # flies at the max floor of its members — the lowest height clearing all of them, and
+    # ≤ the band's min ceiling, so every member stays inside the AGL corridor. This is
+    # the provably fewest distinct altitudes; passes with no window keep their own height.
+    order = sorted((k for k, w in enumerate(windows) if w is not None),
+                   key=lambda k: windows[k][1])    # by ceiling ascending
+    banded = [False] * len(windows)
+    for k in order:
+        if banded[k]:
+            continue
+        stab = windows[k][1]                       # lowest unbanded ceiling
+        group = [m for m in order if not banded[m] and windows[m][0] <= stab]
+        fly = max(windows[m][0] for m in group)    # lowest common height (max floor)
+        for m in group:
+            banded[m] = True
+            for w in windows[m][2]:                # fly the whole band at this height
                 if not (isinstance(w['z'], float) and math.isnan(w['z'])):
-                    w['z'] = lo
-        i = j
+                    w['z'] = fly
     return route
 
 
