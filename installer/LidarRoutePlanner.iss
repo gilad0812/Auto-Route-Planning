@@ -73,3 +73,17 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
+
+[Code]
+// Belt-and-braces on top of CloseApplications: force-terminate any running instance
+// right before files are replaced, so a still-open app can't lock the bundle and block
+// the upgrade ("files in use"). The app keeps no unsaved state in {app}.
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+begin
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/IM {#AppExe} /F /T',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  NeedsRestart := False;   // files are freed now — no reboot needed
+  Result := '';            // empty string => proceed with the install
+end;
