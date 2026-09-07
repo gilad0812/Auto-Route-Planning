@@ -76,7 +76,9 @@ Info "Building with PyInstaller [$mode] -> $DistPath"
 Push-Location $RepoRoot
 try {
     if ($OneFile) { $env:RP_ONEFILE = "1" } else { Remove-Item Env:RP_ONEFILE -ErrorAction SilentlyContinue }
-    pyinstaller desktop.spec --noconfirm --distpath $DistPath --workpath $WorkPath
+    # Invoke via `python -m PyInstaller` (not the bare `pyinstaller` script) so the build
+    # uses the active interpreter and doesn't depend on Scripts\ being on PATH.
+    python -m PyInstaller desktop.spec --noconfirm --distpath $DistPath --workpath $WorkPath
     if (-not $?) { Die "PyInstaller build failed." }
 }
 finally { Pop-Location; Remove-Item Env:RP_ONEFILE -ErrorAction SilentlyContinue }
