@@ -277,6 +277,7 @@ class MainWindow(QMainWindow):
         self.profile_panel = ProfilePanel()            # full-width strip below
         self.profile_panel.setVisible(False)           # opened on demand via View menu
         self.profile_panel.passClicked.connect(self._highlight_pass_on_map)
+        self.profile_panel.passAltitudeChanged.connect(self._on_pass_altitude_changed)
 
         outer = QSplitter(Qt.Vertical)
         outer.addWidget(top)
@@ -1300,10 +1301,14 @@ class MainWindow(QMainWindow):
                 f'waypoints. Click two points for another, or untick Add Pass.')
 
     # ------------------------------------------------------------- edit route
-    def _reestimate_survey(self, new_survey, busy_msg):
+    def _reestimate_survey(self, new_survey, busy_msg, reband=True):
         """Swap in an edited survey route, re-run the density estimate + effective
         route, and repaint everything (summary, map, edit overlay, profile). Restores
-        the previous route on failure. Returns True on success. Shared by Edit Route."""
+        the previous route on failure. Returns True on success. Shared by Edit Route.
+
+        reband=False keeps the incoming per-pass altitudes exactly as given (used by the
+        manual altitude editor) — otherwise auto-banding would overwrite the operator's
+        hand-set height."""
         if not (self.dtm and self.drawn_polygon is not None):
             return False
         prev = self.survey_route
@@ -1311,7 +1316,7 @@ class MainWindow(QMainWindow):
         try:
             # Re-group the (possibly edited) passes onto the fewest shared altitudes —
             # unless the route carries operator-supplied 3D altitudes, which we leave be.
-            if self._route_auto_alt:
+            if reband and self._route_auto_alt:
                 band_route_altitudes(self.dtm, new_survey, self._params(), self.is_geo)
             self.survey_route = new_survey
             self.base_result = estimate_for_route(
@@ -1456,13 +1461,63 @@ class MainWindow(QMainWindow):
             self.profile_panel.clear()
             return
         from .profile import route_profile
-        # Uploaded independent passes: break the profile between them (no pseudo-pass
-        # connector line); auto-planned routes stay continuous for ferry clearance.
-        dist, terr, flight, spans = route_profile(
-            self._route_with_home(), self.dtm, self.is_geo,
-            join_passes=not self._route_active)
+        # Draw each pass as its own segment with no turnaround/connector line between them
+        # (join_passes=False): the connectors add clutter and, when a pass is dragged to a
+        # new altitude, would show as a spurious jump to the neighbouring pass.
+        dist, terr, flight, spans, pids = route_profile(
+            self._route_with_home(), self.dtm, self.is_geo, join_passes=False)
+        # current altitude per pass, so the profile's inline editor shows the live value
+        pass_alt = {}
+        for w in (self.survey_route or []):
+            pid, z = w.get('pass_id'), w.get('z')
+            if (pid is not None and pid not in pass_alt
+                    and not (isinstance(z, float) and math.isnan(z))):
+                pass_alt[pid] = z
         self.profile_panel.update_profile(dist, terr, flight, agl=self.sp_alt.value(),
-                                          spans=spans)
+                                          spans=spans, pass_alt=pass_alt, pids=pids)
+
+    def _on_pass_altitude_changed(self, pass_id, new_z):
+        """Set one pass's constant altitude from the elevation-profile editor. Snap rule:
+        if the new altitude is within ±10 m of the pass immediately to the RIGHT (the next
+        pass along the route), adopt that pass's altitude exactly — so nearby passes share
+        a height. Re-estimates without re-banding, so the hand-set altitude is kept."""
+        if not self.survey_route:
+            return
+        # passes in route order (survey pass_ids are ints; skip any non-survey markers)
+        order, z_of = [], {}
+        for w in self.survey_route:
+            pid, z = w.get('pass_id'), w.get('z')
+            if isinstance(pid, int) and pid not in z_of \
+                    and not (isinstance(z, float) and math.isnan(z)):
+                order.append(pid); z_of[pid] = z
+        if pass_id not in z_of:
+            return
+        new_z = float(new_z)
+        i = order.index(pass_id)
+        did_snap = False
+        if i + 1 < len(order):                        # snap to the pass on the right
+            z_right = z_of[order[i + 1]]
+            if abs(new_z - z_right) <= 10.0 and abs(new_z - z_right) > 1e-9:
+                new_z = float(z_right)
+                did_snap = True
+
+        new_survey = [dict(w) for w in self.survey_route]
+        changed = False
+        for w in new_survey:
+            if w.get('pass_id') == pass_id \
+                    and not (isinstance(w['z'], float) and math.isnan(w['z'])):
+                if abs(w['z'] - new_z) > 1e-9:
+                    changed = True
+                w['z'] = new_z
+        if not changed:
+            return
+        pre = self._snapshot_route(self.survey_route)
+        if self._reestimate_survey(new_survey, f'Line {pass_id} altitude → {new_z:.0f} m — '
+                                   're-estimating…', reband=False):
+            self._record_edit(pre)
+            self.statusBar().showMessage(
+                f'Line {pass_id} altitude set to {new_z:.0f} m'
+                f'{" (matched the line to the right)" if did_snap else ""}.')
 
     def _highlight_pass_on_map(self, pass_id):
         """A pass was clicked in the elevation profile — outline it on the map, or clear
