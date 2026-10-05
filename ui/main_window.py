@@ -37,7 +37,7 @@ except Exception as _e:
     }
     FAILURE_REASON_LABEL = {
         "range": ("Beyond scanner range", "lower AGL or PRR"),
-        "shadow": ("Occlusion shadow", "needs a cross-pass, or accept"),
+        "shadow": ("Shadow / faces away", "needs a cross-line, or accept"),
         "thin": ("Under target", "lower AGL / tighter spacing"),
     }
 

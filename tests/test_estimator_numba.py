@@ -48,7 +48,7 @@ def _setup(tmp, terr_fn, n=700):
 
 def _assert_identical(a, b):
     for k in ('n_fail', 'n_cells', 'n_thin', 'n_shadow', 'n_beyond_range',
-              'n_gap', 'n_void', 'n_range_limited', 'passed', 'cell_size_m'):
+              'n_gap', 'n_backface', 'n_void', 'n_range_limited', 'passed', 'cell_size_m'):
         assert a[k] == b[k], f'{k}: numpy={a[k]} numba={b[k]}'
     assert a['median_density'] == b['median_density'], \
         f"median: {a['median_density']} vs {b['median_density']}"

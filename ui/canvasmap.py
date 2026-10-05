@@ -36,13 +36,13 @@ _FOCUS_DISP_CELLS = 16_000_000
 # with the summary legend so map colours and text agree. (hex, alpha).
 FAILURE_REASON_STYLE = {
     "range": ("#8c959f", 130),    # beyond scanner max range — lower AGL/PRR (grey)
-    "shadow": ("#8250df", 120),   # occlusion shadow — cross-pass or accept (purple)
+    "shadow": ("#8250df", 120),   # shadow / faces away — cross-line or accept (purple)
     "thin": ("#ff9900", 95),      # under target (incl. uncovered) — drawn as a gradient
 }
 # Human labels + the operator's lever, for the legend.
 FAILURE_REASON_LABEL = {
     "range": ("Beyond scanner range", "lower AGL or PRR"),
-    "shadow": ("Occlusion shadow", "needs a cross-pass, or accept"),
+    "shadow": ("Shadow / faces away", "needs a cross-line, or accept"),
     "thin": ("Under target", "lower AGL / tighter spacing"),
 }
 # Under-target cells (thin + uncovered) are shaded by density/target: 0 → red, target → yellow.

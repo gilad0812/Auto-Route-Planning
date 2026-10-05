@@ -52,6 +52,7 @@ def _fused_kernel(lon, lat, am, arr_f, arr,
     range_hit = np.zeros((ny, nx), dtype=np.bool_)
     any_fov = np.zeros((ny, nx), dtype=np.bool_)
     any_cov = np.zeros((ny, nx), dtype=np.bool_)
+    any_back = np.zeros((ny, nx), dtype=np.bool_)
     npass = pax.shape[0]
     nlook = look_sgn.shape[0]
     for idx in prange(ny * nx):
@@ -99,7 +100,7 @@ def _fused_kernel(lon, lat, am, arr_f, arr,
 
         # ── scan every pass ──
         acc = 0.0
-        rh = False; af = False; ac = False
+        rh = False; af = False; ac = False; bk = False
         for k in range(npass):
             z = pz[k]
             h = z - tz
@@ -108,16 +109,16 @@ def _fused_kernel(lon, lat, am, arr_f, arr,
             ax = pax[k]; ay = pay[k]; bx = pbx[k]; by = pby[k]
             dxp = bx - ax; dyp = by - ay
             L2 = dxp * dxp + dyp * dyp
-            if L2 < 1e-9:
+            point = L2 < 1e-9                         # point pass: no along-track extent
+            pl = 0.0; s_cell = 0.0
+            if point:
                 fx = ax; fy = ay; ux = 1.0; uy = 0.0
             else:
+                # unclamped: perpendicular offset + along-track position (see NumPy path)
                 tt = ((Ec - ax) * dxp + (Nc - ay) * dyp) / L2
-                if tt < 0.0:
-                    tt = 0.0
-                elif tt > 1.0:
-                    tt = 1.0
                 fx = ax + tt * dxp; fy = ay + tt * dyp
                 pl = math.sqrt(L2); ux = dxp / pl; uy = dyp / pl
+                s_cell = tt * pl
             ox = Ec - fx; oy = Nc - fy
             d = math.sqrt(ox * ox + oy * oy)
             if d > h * tan_half:
@@ -128,11 +129,16 @@ def _fused_kernel(lon, lat, am, arr_f, arr,
             a_f = h * math.tan(math.radians(10.0 + 5.0 * frac))
             for L in range(nlook):
                 sgn = look_sgn[L]; wgt = look_wgt[L]
+                if not point:
+                    s_air = s_cell - sgn * a_f        # aircraft must be ON the line
+                    if s_air < 0.0 or s_air > pl:
+                        continue
                 px = ox + sgn * a_f * ux
                 py = oy + sgn * a_f * uy
                 R = math.sqrt(px * px + py * py + h * h)
                 cos_i = (h + px * ge + py * gn) / (max(R, 1e-6) * nm)
                 if cos_i <= 0.0:
+                    bk = True                         # reached, but surface faces away
                     continue
                 af = True
                 if R > rng_max:
@@ -157,7 +163,8 @@ def _fused_kernel(lon, lat, am, arr_f, arr,
         range_hit[i, j] = rh
         any_fov[i, j] = af
         any_cov[i, j] = ac
-    return density, range_hit, any_fov, any_cov
+        any_back[i, j] = bk
+    return density, range_hit, any_fov, any_cov, any_back
 
 
 def estimate_density_grid_nb(
@@ -228,7 +235,7 @@ def estimate_density_grid_nb(
     else:
         look_sgn = np.array([0.0]); look_wgt = np.array([1.0])
 
-    density, range_hit, any_fov, any_covered = _fused_kernel(
+    density, range_hit, any_fov, any_covered, any_back = _fused_kernel(
         lon, lat, am, arr_f, arr,
         inv.a, inv.b, inv.c, inv.d, inv.e, inv.f, lon_m, lat_m, cu, cvv,
         t.a * lon_m, t.e * lat_m, t.a, t.c, t.e, t.f,
@@ -252,9 +259,10 @@ def estimate_density_grid_nb(
 
     _thin = fail_mask & (density > 0.0)
     _void = fail_mask & ~_thin
-    _shadow = _void & any_covered
-    _range = _void & ~any_covered & range_hit
-    _gap = _void & ~any_covered & ~range_hit
+    _blind = any_covered | any_back       # beam blocked, or the surface faces away
+    _shadow = _void & _blind
+    _range = _void & ~_blind & range_hit
+    _gap = _void & ~_blind & ~range_hit
 
     def _geo(m):
         r, c = np.where(m)
@@ -272,6 +280,7 @@ def estimate_density_grid_nb(
         "failing_cells_by_reason": by_reason,
         "n_thin": int(_thin.sum()), "n_shadow": int(_shadow.sum()),
         "n_beyond_range": int(_range.sum()), "n_gap": int(_gap.sum()),
+        "n_backface": int((_shadow & any_back & ~any_covered).sum()),
         "passed": len(failing_geo) == 0,
         "failing_cells_geo": failing_geo,
         "n_fail": len(failing_geo),

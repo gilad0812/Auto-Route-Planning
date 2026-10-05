@@ -160,6 +160,7 @@ def estimate_density_grid(
     range_hit = np.zeros((ny, nx), dtype=bool)   # in-FOV but beyond max range
     any_fov = np.zeros((ny, nx), dtype=bool)     # in some look's FOV (any range)
     any_covered = np.zeros((ny, nx), dtype=bool)  # in-FOV AND in-range (pre-occlusion)
+    any_back = np.zeros((ny, nx), dtype=bool)     # reached by a look, but surface faces away
     # Lowest terrain on the grid → the largest possible AGL, hence the widest possible
     # cross-track swath any pass can reach. Used to bound each pass to a sub-window.
     gmin_terr = float(np.nanmin(terr)) if np.isfinite(terr).any() else 0.0
@@ -195,10 +196,17 @@ def estimate_density_grid(
         if L2 < 1e-9:
             fx, fy = ax, ay
             ux, uy = 1.0, 0.0
+            pl = s_cell = None                      # point pass: no along-track extent
         else:
-            tt = np.clip(((Ew - ax) * dx + (Nw - ay) * dy) / L2, 0.0, 1.0)
+            # UNCLAMPED projection: (ox, oy) is the true perpendicular (cross-track)
+            # offset and s_cell the cell's along-track position on the line (m from its
+            # start). Each look is then checked to see the cell only while the aircraft is
+            # ON the line (below) — clamping to the segment instead credited every line
+            # with a half-disc "cap" of cover past each end that no scan line reaches.
+            tt = ((Ew - ax) * dx + (Nw - ay) * dy) / L2
             fx, fy = ax + tt * dx, ay + tt * dy
-            _pl = math.sqrt(L2); ux, uy = dx / _pl, dy / _pl   # along-track unit vector
+            pl = math.sqrt(L2); ux, uy = dx / pl, dy / pl   # along-track unit vector
+            s_cell = tt * pl
         ox, oy = Ew - fx, Nw - fy                   # cross-track aircraft→cell offset
         d = np.hypot(ox, oy)
         h = z_pass - terr[rs, cs]                   # AGL above each cell
@@ -215,6 +223,7 @@ def estimate_density_grid(
         ox_s, oy_s, d_s, h_s = ox[wr, wc], oy[wr, wc], d[wr, wc], h[wr, wc]
         Es, Ns = Ew[wr, wc], Nw[wr, wc]
         g_es, g_ns, nrm_s = g_ew[wr, wc], g_nw[wr, wc], nrmw[wr, wc]
+        s_s = None if s_cell is None else s_cell[wr, wc]
         with np.errstate(invalid="ignore"):
             # Fore/aft along-track tilt grows 10° (swath centre) → 15° (edge); the
             # along-track ground reach of that tilt at this AGL is a_f.
@@ -226,7 +235,18 @@ def estimate_density_grid(
                 R = np.sqrt(px * px + py * py + h_s * h_s)   # slant range for this look
                 # cos(incidence) of THIS look's ray vs surface normal; flat ground → h/R.
                 cos_i = (h_s + px * g_es + py * g_ns) / (np.maximum(R, 1e-6) * nrm_s)
-                facing = cos_i > 0.0                 # in_swath already holds for every cell
+                # The aircraft must be ON the line when this look sees the cell: a fore
+                # look (sgn +1) sees a_f ahead, so it reaches a_f past the END but misses
+                # the first a_f; the aft look mirrors that at the start; nadir neither.
+                if s_s is None:
+                    on_line = np.ones(wr.size, dtype=bool)
+                else:
+                    s_air = s_s - sgn * a_f           # aircraft's along-track position
+                    on_line = (s_air >= 0.0) & (s_air <= pl)
+                facing = on_line & (cos_i > 0.0)     # in_swath already holds for every cell
+                back = on_line & (cos_i <= 0.0)      # reached, but the surface faces away
+                if back.any():
+                    any_back[gr[back], gc[back]] = True
                 beyond = facing & (R > rng_max)      # emitted, but no return
                 covered = facing & (R <= rng_max)
                 # cos_i / R → points per tilted SURFACE m² (survey-quality metric);
@@ -271,14 +291,16 @@ def estimate_density_grid(
     # Categorise each failing cell by CAUSE, so the map colours them and the
     # operator sees the lever, not just "orange":
     #   thin   — reached but under target (AGL over low ground, swath-edge cos²).
-    #   shadow — a pass had it in-range & in-FOV, but occlusion blocked the beam.
+    #   shadow — a line reached it but occlusion blocked the beam, or the surface faces
+    #            away from every line (cos_i ≤ 0). Either way only a cross-line helps.
     #   range  — only ever seen beyond the scanner's max range (AGL/PRR mismatch).
     #   gap    — never fell in any pass's swath (spacing / AOI-edge coverage gap).
     _thin = fail_mask & (density > 0.0)
     _void = fail_mask & ~_thin
-    _shadow = _void & any_covered
-    _range = _void & ~any_covered & range_hit
-    _gap = _void & ~any_covered & ~range_hit
+    _blind = any_covered | any_back       # beam blocked, or the surface faces away
+    _shadow = _void & _blind
+    _range = _void & ~_blind & range_hit
+    _gap = _void & ~_blind & ~range_hit
 
     def _geo(m):
         r, c = np.where(m)
@@ -300,6 +322,7 @@ def estimate_density_grid(
         "failing_cells_by_reason": by_reason,
         "n_thin": int(_thin.sum()), "n_shadow": int(_shadow.sum()),
         "n_beyond_range": int(_range.sum()), "n_gap": int(_gap.sum()),
+        "n_backface": int((_shadow & any_back & ~any_covered).sum()),
         "passed": len(failing_geo) == 0,
         "failing_cells_geo": failing_geo,
         "n_fail": len(failing_geo),
