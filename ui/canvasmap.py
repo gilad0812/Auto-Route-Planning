@@ -134,13 +134,13 @@ class _View(QGraphicsView):
 
     def mouseMoveEvent(self, e):
         self._owner.on_hover(self.mapToScene(e.position().toPoint()))
-        if self._owner.editing and self._owner._edit_drag is not None:
+        if self._owner.editing and self._owner.edit_dragging():
             self._owner.edit_drag_move(self.mapToScene(e.position().toPoint()))
             e.accept(); return
         super().mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e):
-        if self._owner.editing and self._owner._edit_drag is not None:
+        if self._owner.editing and self._owner.edit_dragging():
             self._owner.edit_drag_release(self.mapToScene(e.position().toPoint()))
             e.accept(); return
         super().mouseReleaseEvent(e)
@@ -175,6 +175,7 @@ class CanvasMap(QWidget):
         self._edit_group = None          # scene group holding the edit overlay
         self._edit_drag = None           # [(pass_id, end_idx), …] the joint being dragged
         self._edit_drag_start = None     # scene point where the drag began (dead-zone test)
+        self._edit_move = None           # whole-line move: {'pid','start','seg0'} while dragging
         self._disp_transform = None      # scene(overview) pixel -> world; None until loaded
         self.drawing = False
         self.drawing_pass = False
@@ -262,6 +263,7 @@ class CanvasMap(QWidget):
         self.drawing_pass = False; self.btn_pass.setChecked(False)
         self.btn_pass.setEnabled(False); self.btn_pass.setVisible(False)
         self._edit_group = None; self._edit_passes = {}; self._edit_drag = None
+        self._edit_move = None
         self._edit_route = []; self.editing = False
         self.btn_edit.setChecked(False); self.btn_edit.setEnabled(False)
         self.btn_del.setVisible(False); self.btn_del.setEnabled(False)
@@ -540,7 +542,7 @@ class CanvasMap(QWidget):
         else:
             if self.btn_pass.isChecked():        # leaving edit closes the Add Pass sub-tool
                 self.btn_pass.setChecked(False); self._toggle_pass(False)
-            self._edit_drag = None
+            self._edit_drag = None; self._edit_move = None
             self._clear_edit_overlay()
         self.btn_del.setEnabled(on and bool(self._selected_edit_pids()))
 
@@ -655,9 +657,32 @@ class CanvasMap(QWidget):
         if best_pid is None:
             return False
         self._select_only(best_pid)
+        # Arm a whole-line move: dragging the line's body translates it as-is (same
+        # length and heading); a press with no drag stays a plain selection click.
+        self._edit_move = {'pid': best_pid, 'start': QPointF(sp),
+                           'seg0': self._edit_passes[best_pid]['seg']}
         return True
 
+    def edit_dragging(self):
+        """True while an edit-mode drag is in progress (a joint or a whole line)."""
+        return self._edit_drag is not None or self._edit_move is not None
+
+    def _set_edit_seg(self, pid, seg):
+        d = self._edit_passes[pid]
+        d['seg'] = tuple(seg)
+        path = QPainterPath(QPointF(seg[0], seg[1])); path.lineTo(QPointF(seg[2], seg[3]))
+        d['item'].setPath(path); self._place_handles(pid)
+
     def edit_drag_move(self, sp):
+        mv = self._edit_move
+        if mv is not None:                          # whole-line move: translate both ends
+            if mv['pid'] not in self._edit_passes:
+                return
+            dx, dy = sp.x() - mv['start'].x(), sp.y() - mv['start'].y()
+            ax, ay, bx, by = mv['seg0']
+            self._set_edit_seg(mv['pid'], (ax + dx, ay + dy, bx + dx, by + dy))
+            self.view.setCursor(Qt.ClosedHandCursor)
+            return
         for pid, idx in (self._edit_drag or []):     # move every endpoint at the joint
             d = self._edit_passes.get(pid)
             if d is None:
@@ -669,6 +694,22 @@ class CanvasMap(QWidget):
             d['item'].setPath(path); self._place_handles(pid)
 
     def edit_drag_release(self, sp):
+        mv = self._edit_move
+        if mv is not None:
+            self._edit_move = None
+            self.view.setCursor(Qt.ArrowCursor)
+            scale = abs(self.view.transform().m11()) or 1.0
+            moved_px = math.hypot(sp.x() - mv['start'].x(), sp.y() - mv['start'].y()) * scale
+            d = self._edit_passes.get(mv['pid'])
+            if d is None:
+                return
+            if moved_px < _EDIT_DRAG_MIN_PX:        # just a click: keep the line where it was
+                self._set_edit_seg(mv['pid'], mv['seg0'])
+                return
+            ax, ay, bx, by = d['seg']
+            p0 = self._world(QPointF(ax, ay)); p1 = self._world(QPointF(bx, by))
+            self.passEditGeom.emit([(mv['pid'], p0, p1)])
+            return
         group = self._edit_drag or []
         start = self._edit_drag_start
         self._edit_drag = None
@@ -782,6 +823,7 @@ class CanvasMap(QWidget):
         self.btn_edit.setChecked(False); self.btn_edit.setEnabled(False)
         self.btn_del.setVisible(False)
         self._edit_group = None; self._edit_passes = {}; self._edit_drag = None
+        self._edit_move = None
         self._edit_route = []
         self.btn_focus.blockSignals(True)
         self.btn_focus.setChecked(False); self.btn_focus.setEnabled(False)
