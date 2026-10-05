@@ -16,8 +16,8 @@ lets steep/occluded faces that the nadir look misses be covered from the fore or
 angle — the sensor's whole point on "vertical surfaces and narrow canyons". Total
 density is conserved (pulses split, not added). Toggle with `nfb`.
 
-Occlusion is modelled by a line-of-sight march (per look); a CHM thins vegetated
-cells by `veg_penetration`. Multiple returns are not modelled — an estimator for
+Occlusion is modelled by a line-of-sight march (per look). Multiple returns are
+not modelled — an estimator for
 iterating, confirmed by one HELIOS++ run.
 """
 
@@ -47,7 +47,6 @@ def estimate_density_grid(
     pulse_freq_hz, scan_freq_hz, scan_half_angle_deg, speed_ms, min_points,
     is_geo=True, cell_size_m=1.0, max_cells=3_000_000,
     occlusion=True, occ_margin_m=2.0, nfb=True,
-    chm=None, veg_penetration=0.4,
 ):
     """Estimate per-cell point density for `route` over `dtm`.
 
@@ -57,9 +56,6 @@ def estimate_density_grid(
         region:      AOI as a list of (lon, lat) vertices, or None (whole bbox).
         scan_freq_hz: accepted for signature symmetry; cancels out of the model.
         cell_size_m: grid resolution (auto-coarsened to stay under max_cells).
-        chm:         optional binary vegetation mask (same interface as `dtm`);
-                     cells with value > 0 are thinned by `veg_penetration`.
-        veg_penetration: ground-return fraction through canopy (thumb rule 0.4).
 
     Returns a dict mirroring the HELIOS result shape so the same map overlay/
     summary can render it:
@@ -259,19 +255,6 @@ def estimate_density_grid(
                 if covered.any():
                     any_covered[gr[covered], gc[covered]] = True
                 density[gr, gc] += contrib
-
-    # Canopy: vegetated cells keep only `veg_penetration` of the bare-earth density
-    # (the fraction of pulses reaching the ground through the canopy).
-    if chm is not None:
-        ca = np.asarray(chm.array, dtype=float)
-        ct = chm.transform                           # matches chm.array (native AOI window)
-        ccol = np.clip(((LON - ct.c) / ct.a).astype(int), 0, ca.shape[1] - 1)
-        crow = np.clip(((LAT - ct.f) / ct.e).astype(int), 0, ca.shape[0] - 1)
-        mask = ca[crow, ccol]
-        if chm.nodata is not None:
-            mask = np.where(mask == chm.nodata, 0.0, mask)
-        veg = np.isfinite(mask) & (mask > 0)
-        density = np.where(veg, density * float(veg_penetration), density)
 
     # ── Region mask + failure detection ──────────────────────────────────────
     if region and _MPL_OK:

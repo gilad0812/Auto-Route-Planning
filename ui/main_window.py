@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QApplication, QAbstractSpinBox, QToolButton,
 )
 
-from .planning import (PlanParams, compute_plan, load_dtm, chm_compatible,
+from .planning import (PlanParams, compute_plan, load_dtm,
                        scan_lines_for_square_pattern, build_manual_pass,
                        estimate_for_route, polygon_area_m2, MAX_AOI_M2,
                        _pass_altitude, band_pass_altitudes, band_route_altitudes,
@@ -173,8 +173,6 @@ class MainWindow(QMainWindow):
 
         self.dtm = None
         self.dtm_path = None
-        self.chm = None
-        self.chm_path = None
         self.is_geo = True
         self.base_result = None          # survey result (route + density estimate)
         self.survey_route = []           # survey waypoints
@@ -217,7 +215,6 @@ class MainWindow(QMainWindow):
     def _build_menu(self):
         m = self.menuBar().addMenu('&File')
         a_dtm = QAction('Open DTM…', self); a_dtm.triggered.connect(self._open_dtm)
-        a_chm = QAction('Open CHM…', self); a_chm.triggered.connect(self._open_chm)
         a_wkt = QAction('Load polygon (.wkt/.csv)…', self)
         a_wkt.triggered.connect(self._load_wkt_aoi)
         a_route = QAction('Load route (.wkt/.csv)…', self)
@@ -226,7 +223,7 @@ class MainWindow(QMainWindow):
         self.act_save_route.setEnabled(False)
         self.act_save_route.triggered.connect(self._save_wkt_route)
         a_quit = QAction('Quit', self); a_quit.triggered.connect(self.close)
-        m.addAction(a_dtm); m.addAction(a_chm); m.addAction(a_wkt); m.addAction(a_route)
+        m.addAction(a_dtm); m.addAction(a_wkt); m.addAction(a_route)
         m.addAction(self.act_save_route)
         m.addSeparator(); m.addAction(a_quit)
 
@@ -289,17 +286,11 @@ class MainWindow(QMainWindow):
         self.gb_data = gb_data = QGroupBox('① Data')
         dl = QVBoxLayout(gb_data)
         self.lbl_dtm = QLabel('DTM: (none)'); self.lbl_dtm.setWordWrap(True)
-        self.lbl_chm = QLabel('CHM: (none)'); self.lbl_chm.setWordWrap(True)
         dtm_row = QHBoxLayout()
         b_dtm = QPushButton('Open DTM…'); b_dtm.clicked.connect(self._open_dtm)
         b_dtm_clear = QPushButton('Clear'); b_dtm_clear.clicked.connect(self._clear_dtm)
         dtm_row.addWidget(b_dtm); dtm_row.addWidget(b_dtm_clear)
-        chm_row = QHBoxLayout()
-        b_chm = QPushButton('Open CHM…'); b_chm.clicked.connect(self._open_chm)
-        b_chm_clear = QPushButton('Clear'); b_chm_clear.clicked.connect(self._clear_chm)
-        chm_row.addWidget(b_chm); chm_row.addWidget(b_chm_clear)
         dl.addWidget(self.lbl_dtm); dl.addLayout(dtm_row)
-        dl.addWidget(self.lbl_chm); dl.addLayout(chm_row)
         v.addWidget(gb_data)
 
         # ── AOI ── (workflow step ②)
@@ -348,7 +339,6 @@ class MainWindow(QMainWindow):
         self.cmb_pulse.currentIndexChanged.connect(self._update_scan_freq)
         self.sp_alt.valueChanged.connect(self._update_scan_freq)
         self.sp_speed.valueChanged.connect(self._update_scan_freq)
-        self.sp_veg = self._dspin(0, 1, 0.4, '', 0.05); self.sp_veg.setDecimals(2)
         scl.addRow('Min points / m²', self.sp_minpts)
         scl.addRow('Drone speed', self.sp_speed)
 
@@ -359,7 +349,6 @@ class MainWindow(QMainWindow):
         adv.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         adv.addRow('Pulse freq', self.cmb_pulse)
         adv.addRow('Scan freq (auto)', self.sp_scanfreq)
-        adv.addRow('Canopy ground-return frac', self.sp_veg)
         adv.addRow(QLabel('FOV fixed at 100° (±50°)'))
         self.scan_advanced.set_content_layout(adv)
         scl.addRow(self.scan_advanced)
@@ -430,7 +419,6 @@ class MainWindow(QMainWindow):
         s.setValue('scan/min_points', self.sp_minpts.value())
         s.setValue('scan/speed', self.sp_speed.value())
         s.setValue('scan/pulse_freq', self.cmb_pulse.currentData())
-        s.setValue('scan/veg', self.sp_veg.value())
         s.setValue('window/geometry', self.saveGeometry())
 
     def _load_settings(self):
@@ -445,7 +433,6 @@ class MainWindow(QMainWindow):
         idx = self.cmb_pulse.findData(pf)
         if idx >= 0:
             self.cmb_pulse.setCurrentIndex(idx)           # re-derives the scan freq
-        self.sp_veg.setValue(s.value('scan/veg', self.sp_veg.value(), type=float))
         geo = s.value('window/geometry')
         if geo is not None:
             self.restoreGeometry(geo)
@@ -571,8 +558,7 @@ class MainWindow(QMainWindow):
         self._map_focused = True
         self._set_busy(True, 'Cropping the DTM to the polygon…')
         try:
-            self.mapview.set_dtm(self.dtm, self.dtm_path, self.chm, self.chm_path,
-                                 focus_polygon=poly)
+            self.mapview.set_dtm(self.dtm, self.dtm_path, focus_polygon=poly)
             self.mapview.set_aoi_polygon(list(poly.exterior.coords))
         finally:
             self._set_busy(False)
@@ -583,15 +569,13 @@ class MainWindow(QMainWindow):
             'DTM opened cropped to the polygon — full-extent render skipped.')
 
     def _clear_dtm(self):
-        """Drop the loaded DTM (and the CHM/AOI/results that depend on it) and
-        blank the map — mirrors the CHM Clear."""
+        """Drop the loaded DTM (and the AOI/results that depend on it) and blank the
+        map."""
         self.dtm = None; self.dtm_path = None
-        self.chm = None; self.chm_path = None
         self.is_geo = True
         self.drawn_polygon = None
         self.loaded_route = None; self._set_route_mode(False)
         self.lbl_dtm.setText('DTM: (none)')
-        self.lbl_chm.setText('CHM: (none)')
         self.lbl_aoi.setText('Draw a polygon on the map.')
         self.btn_compute.setEnabled(False)
         self._clear_results()
@@ -838,7 +822,7 @@ class MainWindow(QMainWindow):
         try:
             self.base_result = estimate_for_route(
                 self.dtm, self.drawn_polygon, route, self._params(),
-                chm=self.chm, is_geo=self.is_geo)
+                is_geo=self.is_geo)
             self.survey_route = route
             self.result = self.base_result
         except Exception as e:
@@ -849,42 +833,11 @@ class MainWindow(QMainWindow):
         self._finish_result(
             f'Done — {self.result.n_waypoints} waypoints (uploaded route, current params)')
 
-    def _open_chm(self):
-        if self.dtm is None:
-            QMessageBox.information(self, 'CHM', 'Open a DTM first.'); return
-        path, _ = QFileDialog.getOpenFileName(
-            self, 'Open CHM', '', 'GeoTIFF (*.tif *.tiff);;All files (*)')
-        if not path:
-            return
-        try:
-            chm = load_dtm(path)
-        except Exception as e:
-            QMessageBox.critical(self, 'CHM error', str(e)); return
-        ok, reason = chm_compatible(self.dtm, chm)
-        if not ok:
-            QMessageBox.warning(self, 'CHM incompatible',
-                                f'{reason}\n\nThe CHM was not applied.')
-            return
-        self.chm = chm
-        self.chm_path = path
-        self.lbl_chm.setText(f'CHM: {path}')
-        self._clear_results()          # density estimate is now stale
-        self._refresh_map()
-        if reason:                     # soft note (e.g. partial overlap)
-            QMessageBox.information(self, 'CHM applied', reason)
-            self.statusBar().showMessage(reason)
-
-    def _clear_chm(self):
-        self.chm = None; self.chm_path = None
-        self.lbl_chm.setText('CHM: (none)')
-        self._clear_results()          # density estimate is now stale
-        self._refresh_map()
-
     def _refresh_map(self):
         if self.mapview is not None and self.dtm is not None:
             self._set_busy(True, 'Rendering terrain…')
             try:
-                self.mapview.set_dtm(self.dtm, self.dtm_path, self.chm, self.chm_path)
+                self.mapview.set_dtm(self.dtm, self.dtm_path)
                 self._map_focused = False          # whole extent
                 self._sync_focus_button()
             finally:
@@ -1002,7 +955,6 @@ class MainWindow(QMainWindow):
             speed_ms=self.sp_speed.value(),
             pulse_freq_hz=self.cmb_pulse.currentData(),
             scan_freq_hz=self.sp_scanfreq.value(),
-            veg_penetration=self.sp_veg.value(),
         )
 
     def _compute(self):
@@ -1029,7 +981,7 @@ class MainWindow(QMainWindow):
         self.setEnabled(False)
         try:
             self.base_result = compute_plan(self.dtm, poly, self._params(),
-                                            chm=self.chm, is_geo=self.is_geo)
+                                            is_geo=self.is_geo)
             self.survey_route = self.base_result.route
             self._route_auto_alt = True     # program-assigned altitudes -> re-band on edits
             self.result = self.base_result
@@ -1112,7 +1064,7 @@ class MainWindow(QMainWindow):
             self.survey_route = new_survey
             self.base_result = estimate_for_route(
                 self.dtm, self.drawn_polygon, self.survey_route,
-                self._params(), chm=self.chm, is_geo=self.is_geo)
+                self._params(), is_geo=self.is_geo)
             self.result = self.base_result
         except Exception as e:
             self.survey_route = prev

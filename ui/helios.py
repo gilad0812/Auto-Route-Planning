@@ -40,12 +40,12 @@ class HeliosWorker(QThread):
     log = Signal(str)
     done = Signal(dict)
 
-    def __init__(self, *, dtm, dtm_path, route, polygon, params, chm, is_geo,
+    def __init__(self, *, dtm, dtm_path, route, polygon, params, is_geo,
                  helios_bin, mesh_step_m, work_dir):
         super().__init__()
         self.dtm = dtm; self.dtm_path = dtm_path
         self.route = route; self.polygon = polygon; self.params = params
-        self.chm = chm; self.is_geo = is_geo
+        self.is_geo = is_geo
         self.helios_bin = helios_bin; self.mesh_step_m = mesh_step_m
         self.work_dir = work_dir
         self._stop = threading.Event()
@@ -82,10 +82,6 @@ class HeliosWorker(QThread):
             else:
                 cmp_dtm = DTM(self.dtm_path).read_window(
                     self.polygon.bounds, margin_m=swath_m)
-            # A large CHM (no full array, no path plumbed here) is dropped for the
-            # comparison rather than dereferenced — HELIOS still runs, just unmasked.
-            cmp_chm = self.chm if (self.chm is None
-                                   or getattr(self.chm, 'array', None) is not None) else None
             res = run_feedback_loop(
                 route=self.route, helios_bin=self.helios_bin,
                 scene_obj_path=obj, work_dir=self.work_dir, is_geo=self.is_geo,
@@ -94,8 +90,7 @@ class HeliosWorker(QThread):
                 pulse_freq_hz=int(p.pulse_freq_hz), scan_freq_hz=float(p.scan_freq_hz),
                 scan_angle_deg=half, scanner_ref=DEFAULT_SCANNER_REF,
                 platform_ref=DEFAULT_PLATFORM_REF, dtm=cmp_dtm,
-                region_polygon=region, chm=cmp_chm,
-                veg_penetration=float(p.veg_penetration),
+                region_polygon=region,
                 log=lambda m: self.log.emit(m), stop_event=self._stop,
             )
             self.done.emit(res)
@@ -108,12 +103,12 @@ class HeliosDialog(QDialog):
     window can paint the HELIOS under-density cells (red) on the map."""
     resultReady = Signal(dict)
 
-    def __init__(self, parent, *, dtm, dtm_path, route, polygon, params, chm, is_geo):
+    def __init__(self, parent, *, dtm, dtm_path, route, polygon, params, is_geo):
         super().__init__(parent)
         self.setWindowTitle('HELIOS++ Validation')
         self.resize(620, 520)
         self.dtm = dtm; self.dtm_path = dtm_path; self.route = route
-        self.polygon = polygon; self.params = params; self.chm = chm
+        self.polygon = polygon; self.params = params
         self.is_geo = is_geo
         self.worker = None
         self.result = None
@@ -182,7 +177,7 @@ class HeliosDialog(QDialog):
 
         self.worker = HeliosWorker(
             dtm=self.dtm, dtm_path=self.dtm_path, route=self.route,
-            polygon=self.polygon, params=self.params, chm=self.chm,
+            polygon=self.polygon, params=self.params,
             is_geo=self.is_geo, helios_bin=helios_bin,
             mesh_step_m=self.sp_mesh.value(), work_dir=work)
         self.worker.log.connect(self._append)

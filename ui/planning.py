@@ -1,6 +1,6 @@
 """UI-agnostic glue between the Qt views and the model in ``src/``.
 
-Keeps the widget code thin: load a DTM/CHM, build an AOI polygon, run the route
+Keeps the widget code thin: load a DTM, build an AOI polygon, run the route
 plan + density estimate, and return a plain result object. No Qt imports here on
 purpose — this is testable without a display.
 """
@@ -65,7 +65,6 @@ class PlanParams:
     speed_ms: float = 6.0
     pulse_freq_hz: int = 600_000
     scan_freq_hz: float = 224.4
-    veg_penetration: float = 0.4
     min_peak_clearance_m: float = 50.0   # min clearance above a pass's highest point
 
 
@@ -80,38 +79,6 @@ class PlanResult:
     alt_min: float = float('nan')
     alt_max: float = float('nan')
 
-
-def chm_compatible(dtm, chm):
-    """Whether `chm` can be used as a vegetation mask over `dtm`.
-
-    The density estimator samples the CHM through the CHM's OWN raster transform at
-    the DTM-frame lon/lat of each cell, so the CHM must share the DTM's CRS and
-    actually overlap its extent — otherwise the mask lands on the wrong ground and
-    the result is silently wrong. Resolution may differ (nearest-pixel lookup).
-
-    Returns (ok, reason): ok False blocks applying it (reason = why); ok True with a
-    non-empty reason is a soft note (e.g. partial overlap) the caller may surface.
-    """
-    dcrs, ccrs = dtm.src.crs, chm.src.crs
-    de = dcrs.to_epsg() if dcrs else None
-    ce = ccrs.to_epsg() if ccrs else None
-    if de is not None and ce is not None:
-        if de != ce:
-            return False, f'CRS mismatch: DTM is EPSG:{de}, CHM is EPSG:{ce}.'
-    elif dcrs != ccrs:
-        return False, f'CRS mismatch: DTM {dcrs}, CHM {ccrs}.'
-
-    db, cb = dtm.src.bounds, chm.src.bounds
-    ox = min(db.right, cb.right) - max(db.left, cb.left)
-    oy = min(db.top, cb.top) - max(db.bottom, cb.bottom)
-    if ox <= 0 or oy <= 0:
-        return False, 'CHM does not overlap the DTM extent (different area).'
-
-    d_area = (db.right - db.left) * (db.top - db.bottom)
-    o_area = ox * oy
-    if d_area > 0 and o_area < 0.5 * d_area:
-        return True, f'CHM covers only {100 * o_area / d_area:.0f}% of the DTM extent.'
-    return True, ''
 
 
 def centered_box(dtm, frac=0.5):
@@ -164,7 +131,7 @@ def _aoi_native(dtm, polygon, params: PlanParams, half_deg):
     return dtm.read_window(polygon.bounds, margin_m=2.5 * bs + 10.0)
 
 
-def compute_plan(dtm, polygon, params: PlanParams, chm=None, is_geo=True):
+def compute_plan(dtm, polygon, params: PlanParams, is_geo=True):
     """Run plan + density estimate for one AOI. Returns a PlanResult."""
     area = polygon_area_m2(polygon, is_geo)
     if area > MAX_AOI_M2:
@@ -194,7 +161,6 @@ def compute_plan(dtm, polygon, params: PlanParams, chm=None, is_geo=True):
     # AOI). No-op for a DTM already in RAM. src.res stays native, so the sampling steps
     # above are unchanged.
     dtm = _aoi_native(dtm, polygon, params, half_eff)
-    chm = _aoi_native(chm, polygon, params, half_eff)
 
     if params.adaptive_spacing:
         route = plan_route_adaptive(
@@ -225,16 +191,15 @@ def compute_plan(dtm, polygon, params: PlanParams, chm=None, is_geo=True):
     # z-calibrations. Only ever raises a pass, so clearance/coverage stay safe.
     route = band_pass_altitudes(route, dtm, params.altitude_m, is_geo=is_geo)
 
-    return estimate_for_route(dtm, polygon, route, params, chm=chm, is_geo=is_geo)
+    return estimate_for_route(dtm, polygon, route, params, is_geo=is_geo)
 
 
-def estimate_for_route(dtm, polygon, route, params: PlanParams, chm=None, is_geo=True):
+def estimate_for_route(dtm, polygon, route, params: PlanParams, is_geo=True):
     """Run the density estimate + route stats for an already-built route over the
     AOI. Used both for a freshly planned route and after manually adding passes."""
     half = params.fov_deg / 2.0
     # Native-res AOI window for a large DTM (no-op if already in RAM / already windowed).
     dtm = _aoi_native(dtm, polygon, params, half)
-    chm = _aoi_native(chm, polygon, params, half)
     res = PlanResult(route=route, polygon=polygon)
     res.area_m2 = polygon_area_m2(polygon, is_geo)
     if not route:
@@ -245,7 +210,6 @@ def estimate_for_route(dtm, polygon, route, params: PlanParams, chm=None, is_geo
         pulse_freq_hz=int(params.pulse_freq_hz), scan_freq_hz=float(params.scan_freq_hz),
         scan_half_angle_deg=half, speed_ms=float(params.speed_ms),
         min_points=int(params.min_points), is_geo=is_geo,
-        chm=chm, veg_penetration=float(params.veg_penetration),
     )
 
     wps = [w for w in route

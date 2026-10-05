@@ -14,7 +14,7 @@ from matplotlib import colors as mcolors
 
 from PySide6.QtCore import Qt, Signal, QPointF, QRectF
 from PySide6.QtGui import (
-    QImage, QPixmap, QPainter, QPen, QColor, QBrush, QPolygonF, QCursor, QTransform,
+    QImage, QPixmap, QPainter, QPen, QColor, QBrush, QPolygonF, QCursor,
 )
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGraphicsView, QGraphicsScene,
@@ -88,14 +88,6 @@ def _shaded_relief(arr, nodata):
     return np.ascontiguousarray((out * 255).astype(np.uint8))
 
 
-def _chm_rgba(arr, nodata):
-    a = np.asarray(arr, dtype=float)
-    if nodata is not None:
-        a = np.where(a == nodata, np.nan, a)
-    veg = np.isfinite(a) & (a > 0)
-    rgba = np.zeros((*a.shape, 4), dtype=np.uint8)
-    rgba[veg] = (60, 160, 60, 120)
-    return np.ascontiguousarray(rgba)
 
 
 class _View(QGraphicsView):
@@ -164,7 +156,6 @@ class CanvasMap(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.dtm = None
-        self.chm = None
         self._inv = None                 # world -> pixel
         self._focus_polygon = None       # AOI the map is focused on, or None (full extent)
         self.selecting_passes = False     # route-pass selection mode (Load route .wkt)
@@ -188,7 +179,6 @@ class CanvasMap(QWidget):
         self._density_item = None
         self._helios_item = None
         self._pass_highlight_item = None  # one pass highlighted from the elevation profile
-        self._chm_item = None
         self._pass_segs = []             # [(ax, ay, bx, by, z)] scene coords, for hover
 
         v = QVBoxLayout(self); v.setContentsMargins(0, 0, 0, 0); v.setSpacing(0)
@@ -221,9 +211,6 @@ class CanvasMap(QWidget):
         self.btn_focus.setToolTip('Zoom the map to the polygon at native resolution; '
                                   'toggle off to show the full DTM.')
         self.btn_focus.toggled.connect(self.focusToggled)
-        self.btn_chm = QToolButton(); self.btn_chm.setText('CHM')
-        self.btn_chm.setCheckable(True); self.btn_chm.setEnabled(False)
-        self.btn_chm.clicked.connect(self._toggle_chm)
         # Shown only while selecting passes from a loaded route (.wkt).
         self.btn_all = QToolButton(); self.btn_all.setText('Select all')
         self.btn_all.setEnabled(False); self.btn_all.setVisible(False)
@@ -234,7 +221,7 @@ class CanvasMap(QWidget):
         self.btn_confirm.setToolTip('Run the density estimate on the selected passes.')
         self.btn_confirm.clicked.connect(self.passesConfirmed)
         for b in (self.btn_draw, self.btn_edit, self.btn_pass, self.btn_del,
-                  self.btn_fit, self.btn_focus, self.btn_chm,
+                  self.btn_fit, self.btn_focus,
                   self.btn_all, self.btn_confirm):
             bar.addWidget(b)
         bar.addStretch(1)
@@ -252,7 +239,7 @@ class CanvasMap(QWidget):
     def _reset_scene(self):
         self.scene.clear()                           # deletes all items, incl. route passes
         self._aoi_item = self._route_group = self._density_item = None
-        self._helios_item = self._chm_item = None
+        self._helios_item = None
         self._pass_highlight_item = None
         self._verts = []; self._draw_items = []; self._pass_segs = []
         self._pass_anchor = None; self._pass_preview = None
@@ -357,8 +344,8 @@ class CanvasMap(QWidget):
         self.btn_confirm.setVisible(False); self.btn_confirm.setEnabled(False)
         self.btn_all.setVisible(False); self.btn_all.setEnabled(False)
 
-    def set_dtm(self, dtm, dtm_path=None, chm=None, chm_path=None, focus_polygon=None):
-        self.dtm = dtm; self.chm = chm
+    def set_dtm(self, dtm, dtm_path=None, focus_polygon=None):
+        self.dtm = dtm
         self._focus_polygon = None
         self._reset_scene()
         if focus_polygon is not None:
@@ -371,7 +358,7 @@ class CanvasMap(QWidget):
         # a giga-pixel DTM shows and pans like a small one with bounded memory. Planning
         # still reads native resolution (planning._aoi_native). For a large DTM this read
         # scans the whole file once — a few seconds at load, then the map is static.
-        self._render_overview(*dtm.overview_array(), chm)
+        self._render_overview(*dtm.overview_array())
 
     def focus_on(self, polygon, margin_m=250.0):
         """Render ONLY the DTM window around `polygon` (+ margin) at ~native resolution.
@@ -384,7 +371,7 @@ class CanvasMap(QWidget):
         self._focus_polygon = polygon
         self._reset_scene()
         view = self.dtm.read_window(polygon.bounds, margin_m=margin_m)
-        self._render_overview(*view.overview_array(_FOCUS_DISP_CELLS), self.chm)
+        self._render_overview(*view.overview_array(_FOCUS_DISP_CELLS))
         self._fit()
 
     def show_full(self):
@@ -395,11 +382,11 @@ class CanvasMap(QWidget):
             return
         self._focus_polygon = None
         self._reset_scene()
-        self._render_overview(*self.dtm.overview_array(), self.chm)
+        self._render_overview(*self.dtm.overview_array())
         self._fit()
 
-    def _render_overview(self, disp, disp_t, stride, chm):
-        """Build the static relief pixmap (+ CHM overlay) from the display overview and
+    def _render_overview(self, disp, disp_t, stride):
+        """Build the static relief pixmap from the display overview and
         set up the scene coordinate system. Runs on the GUI thread."""
         self._disp_transform = disp_t
         self._disp_stride = stride
@@ -410,21 +397,6 @@ class CanvasMap(QWidget):
         self.scene.addItem(QGraphicsPixmapItem(QPixmap.fromImage(img)))
         self.scene.setSceneRect(QRectF(0, 0, w, h))
 
-        if chm is not None:
-            # CHM's own bounded overview; a transform places it in the DTM scene grid so
-            # it lands correctly even at a different resolution/extent.
-            cdisp, chm_t, _cs = chm.overview_array()
-            self._chm_rgba = _chm_rgba(cdisp, chm.nodata)
-            ch, cw, _ = self._chm_rgba.shape
-            cimg = QImage(self._chm_rgba.data, cw, ch, 4 * cw, QImage.Format_RGBA8888)
-            self._chm_item = QGraphicsPixmapItem(QPixmap.fromImage(cimg))
-            m = self._inv * chm_t
-            self._chm_item.setTransform(QTransform(m.a, m.d, m.b, m.e, m.c, m.f))
-            self._chm_item.setVisible(self.btn_chm.isChecked())
-            self.scene.addItem(self._chm_item)
-            self.btn_chm.setEnabled(True)
-        else:
-            self.btn_chm.setEnabled(False)
         self._fit()
 
     def _fit(self):
@@ -806,13 +778,13 @@ class CanvasMap(QWidget):
     def clear(self):
         """Full reset to the empty state (used when the DTM is cleared)."""
         self.scene.clear()
-        self.dtm = None; self.chm = None; self._inv = None; self._disp_transform = None
+        self.dtm = None; self._inv = None; self._disp_transform = None
         self._focus_polygon = None
         self._route_passes = {}; self.selecting_passes = False
         self.btn_confirm.setVisible(False); self.btn_confirm.setEnabled(False)
         self.btn_all.setVisible(False); self.btn_all.setEnabled(False)
         self._aoi_item = self._route_group = self._density_item = None
-        self._helios_item = self._chm_item = None
+        self._helios_item = None
         self._pass_highlight_item = None
         self._verts = []; self._draw_items = []; self._pass_segs = []
         self._pass_anchor = None; self._pass_preview = None
@@ -830,12 +802,7 @@ class CanvasMap(QWidget):
         self.btn_focus.blockSignals(False)
         self.view.setDragMode(QGraphicsView.ScrollHandDrag)
         self.view.setCursor(Qt.ArrowCursor)
-        self.btn_chm.setChecked(False); self.btn_chm.setEnabled(False)
         self.lbl_coord.setText('')
-
-    def _toggle_chm(self, on):
-        if self._chm_item is not None:
-            self._chm_item.setVisible(on)
 
     # ----------------------------------------------------------- overlays
     def show_plan(self, route_wps, density_cells, density_color='#ff9900',

@@ -5,8 +5,8 @@ is one fused, multithreaded @njit kernel: per output cell it computes the terrai
 (bilinear), the slope/normal (native-pixel gradient) and the scan geometry over every
 pass — NFB looks + occlusion march — then sums. Cell-major, so it parallelises with
 prange and never scatters into shared memory. Only the grid setup (1-D lon/lat, the
-nodata-masked DTM views) and the finalisation (canopy thinning + failure
-categorisation) stay in NumPy.
+nodata-masked DTM views) and the finalisation (failure categorisation) stay
+in NumPy.
 
 Correctness is validated bit-for-bit against the NumPy estimator
 (tests/test_estimator_numba.py); this module is only imported when numba is available,
@@ -165,7 +165,6 @@ def estimate_density_grid_nb(
     pulse_freq_hz, scan_freq_hz, scan_half_angle_deg, speed_ms, min_points,
     is_geo=True, cell_size_m=1.0, max_cells=3_000_000,
     occlusion=True, occ_margin_m=2.0, nfb=True,
-    chm=None, veg_penetration=0.4,
 ):
     """Numba fast path with the SAME signature and result dict as
     density_estimate.estimate_density_grid."""
@@ -237,18 +236,8 @@ def estimate_density_grid_nb(
         tan_half, fov, rng_max, float(pulse_freq_hz), float(speed_ms), float(occ_margin_m),
         look_sgn, look_wgt, bool(occlusion))
 
-    # ── finalise (NumPy): canopy thinning + failure categorisation ──────────
+    # ── finalise (NumPy): failure categorisation ─────────────────────────────
     LON, LAT = np.meshgrid(lon, lat)
-    if chm is not None:
-        ca = np.asarray(chm.array, dtype=float)
-        ct = chm.transform
-        ccol = np.clip(((LON - ct.c) / ct.a).astype(int), 0, ca.shape[1] - 1)
-        crow = np.clip(((LAT - ct.f) / ct.e).astype(int), 0, ca.shape[0] - 1)
-        mask = ca[crow, ccol]
-        if chm.nodata is not None:
-            mask = np.where(mask == chm.nodata, 0.0, mask)
-        veg = np.isfinite(mask) & (mask > 0)
-        density = np.where(veg, density * float(veg_penetration), density)
 
     if region and _MPL_OK:
         inside = _MplPath(np.asarray(region, dtype=float)).contains_points(

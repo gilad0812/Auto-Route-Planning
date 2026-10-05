@@ -129,23 +129,6 @@ def _proj_route_region(n=400):
     return route, reg
 
 
-def test_numba_matches_numpy_chm():
-    """CHM canopy thinning path."""
-    if not _HAVE_NB:
-        print('SKIP  numba not installed'); return
-    n = 400
-    yy, xx = np.mgrid[0:n, 0:n]
-    Z = 300 + 0.05 * xx + 0.03 * yy + 12 * np.sin(xx / 40.0)
-    tr = from_origin(500000, 3900000 + n, 1, 1)
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-        dtm = _write(os.path.join(tmp, 'p.tif'), Z, 'EPSG:32633', tr)
-        chm = _write(os.path.join(tmp, 'chm.tif'),
-                     np.where(xx > n // 2, 10.0, 0.0), 'EPSG:32633', tr)
-        route, reg = _proj_route_region(n)
-        kw = dict(_KW, chm=chm, veg_penetration=0.4)
-        _assert_identical(estimate_density_grid(route, dtm, reg, **kw),
-                          estimate_density_grid_nb(route, dtm, reg, **kw))
-
 
 def test_numba_matches_numpy_nodata():
     """nodata voids in the DTM (NaN terrain + gradient mean-fill)."""
@@ -169,7 +152,7 @@ if __name__ == '__main__':
     ok = True
     for fn in (test_numba_matches_numpy_gentle, test_numba_matches_numpy_steep,
                test_numba_matches_numpy_nfb_off, test_numba_matches_numpy_geographic,
-               test_numba_matches_numpy_chm, test_numba_matches_numpy_nodata):
+               test_numba_matches_numpy_nodata):
         try:
             fn(); print(f'PASS  {fn.__name__}')
         except AssertionError as e:
