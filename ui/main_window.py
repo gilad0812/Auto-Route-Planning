@@ -22,8 +22,8 @@ from .planning import (PlanParams, compute_plan, load_dtm, chm_compatible,
                        scan_lines_for_square_pattern, build_manual_pass,
                        estimate_for_route, polygon_area_m2, MAX_AOI_M2,
                        _pass_altitude, band_pass_altitudes, band_route_altitudes,
-                       _path_length_m, _LAT_M)
-from .geo import from_utm, fmt_utm
+                       _LAT_M)
+from .geo import from_utm
 
 try:
     from .canvasmap import CanvasMap, FAILURE_REASON_STYLE, FAILURE_REASON_LABEL
@@ -46,13 +46,6 @@ from shapely.geometry import (shape as shapely_shape, box as shapely_box, MultiP
 from shapely.wkt import loads as wkt_loads
 
 PULSE_FREQS = (150_000, 300_000, 600_000, 1_200_000, 1_800_000, 2_400_000)
-
-# Ferry/home legs are pure transit (not scanned). They fly at the connecting pass's
-# altitude to avoid altitude changes at the survey boundary, and only climb above it
-# when the terrain under the leg comes within this clearance margin — enough to keep
-# the ferry line off the ground without needless extra altitude (a multirotor
-# recovers nothing on the descent, so every wasted metre of climb is wasted energy).
-_TRANSIT_BUFFER_M = 20.0
 
 # Passes are always floored at least this far above their highest point. Fixed (not
 # exposed in the UI) — it's a safety clearance, not a routine tuning knob.
@@ -183,19 +176,17 @@ class MainWindow(QMainWindow):
         self.chm = None
         self.chm_path = None
         self.is_geo = True
-        self.base_result = None          # survey-only result (no home legs)
-        self.survey_route = []           # survey waypoints (base for home legs)
+        self.base_result = None          # survey result (route + density estimate)
+        self.survey_route = []           # survey waypoints
         self._edit_undo = []             # snapshots of survey_route for undo (route edits)
         self._edit_redo = []             # snapshots for redo
-        self.result = None               # effective result = survey + in-AOI home legs
+        self.result = None               # current result shown in the UI
         self.drawn_polygon = None        # shapely Polygon drawn on the map
         self._map_focused = False        # map zoomed to the AOI (vs full-extent overview)
         self.loaded_route = None         # operator route from .wkt (list of waypoints), for pass selection
         self._route_auto_alt = False     # loaded route had no Z (altitudes auto-assigned -> band on confirm)
         self._route_active = False       # a confirmed uploaded route is active (Compute re-estimates it)
         self._pending_aoi = None         # AOI loaded before a DTM — crop to it on the next Open DTM
-        self.home = None                 # takeoff/return-home (lon, lat) or None
-        self.home_ground = float('nan')  # terrain elevation at home, if in the DTM
 
         self._build_menu()
         self._build_body()
@@ -323,18 +314,6 @@ class MainWindow(QMainWindow):
         al.addWidget(self.lbl_aoi); al.addWidget(b_enter_aoi); al.addWidget(b_clear_aoi)
         v.addWidget(gb_aoi)
 
-        # ── Takeoff / Home ── (optional — outside the numbered sequence)
-        gb_home = QGroupBox('Takeoff / Home · optional')
-        hl = QVBoxLayout(gb_home)
-        self.lbl_home = QLabel('Home: (none)')
-        self.lbl_home.setWordWrap(True); self.lbl_home.setStyleSheet('color:#888;')
-        home_row = QHBoxLayout()
-        b_home = QPushButton('Set coordinate…'); b_home.clicked.connect(self._set_home_coord)
-        b_home_clear = QPushButton('Clear'); b_home_clear.clicked.connect(self._clear_home)
-        home_row.addWidget(b_home); home_row.addWidget(b_home_clear)
-        hl.addWidget(self.lbl_home); hl.addLayout(home_row)
-        v.addWidget(gb_home)
-
         # ── Flight ── (workflow step ③)
         gb_flight = QGroupBox('③ Flight')
         fl = QFormLayout(gb_flight)
@@ -441,7 +420,7 @@ class MainWindow(QMainWindow):
     def _settings(self):
         # per-user store (Windows registry HKCU); survives restarts on the air-gapped
         # machine. Only planning PARAMETERS + calibration are persisted, not the DTM/
-        # AOI/home mission state (which belongs to a mission, not to preferences).
+        # AOI mission state (which belongs to a mission, not to preferences).
         return QSettings('AutoRoutePlanning', 'RoutePlanner')
 
     def _save_settings(self):
@@ -556,8 +535,6 @@ class MainWindow(QMainWindow):
         self.is_geo = crs.is_geographic if crs else True
         w, h = self.dtm.src.width, self.dtm.src.height     # native size (array may be windowed)
         self.lbl_dtm.setText(f'DTM: {path}\n{w}×{h} px · CRS {crs}')
-        self.home = None; self.home_ground = float('nan')   # new area
-        self.lbl_home.setText('Home: (none)')
         self.loaded_route = None; self._set_route_mode(False)
         self._clear_results()
         if self._pending_aoi is not None:
@@ -613,10 +590,8 @@ class MainWindow(QMainWindow):
         self.is_geo = True
         self.drawn_polygon = None
         self.loaded_route = None; self._set_route_mode(False)
-        self.home = None; self.home_ground = float('nan')
         self.lbl_dtm.setText('DTM: (none)')
         self.lbl_chm.setText('CHM: (none)')
-        self.lbl_home.setText('Home: (none)')
         self.lbl_aoi.setText('Draw a polygon on the map.')
         self.btn_compute.setEnabled(False)
         self._clear_results()
@@ -865,7 +840,7 @@ class MainWindow(QMainWindow):
                 self.dtm, self.drawn_polygon, route, self._params(),
                 chm=self.chm, is_geo=self.is_geo)
             self.survey_route = route
-            self.result = self._effective_result()
+            self.result = self.base_result
         except Exception as e:
             self.setEnabled(True); self._set_busy(False)
             QMessageBox.critical(self, 'Estimate', str(e))
@@ -927,7 +902,7 @@ class MainWindow(QMainWindow):
 
     def _render_map(self, focus):
         """Render the map base (focused on the AOI, or the full extent) and re-apply the
-        AOI outline + route/density/home overlays on top."""
+        AOI outline + route/density overlays on top."""
         if self.mapview is None or self.dtm is None:
             return
         self._map_focused = bool(focus and self.drawn_polygon is not None)
@@ -946,8 +921,6 @@ class MainWindow(QMainWindow):
             # data; the route survived the re-render, so restore both.
             self.mapview.btn_edit.setEnabled(True)
             self.mapview.set_editable_route(self.survey_route)
-        else:
-            self._show_home()
 
     def _on_map_focus_toggled(self, on):
         self._render_map(focus=on)
@@ -963,7 +936,6 @@ class MainWindow(QMainWindow):
         self._update_workflow()
         if self.mapview is not None:
             self.mapview.clear_overlays()
-            self._show_home()                 # keep the marker, drop stale ferry legs
             self.mapview.btn_pass.setChecked(False)
             self.mapview._toggle_pass(False)
             self.mapview.btn_pass.setEnabled(False)
@@ -1014,191 +986,10 @@ class MainWindow(QMainWindow):
         self._clear_results()
         self._refresh_map()
 
-    def _set_home_coord(self):
-        """Enter the takeoff / return-home point as a typed GPS coordinate."""
-        if self.dtm is None:
-            QMessageBox.information(self, 'Home', 'Open a DTM first.'); return
-        from PySide6.QtWidgets import QInputDialog
-        text, ok = QInputDialog.getText(
-            self, 'Set takeoff / home', 'Home as UTM 36N  easting, northing :')
-        if not ok or not text.strip():
-            return
-        parts = text.replace(',', ' ').split()
-        try:
-            easting, northing = float(parts[0]), float(parts[1])
-        except (ValueError, IndexError):
-            QMessageBox.warning(self, 'Home',
-                                f'Could not read "{text}".\nUse: easting, northing (UTM 36N)')
-            return
-        lon, lat = from_utm(self.dtm.src.crs, easting, northing)
-        self.home = (lon, lat)
-        z = self.dtm.elevation_at(lon, lat)
-        self.home_ground = z
-        gtxt = f'ground {z:.0f} m' if z == z else 'outside DTM'
-        self.lbl_home.setText(f'Home: {fmt_utm(self.dtm.src.crs, lon, lat)}  ({gtxt})')
-        self._set_busy(True, 'Adding home — re-estimating…')
-        try:
-            self._rebuild_effective()
-        finally:
-            self._set_busy(False)
-
-    def _clear_home(self):
-        self.home = None
-        self.home_ground = float('nan')
-        self.lbl_home.setText('Home: (none)')
-        self._rebuild_effective()
-
-    def _show_home(self):
-        """Redraw the home marker + ferry legs (legs only when a route exists)."""
-        if self.mapview is None:
-            return
-        wps = self.result.route if (self.result and self.result.route) else []
-        self.mapview.show_home(self.home, wps)
-
-    def _transit_wp(self, x, y, z):
-        """A non-survey ferry waypoint (home, or a survey-boundary climb/descent
-        point) at the given position/altitude."""
-        return {'x': x, 'y': y, 'z': z, 'target_distance': None, 'pass_id': 'home'}
-
-    def _terrain_max_along(self, p0, p1):
-        """Max DTM terrain elevation sampled (at pixel resolution) along the
-        segment p0→p1, ignoring cells outside the DTM. NaN if none have data."""
-        ax, ay = p0
-        bx, by = p1
-        dist = math.hypot(bx - ax, by - ay)
-        res_map = min(abs(self.dtm.src.res[0]), abs(self.dtm.src.res[1]))
-        n = 0 if dist == 0 else max(1, min(4000, int(dist / max(res_map, 1e-12))))
-        best = float('nan')
-        for i in range(n + 1):
-            f = 0.0 if n == 0 else i / n
-            e = self.dtm.elevation_at(ax + (bx - ax) * f, ay + (by - ay) * f)
-            if e == e:                       # not NaN
-                best = e if math.isnan(best) else max(best, e)
-        return best
-
-    def _ferry_altitude(self, endpoint):
-        """Flat transit height for the pure-transit ferry leg between home and
-        `endpoint` (the first/last survey waypoint). Primary rule: fly at the
-        connecting pass's own altitude, so entering/leaving the survey needs no
-        altitude change. Only climb above that when the terrain under THIS leg would
-        come within the clearance buffer — just enough to keep the ferry line off the
-        ground — and never pinned to the global survey max. Falls back to the pass
-        altitude where the leg leaves the DTM (no terrain to clear against)."""
-        ez = endpoint['z']                              # connecting pass altitude
-        tmax = self._terrain_max_along(self.home, (endpoint['x'], endpoint['y']))
-        if math.isnan(tmax):
-            return ez
-        return max(ez, tmax + _TRANSIT_BUFFER_M)        # raise only to clear terrain
-
-    def _route_with_home(self):
-        """Effective route bracketed by the home point (takeoff … return).
-
-        Each ferry leg is flown FLAT at its own transit altitude, then the drop to
-        (or climb from) the pass altitude happens at the survey edge — not spread
-        across the leg. If the descent were interpolated over the whole ferry, the
-        flight line would sag through any mid-leg terrain peak; holding altitude to
-        the boundary and stepping down over the survey entry point keeps the ferry
-        clear of the ground the whole way."""
-        route = self.result.route
-        if self.home is None or not route:
-            return route
-        valid = [w for w in route
-                 if not (isinstance(w['z'], float) and math.isnan(w['z']))]
-        if not valid:
-            return route
-        first, last = valid[0], valid[-1]
-        hx, hy = self.home
-        a_out = self._ferry_altitude(first)
-        a_ret = self._ferry_altitude(last)
-
-        head = [self._transit_wp(hx, hy, a_out)]
-        if a_out > first['z'] + 1e-6:          # hold high, then descend at the edge
-            head.append(self._transit_wp(first['x'], first['y'], a_out))
-        tail = []
-        if a_ret > last['z'] + 1e-6:           # climb at the edge, then hold high
-            tail.append(self._transit_wp(last['x'], last['y'], a_ret))
-        tail.append(self._transit_wp(hx, hy, a_ret))
-        return head + route + tail
-
     def _survey_end(self):
         """Last valid survey waypoint — where a manually drawn pass chains from."""
         return next((w for w in reversed(self.survey_route or [])
                      if not (isinstance(w['z'], float) and math.isnan(w['z']))), None)
-
-    def _ferry_inpoly_far(self, anchor, toward, poly):
-        """Walking from `anchor` (a survey endpoint, on/in the polygon) toward
-        `toward` (home), the farthest point still inside the polygon — i.e. the
-        in-AOI portion of that ferry. (lon,lat) or None when negligible."""
-        from shapely.geometry import Point
-        ax, ay = anchor
-        tx, ty = toward
-        dist = math.hypot(tx - ax, ty - ay)
-        if dist == 0:
-            return None
-        to_m = _LAT_M if self.is_geo else 1.0
-        res_m = min(abs(self.dtm.src.res[0]), abs(self.dtm.src.res[1])) * to_m
-        n = max(1, min(2000, int(dist / max(res_m / to_m, 1e-12))))
-        far = None
-        for i in range(1, n + 1):
-            f = i / n
-            px, py = ax + (tx - ax) * f, ay + (ty - ay) * f
-            if poly.covers(Point(px, py)):
-                far = (px, py)
-            else:
-                break                       # left the polygon (contiguous from anchor)
-        if far is None:
-            return None
-        seg_m = math.hypot((far[0] - ax) * to_m, (far[1] - ay) * to_m)
-        return far if seg_m >= max(2 * res_m, 5.0) else None
-
-    def _home_legs(self):
-        """(start_leg, end_leg) waypoint lists: the in-AOI portions of the
-        home↔survey ferry, flown as terrain-following scanning passes. ([],[])
-        when neither ferry crosses the polygon."""
-        if (self.home is None or not self.survey_route
-                or self.drawn_polygon is None):
-            return [], []
-        valid = [w for w in self.survey_route
-                 if not (isinstance(w['z'], float) and math.isnan(w['z']))]
-        if not valid:
-            return [], []
-        params = self._params()
-        poly = self.drawn_polygon
-        ids = [w.get('pass_id', 0) for w in valid if isinstance(w.get('pass_id'), int)]
-        base = max(ids, default=-1)
-        sfirst = (valid[0]['x'], valid[0]['y'])
-        slast = (valid[-1]['x'], valid[-1]['y'])
-        start_leg, end_leg = [], []
-        e = self._ferry_inpoly_far(sfirst, self.home, poly)
-        if e:                               # entry → survey start (own pass id)
-            start_leg = build_manual_pass(self.dtm, e, sfirst, params, self.is_geo, base + 1)
-        x = self._ferry_inpoly_far(slast, self.home, poly)
-        if x:                               # survey end → exit (own pass id)
-            end_leg = build_manual_pass(self.dtm, slast, x, params, self.is_geo, base + 2)
-        return start_leg, end_leg
-
-    def _effective_result(self):
-        """Base survey result augmented with in-AOI home legs (re-estimated), or
-        the base result unchanged when there's no home / no crossing ferry."""
-        if self.base_result is None:
-            return None
-        start_leg, end_leg = self._home_legs()
-        if not start_leg and not end_leg:
-            return self.base_result
-        route = start_leg + list(self.survey_route) + end_leg
-        return estimate_for_route(self.dtm, self.drawn_polygon, route,
-                                  self._params(), chm=self.chm, is_geo=self.is_geo)
-
-    def _rebuild_effective(self):
-        """Recompute the effective result from the survey base + home, and redraw.
-        Call after the survey or the home point changes."""
-        self.result = self._effective_result()
-        if self.result is not None:
-            self._render_summary(self.result)
-            self._render_map_overlays(self.result)
-        else:
-            self._show_home()
-        self._refresh_profile()
 
     def _params(self):
         return PlanParams(
@@ -1241,7 +1032,7 @@ class MainWindow(QMainWindow):
                                             chm=self.chm, is_geo=self.is_geo)
             self.survey_route = self.base_result.route
             self._route_auto_alt = True     # program-assigned altitudes -> re-band on edits
-            self.result = self._effective_result()
+            self.result = self.base_result
         except Exception as e:
             self.setEnabled(True)
             self._set_busy(False)
@@ -1322,7 +1113,7 @@ class MainWindow(QMainWindow):
             self.base_result = estimate_for_route(
                 self.dtm, self.drawn_polygon, self.survey_route,
                 self._params(), chm=self.chm, is_geo=self.is_geo)
-            self.result = self._effective_result()
+            self.result = self.base_result
         except Exception as e:
             self.survey_route = prev
             QMessageBox.critical(self, 'Re-estimate error', str(e))
@@ -1465,7 +1256,7 @@ class MainWindow(QMainWindow):
         # (join_passes=False): the connectors add clutter and, when a pass is dragged to a
         # new altitude, would show as a spurious jump to the neighbouring pass.
         dist, terr, flight, spans, pids = route_profile(
-            self._route_with_home(), self.dtm, self.is_geo, join_passes=False)
+            self.result.route, self.dtm, self.is_geo, join_passes=False)
         # current altitude per pass, so the profile's inline editor shows the live value
         pass_alt = {}
         for w in (self.survey_route or []):
@@ -1526,7 +1317,7 @@ class MainWindow(QMainWindow):
             return
         if pass_id is None:
             self.mapview.highlight_pass([]); return
-        coords = [(w['x'], w['y']) for w in self._route_with_home()
+        coords = [(w['x'], w['y']) for w in self.result.route
                   if w.get('pass_id') == pass_id
                   and not (isinstance(w['z'], float) and math.isnan(w['z']))]
         self.mapview.highlight_pass(coords)
@@ -1544,9 +1335,8 @@ class MainWindow(QMainWindow):
             'geometry': {'type': 'Point', 'coordinates': [w['x'], w['y'], w['z']]},
             'properties': {'altitude_m': w['z'],
                            'target_agl_m': w.get('target_distance'),
-                           'pass_id': w.get('pass_id'),
-                           'role': 'home' if w.get('pass_id') == 'home' else 'survey'},
-        } for w in self._route_with_home()
+                           'pass_id': w.get('pass_id')},
+        } for w in self.result.route
             if not (isinstance(w['z'], float) and math.isnan(w['z']))]
         with open(path, 'w', encoding='utf-8') as f:
             json.dump({'type': 'FeatureCollection', 'features': feats}, f, indent=2)
@@ -1559,20 +1349,19 @@ class MainWindow(QMainWindow):
                                               'route.csv', 'CSV (*.csv)')
         if not path:
             return
-        wps = [w for w in self._route_with_home()
+        wps = [w for w in self.result.route
                if not (isinstance(w['z'], float) and math.isnan(w['z']))]
         with open(path, 'w', newline='', encoding='utf-8') as f:
             wr = csv.writer(f)
-            wr.writerow(['index', 'x', 'y', 'z', 'target_agl_m', 'pass_id', 'role'])
+            wr.writerow(['index', 'x', 'y', 'z', 'target_agl_m', 'pass_id'])
             for i, w in enumerate(wps):
-                role = 'home' if w.get('pass_id') == 'home' else 'survey'
                 wr.writerow([i, w['x'], w['y'], w['z'],
-                             w.get('target_distance'), w.get('pass_id'), role])
+                             w.get('target_distance'), w.get('pass_id')])
         self.statusBar().showMessage(f'Wrote {len(wps)} waypoints → {path}')
 
     def _survey_pass_lines(self):
         """The survey passes as shapely LineString Z (one per pass, endpoint→endpoint),
-        in route order. Home ferry legs are auto-generated, so they're excluded."""
+        in route order."""
         groups = {}
         order = []
         for w in self.survey_route:
@@ -1627,7 +1416,6 @@ class MainWindow(QMainWindow):
             self.mapview.show_plan(wps, est.get('failing_cells_geo', []),
                                    density_color='#ff9900', density_radius_m=rad,
                                    connect_passes=connect)
-        self.mapview.show_home(self.home, wps)
 
     # ---------------------------------------------------------------- render
     def _render_summary(self, r):
@@ -1637,9 +1425,7 @@ class MainWindow(QMainWindow):
         est = r.estimate or {}
         area = (f'{r.area_m2 / 1e6:.3f} km²' if r.area_m2 >= 1e6
                 else f'{r.area_m2:,.0f} m²')
-        # path length includes the ferry legs to/from home when one is set
-        plen_m = _path_length_m(self._route_with_home(), self.is_geo) \
-            if self.home is not None else r.path_len_m
+        plen_m = r.path_len_m
         plen = (f'{plen_m / 1000:.2f} km' if plen_m >= 1000
                 else f'{plen_m:.0f} m')
         ncell = max(est.get('n_cells', 0), 1)
@@ -1655,9 +1441,6 @@ class MainWindow(QMainWindow):
             ('Path length', plen),
             ('Alt range', f'{r.alt_min:.0f} – {r.alt_max:.0f} m'),
         ]
-        if self.home is not None and self.dtm is not None:
-            rows.append(('Takeoff/Home',
-                         fmt_utm(self.dtm.src.crs, self.home[0], self.home[1])))
         rows += [
             ('<b>Density estimate</b>', ''),
             ('Coverage', f'{cov:.1f}%'),

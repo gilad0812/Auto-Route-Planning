@@ -27,13 +27,13 @@ def route_profile(route, dtm, is_geo=True, sample_step_m=None, join_passes=True)
 
     NaN-z waypoints are dropped; flight altitude is linear between kept waypoints —
     flat within a pass (equal endpoint z) and a climb/descent across a turn. Terrain
-    is NaN where the path leaves the DTM (e.g. a ferry outside the tile).
+    is NaN where the path leaves the DTM (e.g. a pass running off the tile).
 
     join_passes=False (independent uploaded passes): the leg between two DIFFERENT
     passes is dropped — no pseudo-pass connector (the flight line does not link them)
     and no gap: the line just breaks and the next pass is laid right after this one.
     join_passes=True keeps the route continuous (auto-planned routes, where the
-    turnaround/ferry clearance matters)."""
+    turnaround clearance matters)."""
     wps = [w for w in route
            if not (isinstance(w['z'], float) and math.isnan(w['z']))]
     if len(wps) < 2:
