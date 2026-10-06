@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGraphicsView, QGraphicsScene,
     QGraphicsPixmapItem, QGraphicsEllipseItem, QGraphicsPathItem,
     QGraphicsPolygonItem, QToolButton, QLabel, QGraphicsItemGroup, QToolTip,
+    QMenu,
 )
 from PySide6.QtGui import QPainterPath
 
@@ -105,11 +106,19 @@ class _View(QGraphicsView):
         self.scale(factor, factor)
 
     def mousePressEvent(self, e):
+        if e.button() == Qt.RightButton:             # right-click a point: its menu (any mode)
+            k = self._owner.point_index_at(self.mapToScene(e.position().toPoint()))
+            if k is not None:
+                self._owner.show_point_menu(k, e.globalPosition().toPoint())
+                e.accept(); return
         if self._owner.drawing and e.button() == Qt.LeftButton:
             self._owner.add_vertex(self.mapToScene(e.position().toPoint()))
             e.accept(); return
         if self._owner.drawing_pass and e.button() == Qt.LeftButton:
             self._owner.add_pass_vertex(self.mapToScene(e.position().toPoint()))
+            e.accept(); return
+        if self._owner.adding_point and e.button() == Qt.LeftButton:
+            self._owner.add_point(self.mapToScene(e.position().toPoint()))
             e.accept(); return
         if self._owner.selecting_passes and e.button() == Qt.LeftButton:
             self._owner.toggle_pass_at(self.mapToScene(e.position().toPoint()))
@@ -180,6 +189,9 @@ class CanvasMap(QWidget):
         self._helios_item = None
         self._pass_highlight_item = None  # one pass highlighted from the elevation profile
         self._pass_segs = []             # [(ax, ay, bx, by, z)] scene coords, for hover
+        self.adding_point = False        # 'Add point' tool on: clicks drop a marker
+        self._points = []                # [(lon, lat)] dropped points (world coords)
+        self._points_group = None        # scene group drawing them
 
         v = QVBoxLayout(self); v.setContentsMargins(0, 0, 0, 0); v.setSpacing(0)
         barw = QWidget(); barw.setObjectName('mapbar')
@@ -204,6 +216,12 @@ class CanvasMap(QWidget):
         self.btn_del.setEnabled(False); self.btn_del.setVisible(False)
         self.btn_del.setToolTip('Delete the selected pass from the route (or press Delete).')
         self.btn_del.clicked.connect(self._delete_selected_edit)
+        self.btn_point = QToolButton(); self.btn_point.setText('📍 Add point')
+        self.btn_point.setCheckable(True); self.btn_point.setEnabled(False)
+        self.btn_point.setToolTip('Click the map to drop a point. Hover a point to see its '
+                                  'UTM coordinate; right-click it to delete. Stays on for '
+                                  'more points.')
+        self.btn_point.clicked.connect(self._toggle_point)
         self.btn_fit = QToolButton(); self.btn_fit.setText('⤢ Fit')
         self.btn_fit.clicked.connect(self._fit)
         self.btn_focus = QToolButton(); self.btn_focus.setText('◎ polygon')
@@ -221,7 +239,7 @@ class CanvasMap(QWidget):
         self.btn_confirm.setToolTip('Run the density estimate on the selected passes.')
         self.btn_confirm.clicked.connect(self.passesConfirmed)
         for b in (self.btn_draw, self.btn_edit, self.btn_pass, self.btn_del,
-                  self.btn_fit, self.btn_focus,
+                  self.btn_point, self.btn_fit, self.btn_focus,
                   self.btn_all, self.btn_confirm):
             bar.addWidget(b)
         bar.addStretch(1)
@@ -254,6 +272,11 @@ class CanvasMap(QWidget):
         self._edit_route = []; self.editing = False
         self.btn_edit.setChecked(False); self.btn_edit.setEnabled(False)
         self.btn_del.setVisible(False); self.btn_del.setEnabled(False)
+        self._points_group = None                    # scene.clear() deleted its items
+        if self.adding_point:                        # leave the tool; restore normal panning
+            self.adding_point = False; self.btn_point.setChecked(False)
+            self.view.setDragMode(QGraphicsView.ScrollHandDrag)
+            self.view.setCursor(Qt.ArrowCursor)
 
     # ------------------------------------------- loaded route: pass selection
     def show_route_passes(self, passes):
@@ -345,6 +368,8 @@ class CanvasMap(QWidget):
         self.btn_all.setVisible(False); self.btn_all.setEnabled(False)
 
     def set_dtm(self, dtm, dtm_path=None, focus_polygon=None):
+        if dtm is not self.dtm:
+            self._points = []                        # different terrain: old points don't apply
         self.dtm = dtm
         self._focus_polygon = None
         self._reset_scene()
@@ -396,7 +421,8 @@ class CanvasMap(QWidget):
         img = QImage(self._relief.data, w, h, 3 * w, QImage.Format_RGB888)
         self.scene.addItem(QGraphicsPixmapItem(QPixmap.fromImage(img)))
         self.scene.setSceneRect(QRectF(0, 0, w, h))
-
+        self.btn_point.setEnabled(True)
+        self._draw_points()                          # dropped points survive re-renders
         self._fit()
 
     def _fit(self):
@@ -426,7 +452,11 @@ class CanvasMap(QWidget):
         self.lbl_coord.setText(f'{fmt_utm(crs, lon, lat)}   ·   {ztxt}')
         if self.drawing_pass:
             self._update_pass_preview(sp)
-        else:
+        k = self.point_index_at(sp)
+        if k is not None:                            # hovering a dropped point: its coordinate
+            QToolTip.showText(QCursor.pos(), self._point_text(*self._points[k])
+                              + '\nright-click to delete')
+        elif not self.drawing_pass:
             self._pass_tooltip(sp)
 
     def _pass_tooltip(self, sp):
@@ -449,6 +479,8 @@ class CanvasMap(QWidget):
 
     # ----------------------------------------------------------- drawing
     def _toggle_draw(self, on):
+        if on and self.adding_point:                # tools are exclusive
+            self.btn_point.setChecked(False); self._toggle_point(False)
         self.drawing = on
         self.view.setDragMode(QGraphicsView.NoDrag if on else QGraphicsView.ScrollHandDrag)
         self.view.setCursor(Qt.CrossCursor if on else Qt.ArrowCursor)
@@ -497,10 +529,98 @@ class CanvasMap(QWidget):
         if self._pass_preview is not None:
             self.scene.removeItem(self._pass_preview); self._pass_preview = None
 
+    # ----------------------------------------------------------- points
+    def _toggle_point(self, on):
+        """'Add point' tool: left-click drops a labelled marker at that coordinate,
+        right-click on a marker removes it. Exclusive with polygon drawing and Edit Route;
+        stays on for more points."""
+        self.adding_point = on
+        if on:
+            if self.drawing:
+                self.btn_draw.setChecked(False); self._toggle_draw(False)
+            if self.editing:
+                self.btn_edit.setChecked(False); self._toggle_edit(False)
+        self.view.setDragMode(QGraphicsView.NoDrag if on else QGraphicsView.ScrollHandDrag)
+        self.view.setCursor(Qt.CrossCursor if on else Qt.ArrowCursor)
+
+    def add_point(self, sp):
+        """Drop a point at scene position `sp` (stored as world lon/lat)."""
+        if self.dtm is None or self._disp_transform is None:
+            return
+        self._points.append(self._world(sp))
+        self._draw_points()
+
+    def point_index_at(self, sp):
+        """Index of the dropped point under scene position `sp` (within a few screen
+        pixels), or None."""
+        if not self._points or self._inv is None:
+            return None
+        tol = 10.0 / (abs(self.view.transform().m11()) or 1.0)
+        best, best_d = None, tol
+        for k, (lon, lat) in enumerate(self._points):
+            q = self._scene(lon, lat)
+            dd = math.hypot(q.x() - sp.x(), q.y() - sp.y())
+            if dd <= best_d:
+                best, best_d = k, dd
+        return best
+
+    def delete_point(self, k):
+        if 0 <= k < len(self._points):
+            del self._points[k]
+            QToolTip.hideText()
+            self._draw_points()
+
+    def _point_menu(self, k):
+        """Context menu for point `k`: delete it, or delete every point."""
+        menu = QMenu(self.view)
+        menu.addAction(f'Delete point  ({self._point_text(*self._points[k])})',
+                       lambda: self.delete_point(k))
+        if len(self._points) > 1:
+            menu.addAction(f'Delete all points ({len(self._points)})', self.clear_points)
+        return menu
+
+    def show_point_menu(self, k, global_pos):
+        self._point_menu(k).exec(global_pos)
+
+    def clear_points(self):
+        self._points = []
+        QToolTip.hideText()
+        self._draw_points()
+
+    def _point_text(self, lon, lat):
+        """'E … N … · z m' — the point's UTM coordinate and ground height."""
+        try:
+            from .geo import fmt_utm
+        except ImportError:                          # standalone import fallback
+            from geo import fmt_utm
+        z = self.dtm.elevation_at(lon, lat) if self.dtm is not None else float('nan')
+        return fmt_utm(self.dtm.src.crs, lon, lat) + (f'  ·  {z:.0f} m' if z == z else '')
+
+    def points(self):
+        """The dropped points as [(lon, lat)] in the DTM's CRS."""
+        return list(self._points)
+
+    def _draw_points(self):
+        """(Re)draw every dropped point as a dot of fixed screen size, above the route and
+        overlays. Its coordinate shows on hover (see on_hover), not as a permanent label."""
+        if self._points_group is not None:
+            self.scene.removeItem(self._points_group); self._points_group = None
+        if self.dtm is None or self._inv is None or not self._points:
+            return
+        grp = QGraphicsItemGroup(); grp.setZValue(40); self.scene.addItem(grp)
+        for lon, lat in self._points:
+            dot = QGraphicsEllipseItem(-5, -5, 10, 10)
+            dot.setBrush(QBrush(QColor('#ff5c8a'))); dot.setPen(QPen(Qt.white, 1.5))
+            dot.setFlag(QGraphicsEllipseItem.ItemIgnoresTransformations)
+            dot.setPos(self._scene(lon, lat)); grp.addToGroup(dot)
+        self._points_group = grp
+
     # ----------------------------------------------------------- edit route
     def _toggle_edit(self, on):
         """Enter/leave Edit Route mode. Add Pass and Delete are sub-tools of this mode,
         shown only while it's on; polygon-drawing is exclusive with it."""
+        if on and self.adding_point:                # tools are exclusive
+            self.btn_point.setChecked(False); self._toggle_point(False)
         self.editing = on
         self.view.setDragMode(QGraphicsView.NoDrag if on else QGraphicsView.ScrollHandDrag)
         self.view.setCursor(Qt.ArrowCursor)
@@ -778,6 +898,9 @@ class CanvasMap(QWidget):
     def clear(self):
         """Full reset to the empty state (used when the DTM is cleared)."""
         self.scene.clear()
+        self._points = []; self._points_group = None
+        self.adding_point = False
+        self.btn_point.setChecked(False); self.btn_point.setEnabled(False)
         self.dtm = None; self._inv = None; self._disp_transform = None
         self._focus_polygon = None
         self._route_passes = {}; self.selecting_passes = False
