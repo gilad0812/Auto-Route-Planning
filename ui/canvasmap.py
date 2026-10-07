@@ -12,7 +12,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import colors as mcolors
 
-from PySide6.QtCore import Qt, Signal, QPointF, QRectF
+from PySide6.QtCore import Qt, Signal, QPointF, QRectF, QRect, QEvent
 from PySide6.QtGui import (
     QImage, QPixmap, QPainter, QPen, QColor, QBrush, QPolygonF, QCursor,
 )
@@ -48,6 +48,10 @@ FAILURE_REASON_LABEL = {
 }
 # Under-target cells (thin + uncovered) are shaded by density/target: 0 → red, target → yellow.
 _THIN_CMAP = plt.get_cmap('autumn')
+
+# Hover tooltips (a point's coordinate, a line's altitude) stay up this long while the
+# cursor rests on the thing; moving off it hides them at once.
+_TIP_MS = 60_000
 
 # Edit Route: a drag shorter than this (in screen pixels) is treated as a click, not a
 # move — so a tap or tiny nudge on a joint doesn't trigger a re-estimate.
@@ -93,6 +97,17 @@ def _shaded_relief(arr, nodata):
 
 class _View(QGraphicsView):
     """QGraphicsView with wheel-zoom and click-to-draw, delegating to the owner."""
+    def viewportEvent(self, e):
+        # When the mouse rests, Qt sends a ToolTip event; the scene answers with the
+        # hovered ITEM's tooltip and - our dots and lines have none - would HIDE the
+        # point / altitude tooltip. Answer it ourselves so the tooltip stays up.
+        if e.type() == QEvent.ToolTip:
+            tip = self._owner.hover_tip_text(self.mapToScene(e.pos()))
+            if tip:
+                self._owner._show_tip(tip)
+                return True
+        return super().viewportEvent(e)
+
     def __init__(self, scene, owner):
         super().__init__(scene)
         self._owner = owner
@@ -452,28 +467,31 @@ class CanvasMap(QWidget):
         self.lbl_coord.setText(f'{fmt_utm(crs, lon, lat)}   ·   {ztxt}')
         if self.drawing_pass:
             self._update_pass_preview(sp)
+        tip = self.hover_tip_text(sp)
+        if tip or not self.drawing_pass:             # (pass drawing keeps its own preview)
+            self._show_tip(tip)
+
+    def hover_tip_text(self, sp):
+        """Tooltip text for scene position `sp`: a dropped point's coordinate, else the
+        altitude of a pass line under the cursor, else None."""
         k = self.point_index_at(sp)
         if k is not None:                            # hovering a dropped point: its coordinate
-            QToolTip.showText(QCursor.pos(), self._point_text(*self._points[k])
-                              + '\nright-click to delete')
-        elif not self.drawing_pass:
-            self._pass_tooltip(sp)
-
-    def _pass_tooltip(self, sp):
-        """Show the pass altitude in a tooltip when the cursor is near a pass line."""
-        if not self._pass_segs:
-            QToolTip.hideText()
-            return
+            return self._point_text(*self._points[k]) + '\nright-click to delete'
+        if self.drawing_pass or not self._pass_segs:
+            return None
         # hover tolerance: a few screen pixels expressed in scene units
         scale = abs(self.view.transform().m11()) or 1.0
-        tol = 6.0 / scale
-        best_z, best_d = None, tol
+        best_z, best_d = None, 6.0 / scale
         for ax, ay, bx, by, z in self._pass_segs:
             d = _point_seg_dist(sp.x(), sp.y(), ax, ay, bx, by)
             if d <= best_d:
                 best_d, best_z = d, z
-        if best_z is not None:
-            QToolTip.showText(QCursor.pos(), f'Pass altitude: {best_z:.0f} m')
+        return f'Pass altitude: {best_z:.0f} m' if best_z is not None else None
+
+    def _show_tip(self, text):
+        """Show `text` at the cursor for _TIP_MS (moving off hides it), or hide."""
+        if text:
+            QToolTip.showText(QCursor.pos(), text, self.view.viewport(), QRect(), _TIP_MS)
         else:
             QToolTip.hideText()
 
