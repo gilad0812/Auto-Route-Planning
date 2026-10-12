@@ -1,0 +1,8 @@
+# Lint gate for CI and the pre-commit hook. Deliberately narrow: only real bugs, no style
+# rules — undefined names, syntax errors, unused imports/variables, redefinitions. Those
+# matter most in the frozen .exe, where a broken code path only shows on the target machine.
+target-version = "py312"
+extend-exclude = ["build", "dist", "offline_kit", "helios_bin", "examples"]
+
+[lint]
+select = ["E9", "F63", "F7", "F82", "F401", "F811", "F841"]

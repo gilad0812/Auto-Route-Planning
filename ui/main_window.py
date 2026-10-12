@@ -25,6 +25,7 @@ from .planning import (PlanParams, compute_plan, load_dtm,
                        _pass_altitude, band_pass_altitudes, band_route_altitudes,
                        _LAT_M)
 from .geo import from_utm
+from .version import __version__
 
 try:
     from .canvasmap import CanvasMap, FAILURE_REASON_STYLE, FAILURE_REASON_LABEL
@@ -313,7 +314,7 @@ class CollapsibleSection(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('LiDAR Drone Route Planner — desktop')
+        self.setWindowTitle(f'LiDAR Drone Route Planner — {__version__}')
         self.resize(1280, 820)
 
         self.dtm = None

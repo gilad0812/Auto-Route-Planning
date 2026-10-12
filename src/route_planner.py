@@ -1,7 +1,7 @@
 import math
 import numpy as np
 import shapely
-from shapely.geometry import shape, LineString, Polygon, mapping
+from shapely.geometry import LineString, Polygon
 
 _LAT_M = 111139.0  # metres per degree latitude (WGS-84 approximation)
 

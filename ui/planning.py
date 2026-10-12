@@ -19,7 +19,7 @@ from route_planner import (                                # noqa: E402
     plan_route_adaptive, plan_route, _pass_altitude, band_pass_altitudes)
 from density_estimate import estimate_density_grid       # noqa: E402
 from scanner import (                                      # noqa: E402
-    max_range_m, scan_lines_for_square_pattern)
+    max_range_m, scan_lines_for_square_pattern)  # noqa: F401  (re-exported to main_window)
 
 # Numba fast path (fused, multithreaded kernel — ~10-30x). Optional: import fails
 # cleanly where numba isn't installed, and any runtime error falls back to the NumPy

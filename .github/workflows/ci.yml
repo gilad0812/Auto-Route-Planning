@@ -1,0 +1,121 @@
+# Every push / PR: lint -> tests (with and without numba) -> build the .exe -> run the
+# packaged .exe's --self-test. The tested bundle is uploaded as a downloadable artifact.
+# release.yml calls this same workflow for a tagged version.
+name: CI
+
+on:
+  push:
+    branches: ['**']          # branches only — tags go through release.yml
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      version:
+        description: Version stamped into the app (e.g. 1.2.0). Empty = dev+<commit>.
+        type: string
+        default: ''
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ inputs.version }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.14'
+  PYTHONIOENCODING: utf-8
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install ruff==0.17.0
+      - run: ruff check --output-format=github .
+
+  test:
+    name: test (${{ matrix.variant }})
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # 'numpy-only' removes numba: the app must still work on its NumPy fallback
+        variant: [numba, numpy-only]
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-lock.txt
+      - name: Install pinned dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-lock.txt pytest==9.1.1
+      - name: Remove numba (NumPy fallback path)
+        if: matrix.variant == 'numpy-only'
+        run: pip uninstall -y numba llvmlite
+      - name: Run tests
+        run: python -m pytest -q -p no:cacheprovider tests
+
+  build:
+    needs: [lint, test]
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-lock.txt
+      - name: Install pinned dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-lock.txt
+
+      - name: Stamp version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = '${{ inputs.version }}'
+          if (-not $v) { $v = "dev+$('${{ github.sha }}'.Substring(0, 7))" }
+          "__version__ = '$v'" | Set-Content ui/version.py -Encoding utf8
+          "version=$v" >> $env:GITHUB_OUTPUT
+          Write-Host "Version: $v"
+
+      - name: Build .exe (PyInstaller)
+        shell: pwsh
+        run: ./build.ps1
+
+      - name: Self-test the packaged .exe
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'selftest'
+          $exe = 'dist/LidarRoutePlanner/LidarRoutePlanner.exe'
+          $p = Start-Process $exe -ArgumentList '--self-test', "`"$out`"" -PassThru
+          if (-not $p.WaitForExit(600000)) { $p.Kill(); throw 'Self-test timed out (10 min).' }
+          $log = Get-Content (Join-Path $out 'selftest.log') -Raw -ErrorAction SilentlyContinue
+          Write-Host $log
+          "### Packaged .exe self-test (${{ steps.ver.outputs.version }})`n``````n$log``````" >> $env:GITHUB_STEP_SUMMARY
+          if ($p.ExitCode -ne 0) { throw "Self-test failed (exit $($p.ExitCode))." }
+
+      - name: Upload self-test report (log + screenshot)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selftest-report
+          path: ${{ runner.temp }}/selftest/
+          if-no-files-found: warn
+
+      - name: Upload the tested bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: LidarRoutePlanner-${{ steps.ver.outputs.version }}
+          path: dist/LidarRoutePlanner/
+          retention-days: 30

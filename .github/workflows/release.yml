@@ -1,0 +1,84 @@
+# Push a tag like v1.2.0  ->  full CI (lint, tests, build, packaged self-test) for that
+# version, then a GitHub Release with:
+#   LidarRoutePlanner-Setup-1.2.0.exe   per-user installer (Inno Setup)
+#   LidarRoutePlanner-1.2.0.zip         the same bundle as a portable folder
+#   OfflineDevKit-1.2.0.zip             wheelhouse + Python installer + repo bundle
+#   SHA256SUMS.txt                      verify the copy on the air-gapped machine:
+#                                         Get-FileHash <file> -Algorithm SHA256
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+  ci:
+    needs: version
+    uses: ./.github/workflows/ci.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+
+  release:
+    needs: [version, ci]
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history for the offline kit's repo.bundle
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'  # only drives pip download for the offline kit
+
+      - name: Get the tested bundle from CI
+        uses: actions/download-artifact@v4
+        with:
+          name: LidarRoutePlanner-${{ env.VERSION }}
+          path: dist/LidarRoutePlanner
+
+      - name: Installer (Inno Setup)
+        shell: pwsh
+        run: |
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue) -and
+              -not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+          ./make_installer.ps1 -Version $env:VERSION
+
+      - name: Offline dev kit
+        shell: pwsh
+        run: ./make_offline_kit.ps1 -KitDir "$env:RUNNER_TEMP/OfflineDevKit-$env:VERSION"
+
+      - name: Package + checksums
+        shell: pwsh
+        run: |
+          $rel = New-Item -ItemType Directory -Force release
+          Copy-Item "dist/installer/LidarRoutePlanner-Setup-$env:VERSION.exe" $rel
+          Compress-Archive dist/LidarRoutePlanner "$rel/LidarRoutePlanner-$env:VERSION.zip"
+          Compress-Archive "$env:RUNNER_TEMP/OfflineDevKit-$env:VERSION" "$rel/OfflineDevKit-$env:VERSION.zip"
+          Get-ChildItem $rel -File | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          } | Set-Content "$rel/SHA256SUMS.txt" -Encoding ascii
+          Get-Content "$rel/SHA256SUMS.txt"
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME (Get-ChildItem release -File).FullName `
+            --title "LiDAR Route Planner $env:VERSION" --generate-notes `
+            --notes "Tested build: lint, unit tests and the packaged .exe self-test all passed. Verify downloads against SHA256SUMS.txt."

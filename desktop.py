@@ -2,6 +2,8 @@
 
     python desktop.py                         → launch the GUI
     python desktop.py --helios-selftest DTM   → headless HELIOS run (diagnostics)
+    python desktop.py --self-test [OUT_DIR]   → end-to-end check of the build (selftest.py);
+                                                exit code 0 = everything works
 
 The self-test exists so the packaged .exe can be verified end-to-end without
 the GUI: it computes a small route on the given DTM, runs HELIOS++ validation,
@@ -102,13 +104,16 @@ def _helios_selftest(dtm_path):
         log(f'RESULT error={res.get("error")} passed={res.get("passed")} '
             f'stats={res.get("density_stats")}')
         log('SELFTEST DONE')
-    except Exception as e:
+    except Exception:
         import traceback
         log('EXCEPTION:\n' + traceback.format_exc())
     print(f'self-test log written to: {log_path}')
 
 
 def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == '--self-test':
+        import selftest
+        sys.exit(selftest.run(sys.argv[2] if len(sys.argv) > 2 else None))
     if len(sys.argv) >= 2 and sys.argv[1] == '--helios-selftest':
         _helios_selftest(sys.argv[2] if len(sys.argv) > 2
                          else 'data/dtm_ca_hills_2m.tif')

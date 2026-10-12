@@ -69,6 +69,43 @@ one folder to the target machine (same OS + architecture) and run
 Flags: `-SkipHelios` (exe only), `-HeliosSource <dir>`, `-BuildRoot <dir>`. Drop a
 `assets/app.ico` to brand the executable.
 
+### CI and releases (GitHub Actions)
+
+Every push and PR runs `.github/workflows/ci.yml`:
+
+1. **Lint**: `ruff` with bug-only rules (undefined names, unused imports, syntax errors).
+2. **Tests**: `pytest` on Windows, twice: with numba and without it (the NumPy fallback).
+3. **Build**: `build.ps1` builds the .exe from the pinned `requirements-lock.txt`, then
+   runs the packaged `LidarRoutePlanner.exe --self-test`.
+4. **Artifacts**: the tested bundle and the self-test report (log + screenshot) can be
+   downloaded from the run page.
+
+To **release**, push a version tag:
+
+```powershell
+git tag v1.2.0
+git push origin v1.2.0
+```
+
+`release.yml` runs the full CI for that version, which also stamps the version into the
+window title. It then publishes a GitHub Release containing:
+
+- the installer
+- a portable zip of the bundle
+- the offline dev kit
+- `SHA256SUMS.txt`
+
+On the standalone machine, check that the copy is intact with
+`Get-FileHash <file> -Algorithm SHA256`.
+
+To check any build by hand, including on the standalone machine, run
+`LidarRoutePlanner.exe --self-test C:\some\folder`. It writes `selftest.log` and
+`selftest.png` there and exits with code 0 if everything works.
+
+Dependencies are pinned in `requirements-lock.txt`. Dependabot proposes monthly updates
+as PRs, and CI tests each one. To lint locally before each commit, run
+`pip install pre-commit` and then `pre-commit install`.
+
 ### Developing on an offline (air-gapped) machine
 
 To **edit, run, and rebuild** the app with no internet, use the offline-kit scripts.

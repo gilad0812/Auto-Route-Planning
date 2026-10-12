@@ -9,7 +9,6 @@ system PATH. Install downloads the latest GitHub release and runs it silently
 from __future__ import annotations
 
 import json
-import os
 import platform
 import shutil
 import stat

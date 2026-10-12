@@ -65,8 +65,14 @@ try {
     if ($OneFile) { $env:RP_ONEFILE = "1" } else { Remove-Item Env:RP_ONEFILE -ErrorAction SilentlyContinue }
     # Invoke via `python -m PyInstaller` (not the bare `pyinstaller` script) so the build
     # uses the active interpreter and doesn't depend on Scripts\ being on PATH.
+    # PyInstaller logs INFO lines to stderr; with "Stop", Windows PowerShell 5.1 would turn
+    # them into a terminating error once output is redirected (CI logs, *> file). Judge
+    # the build by its exit code instead.
+    $ErrorActionPreference = "Continue"
     python -m PyInstaller desktop.spec --noconfirm --distpath $DistPath --workpath $WorkPath
-    if (-not $?) { Die "PyInstaller build failed." }
+    $code = $LASTEXITCODE
+    $ErrorActionPreference = "Stop"
+    if ($code -ne 0) { Die "PyInstaller build failed (exit $code)." }
 }
 finally { Pop-Location; Remove-Item Env:RP_ONEFILE -ErrorAction SilentlyContinue }
 
