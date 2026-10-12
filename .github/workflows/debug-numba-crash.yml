@@ -1,0 +1,40 @@
+# TEMPORARY — isolate the silent exit(1) in the numba test job. Delete when found.
+name: debug-numba-crash
+on:
+  push:
+    branches: [feature/ci]
+    paths: ['.github/workflows/debug-numba-crash.yml']
+jobs:
+  probe:
+    name: probe (${{ matrix.case }})
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [window-alone, edit-then-window, workqueue-layer, one-thread, omp-layer-info]
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: requirements-lock.txt
+      - run: pip install -r requirements-lock.txt pytest==9.1.1
+      - name: probe
+        shell: pwsh
+        run: |
+          $t = 'tests'
+          switch ('${{ matrix.case }}') {
+            'window-alone'     { $t = 'tests/test_window_fits.py' }
+            'edit-then-window' { $t = 'tests/test_route_edit.py tests/test_window_fits.py' }
+            'workqueue-layer'  { $env:NUMBA_THREADING_LAYER = 'workqueue' }
+            'one-thread'       { $env:NUMBA_NUM_THREADS = '1' }
+            'omp-layer-info'   { python -c "import numba; print(numba.__version__); from numba.np.ufunc import parallel as p; import numba.config as c; print('layer cfg', c.THREADING_LAYER)"; numba -s | Select-String -Pattern 'Threading|TBB|OpenMP|Workqueue' }
+          }
+          python -X faulthandler -u -m pytest -v -p no:cacheprovider $t.Split(' ')
+          "PYTEST EXIT CODE: $LASTEXITCODE  (hex 0x{0:X8})" -f $LASTEXITCODE
+          exit $LASTEXITCODE
