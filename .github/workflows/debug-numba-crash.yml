@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        case: [window-alone, edit-then-window, workqueue-layer, one-thread, omp-layer-info]
+        case: [full-nocapture, skip-numba-tests, skip-multi-polygon, numpy-only-nocapture]
     env:
       QT_QPA_PLATFORM: offscreen
       PYTHONIOENCODING: utf-8
@@ -28,13 +28,13 @@ jobs:
         shell: pwsh
         run: |
           $t = 'tests'
+          $extra = @()
           switch ('${{ matrix.case }}') {
-            'window-alone'     { $t = 'tests/test_window_fits.py' }
-            'edit-then-window' { $t = 'tests/test_route_edit.py tests/test_window_fits.py' }
-            'workqueue-layer'  { $env:NUMBA_THREADING_LAYER = 'workqueue' }
-            'one-thread'       { $env:NUMBA_NUM_THREADS = '1' }
-            'omp-layer-info'   { python -c "import numba; print(numba.__version__); from numba.np.ufunc import parallel as p; import numba.config as c; print('layer cfg', c.THREADING_LAYER)"; numba -s | Select-String -Pattern 'Threading|TBB|OpenMP|Workqueue' }
+            'skip-numba-tests'     { $extra = @('--ignore', 'tests/test_estimator_numba.py') }
+            'skip-multi-polygon'   { $extra = @('--ignore', 'tests/test_multi_polygon.py') }
+            'numpy-only-nocapture' { pip uninstall -y numba llvmlite }
           }
-          python -X faulthandler -u -m pytest -v -p no:cacheprovider $t.Split(' ')
+          $env:QT_LOGGING_RULES = '*.debug=false'
+          python -X faulthandler -u -m pytest -v -s -p no:cacheprovider tests @extra 2>&1 | Select-Object -Last 60
           "PYTEST EXIT CODE: $LASTEXITCODE  (hex 0x{0:X8})" -f $LASTEXITCODE
           exit $LASTEXITCODE
