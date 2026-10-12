@@ -61,8 +61,25 @@ jobs:
         if: matrix.variant == 'numpy-only'
         run: pip uninstall -y numba llvmlite
       - name: Run tests
-        # unbuffered + verbose + faulthandler: a native crash still shows which test and where
-        run: python -X faulthandler -u -m pytest -v -rA -p no:cacheprovider tests
+        # One process per test file, like each file's standalone run: the GUI tests open
+        # many main windows, and a Qt abort (0xC0000409) after ~10 windows + numba estimates
+        # in ONE process on the runner (never seen in the app, one window per process)
+        # would otherwise take down the files after it. Unbuffered + verbose + faulthandler
+        # so a native crash still shows which test and where.
+        shell: pwsh
+        run: |
+          $failed = @()
+          foreach ($f in Get-ChildItem tests -Filter 'test_*.py' | Sort-Object Name) {
+            Write-Host "::group::$($f.Name)"
+            python -X faulthandler -u -m pytest -v -rA -p no:cacheprovider $f.FullName
+            $code = $LASTEXITCODE
+            Write-Host "::endgroup::"
+            if ($code -ne 0) {
+              $failed += $f.Name
+              Write-Host ("::error::{0} failed (exit 0x{1:X8})" -f $f.Name, $code)
+            }
+          }
+          if ($failed) { throw "Failed: $($failed -join ', ')" }
 
   build:
     needs: [lint, test]
