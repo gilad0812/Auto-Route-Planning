@@ -61,7 +61,8 @@ jobs:
         if: matrix.variant == 'numpy-only'
         run: pip uninstall -y numba llvmlite
       - name: Run tests
-        run: python -m pytest -q -p no:cacheprovider tests
+        # unbuffered + verbose + faulthandler: a native crash still shows which test and where
+        run: python -X faulthandler -u -m pytest -v -rA -p no:cacheprovider tests
 
   build:
     needs: [lint, test]
