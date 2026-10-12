@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGraphicsView, QGraphicsScene,
     QGraphicsPixmapItem, QGraphicsEllipseItem, QGraphicsPathItem,
     QGraphicsPolygonItem, QToolButton, QLabel, QGraphicsItemGroup, QToolTip,
-    QMenu,
+    QMenu, QGraphicsSimpleTextItem, QGraphicsRectItem,
 )
 from PySide6.QtGui import QPainterPath
 
@@ -199,6 +199,7 @@ class CanvasMap(QWidget):
         self._pass_anchor = None         # scene point a drawn pass starts from (route end)
         self._pass_preview = None        # rubber-band line to the cursor
         self._aoi_item = None
+        self._other_aoi_item = None       # faint outlines of the other loaded polygons
         self._route_group = None
         self._density_item = None
         self._helios_item = None
@@ -272,6 +273,7 @@ class CanvasMap(QWidget):
     def _reset_scene(self):
         self.scene.clear()                           # deletes all items, incl. route passes
         self._aoi_item = self._route_group = self._density_item = None
+        self._other_aoi_item = None
         self._helios_item = None
         self._pass_highlight_item = None
         self._verts = []; self._draw_items = []; self._pass_segs = []
@@ -900,6 +902,58 @@ class CanvasMap(QWidget):
             self.scene.removeItem(self._aoi_item); self._aoi_item = None
         self._verts = []
 
+    def set_other_polygons(self, polys):
+        """Faint dashed outlines, each with its name, of the OTHER polygons from a
+        multi-polygon file — so you can see where they are while working on one. Only
+        what lies inside the area the map currently shows is drawn (when focused on one
+        polygon, the far-away ones are left out entirely), and only their real boundary —
+        never the edge of the view. `polys` = [(name, [(x, y), …]), …] in the DTM's CRS;
+        [] clears."""
+        if self._other_aoi_item is not None:
+            self.scene.removeItem(self._other_aoi_item); self._other_aoi_item = None
+        if self.dtm is None or self._inv is None or not polys:
+            return
+        from shapely.geometry import Polygon as _Poly, box as _box
+        r = self.scene.sceneRect()
+        (x0, y0), (x1, y1) = self._world(r.topLeft()), self._world(r.bottomRight())
+        view = _box(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+        grp = QGraphicsItemGroup(); grp.setZValue(4)    # under the route and the AOI
+        pen = QPen(QColor('#d0d4da'), 1.5); pen.setCosmetic(True); pen.setStyle(Qt.DashLine)
+        for name, coords in polys:
+            poly = _Poly(coords)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            if not poly.intersects(view):
+                continue                                 # out of view: don't draw it
+            edge = poly.boundary.intersection(view)      # its real outline, inside the view
+            path = QPainterPath()
+            for ln in getattr(edge, 'geoms', [edge]):
+                if ln.is_empty or ln.geom_type not in ('LineString', 'LinearRing'):
+                    continue
+                pts = [self._scene(x, y) for x, y in ln.coords]
+                path.moveTo(pts[0])
+                for q in pts[1:]:
+                    path.lineTo(q)
+            item = QGraphicsPathItem(path); item.setPen(pen)
+            grp.addToGroup(item)
+            # name inside the visible part: white on a dark box, fixed screen size
+            inside = poly.intersection(view)
+            if inside.is_empty or inside.area <= 0:
+                continue
+            c = inside.representative_point()
+            box = QGraphicsRectItem()
+            box.setBrush(QBrush(QColor(0, 0, 0, 150))); box.setPen(QPen(Qt.NoPen))
+            box.setFlag(QGraphicsRectItem.ItemIgnoresTransformations)
+            lbl = QGraphicsSimpleTextItem(name, box)
+            lbl.setBrush(QBrush(QColor('#e6e8eb')))
+            rr = lbl.boundingRect()
+            box.setRect(rr.adjusted(-4, -2, 4, 2))
+            box.setPos(self._scene(c.x, c.y))
+            box.setTransform(box.transform().translate(-rr.width() / 2, -rr.height() / 2))
+            grp.addToGroup(box)
+        self.scene.addItem(grp)
+        self._other_aoi_item = grp
+
     def set_aoi_polygon(self, coords):
         """Draw an AOI from externally-supplied [lon, lat] vertices (manual entry),
         replacing any current AOI. Requires a loaded DTM for the coordinate frame."""
@@ -925,6 +979,7 @@ class CanvasMap(QWidget):
         self.btn_confirm.setVisible(False); self.btn_confirm.setEnabled(False)
         self.btn_all.setVisible(False); self.btn_all.setEnabled(False)
         self._aoi_item = self._route_group = self._density_item = None
+        self._other_aoi_item = None
         self._helios_item = None
         self._pass_highlight_item = None
         self._verts = []; self._draw_items = []; self._pass_segs = []

@@ -8,6 +8,7 @@ import csv
 import json
 import math
 import os
+import re
 
 from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QAction, QKeySequence
@@ -41,8 +42,8 @@ except Exception as _e:
         "thin": ("Under target", "lower AGL / tighter spacing"),
     }
 
-from shapely.geometry import (shape as shapely_shape, box as shapely_box, MultiPoint,
-                              LineString, MultiLineString)
+from shapely.geometry import (shape as shapely_shape, box as shapely_box,
+                              LineString, MultiLineString, Point)
 from shapely.wkt import loads as wkt_loads
 
 PULSE_FREQS = (150_000, 300_000, 600_000, 1_200_000, 1_800_000, 2_400_000)
@@ -93,20 +94,30 @@ def _densify_polyline(xy, step):
     return out
 
 
-def _read_wkt_geoms(path):
+# Column names a CSV might use to name each polygon.
+_NAME_COLUMNS = ('name', 'id', 'fid', 'label', 'title', 'polygon', 'poly', 'area')
+
+
+def _read_wkt_geoms(path, with_names=False):
     """Geometries from a `.wkt` (plain text, one geometry) or a `.csv` with a WKT column
-    (one geometry per row). Raises ValueError with a clear message on failure."""
+    (one geometry per row). Raises ValueError with a clear message on failure.
+
+    with_names=True returns [(name, geometry)] instead: the name comes from a CSV column
+    such as 'name'/'id' (see _NAME_COLUMNS) when there is one, else None; a .wkt file is
+    named after the file."""
     if os.path.splitext(path)[1].lower() != '.csv':
         with open(path, 'r', encoding='utf-8') as f:
             txt = f.read().strip()
         if not txt:
             raise ValueError('File is empty.')
-        return [wkt_loads(txt)]
+        g = wkt_loads(txt)
+        return [(os.path.splitext(os.path.basename(path))[0], g)] if with_names else [g]
     with open(path, 'r', encoding='utf-8-sig', newline='') as f:
         content = f.read()
     if not content.strip():
         raise ValueError('CSV is empty.')
     lines = content.splitlines()
+    parse_err = None
     for delim in (',', ';', '\t', '|'):         # pick the delimiter that yields a WKT column
         rows = [r for r in csv.reader(lines, delimiter=delim)
                 if any((c or '').strip() for c in r)]
@@ -115,15 +126,108 @@ def _read_wkt_geoms(path):
         col, data_rows = _locate_wkt_column(rows)
         if col is None:
             continue
-        geoms = []
-        for r in data_rows:
-            v = (r[col] if col < len(r) else '').strip()
-            if v:
-                geoms.append(wkt_loads(v))
-        if geoms:
-            return geoms
+        name_col = None
+        if data_rows is not rows:                   # the first row was a header
+            hdr = [(h or '').strip().lower() for h in rows[0]]
+            name_col = next((hdr.index(n) for n in _NAME_COLUMNS
+                             if n in hdr and hdr.index(n) != col), None)
+        named = []
+        try:
+            for r in data_rows:
+                v = (r[col] if col < len(r) else '').strip()
+                if v:
+                    nm = (r[name_col].strip() if name_col is not None and name_col < len(r)
+                          else '') or None
+                    named.append((nm, wkt_loads(v)))
+        except Exception as e:                  # this separator cut the WKT apart (e.g. a
+            parse_err = e                       # ';' CSV read with ',') — try the next one
+            continue
+        if named:
+            return named if with_names else [g for _, g in named]
+    if parse_err is not None:
+        raise ValueError(f'Could not read the WKT in the CSV: {parse_err}')
     raise ValueError('No WKT column found (expected a "WKT"/"geometry" column, or WKT '
                      'text in a column).')
+
+
+def _polygons_from_named(named):
+    """[(name|None, geometry)] -> ([(name, Polygon)], [(name, problem)]). Each Polygon is
+    one survey area; a MultiPolygon is split into its parts ('name (1)', 'name (2)', ...);
+    invalid rings are repaired with buffer(0); unnamed ones become 'Polygon <n>'."""
+    items, bad = [], []
+    for k, (name, g) in enumerate(named, 1):
+        base = (name or '').strip() or None
+        if g.geom_type == 'Polygon':
+            parts = [g]
+        elif g.geom_type in ('MultiPolygon', 'GeometryCollection'):
+            parts = [x for x in g.geoms if x.geom_type == 'Polygon']
+        else:
+            bad.append((base or f'Row {k}', f'not a polygon ({g.geom_type})'))
+            continue
+        for j, poly in enumerate(parts, 1):
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+                if poly.geom_type == 'MultiPolygon':        # repaired into pieces: keep the
+                    poly = max(poly.geoms, key=lambda q: q.area)   # main one
+            nm = (f'{base} ({j})' if base and len(parts) > 1 else base) \
+                or f'Polygon {len(items) + 1}'
+            if poly.is_empty or poly.geom_type != 'Polygon':
+                bad.append((nm, 'empty or invalid polygon'))
+            else:
+                items.append((nm, poly))
+    return items, bad
+
+
+# Uploaded-line pieces shorter than this (m) after cropping to a polygon are dropped.
+_MIN_PIECE_M = 10.0
+
+
+def _clip_segment(a, b, poly, min_len):
+    """The parts of the straight segment a→b inside `poly`, each as ((x, y, z), (x, y, z))
+    in a→b direction (z None for 2D input; for 3D, interpolated along the segment at the
+    cut points). A concave polygon can cut one segment into several parts; parts shorter
+    than `min_len` (map units) are dropped."""
+    seg = LineString([(a[0], a[1]), (b[0], b[1])])
+    inter = seg.intersection(poly)
+    out = []
+    for g in getattr(inter, 'geoms', [inter]):
+        if g.is_empty or g.geom_type != 'LineString' or g.length < min_len:
+            continue
+        p0, p1 = g.coords[0], g.coords[-1]
+        if math.hypot(p0[0] - a[0], p0[1] - a[1]) > math.hypot(p1[0] - a[0], p1[1] - a[1]):
+            p0, p1 = p1, p0                              # keep the a→b direction
+
+        def z_at(q):
+            if len(a) < 3 or len(b) < 3:
+                return None
+            t = seg.project(Point(q[0], q[1]), normalized=True)
+            return float(a[2]) + (float(b[2]) - float(a[2])) * t
+        out.append(((float(p0[0]), float(p0[1]), z_at(p0)),
+                    (float(p1[0]), float(p1[1]), z_at(p1))))
+    return out
+
+
+def _route_pass_pts(route):
+    """[(pass_id, [(x, y) start, (x, y) end])] of a route — the selectable passes."""
+    groups, order = {}, []
+    for w in route:
+        pid = w.get('pass_id')
+        if pid not in groups:
+            order.append(pid)
+        groups.setdefault(pid, []).append((w['x'], w['y']))
+    return [(pid, [groups[pid][0], groups[pid][-1]]) for pid in order
+            if len(groups[pid]) >= 2]
+
+
+# Per-polygon working state: what each loaded polygon remembers while you work on another.
+_SLOT_FIELDS = ('base_result', 'result', 'survey_route', '_edit_undo', '_edit_redo',
+                '_route_active', '_route_auto_alt', 'loaded_route')
+
+
+def _empty_slot():
+    return {'base_result': None, 'result': None, 'survey_route': [], '_edit_undo': [],
+            '_edit_redo': [], '_route_active': False, '_route_auto_alt': False,
+            'loaded_route': None}
 
 
 def _hr():
@@ -185,6 +289,9 @@ class MainWindow(QMainWindow):
         self._route_auto_alt = False     # loaded route had no Z (altitudes auto-assigned -> band on confirm)
         self._route_active = False       # a confirmed uploaded route is active (Compute re-estimates it)
         self._pending_aoi = None         # AOI loaded before a DTM — crop to it on the next Open DTM
+        self._aoi_set = []               # several polygons from one file: [{'name','poly','slot'}]
+        self._aoi_active = -1            # index of the polygon being worked on
+        self._pending_aoi_set = None     # several polygons loaded before a DTM
 
         self._build_menu()
         self._build_body()
@@ -302,7 +409,18 @@ class MainWindow(QMainWindow):
         b_enter_aoi.clicked.connect(self._enter_aoi_coords)
         b_clear_aoi = QPushButton('Clear drawn polygon')
         b_clear_aoi.clicked.connect(self._clear_aoi)
-        al.addWidget(self.lbl_aoi); al.addWidget(b_enter_aoi); al.addWidget(b_clear_aoi)
+        # several polygons from one file: pick which one to work on (hidden otherwise)
+        self.aoi_row = QWidget()
+        ar = QHBoxLayout(self.aoi_row); ar.setContentsMargins(0, 0, 0, 0)
+        ar.addWidget(QLabel('Working on:'))
+        self.cmb_aoi = QComboBox()
+        self.cmb_aoi.setToolTip('Polygons from the loaded file. Each keeps its own route, '
+                                'results and edits while you work on another.')
+        self.cmb_aoi.currentIndexChanged.connect(self._switch_aoi)
+        ar.addWidget(self.cmb_aoi, 1)
+        self.aoi_row.setVisible(False)
+        al.addWidget(self.lbl_aoi); al.addWidget(self.aoi_row)
+        al.addWidget(b_enter_aoi); al.addWidget(b_clear_aoi)
         v.addWidget(gb_aoi)
 
         # ── Flight ── (workflow step ③)
@@ -513,6 +631,8 @@ class MainWindow(QMainWindow):
             self, 'Open DTM', '', 'GeoTIFF (*.tif *.tiff);;All files (*)')
         if not path:
             return
+        if not self._pending_aoi_set and not self._confirm_discard_set():
+            return
         try:
             self.dtm = load_dtm(path)
         except Exception as e:
@@ -524,7 +644,12 @@ class MainWindow(QMainWindow):
         self.lbl_dtm.setText(f'DTM: {path}\n{w}×{h} px · CRS {crs}')
         self.loaded_route = None; self._set_route_mode(False)
         self._clear_results()
-        if self._pending_aoi is not None:
+        pending_set, self._pending_aoi_set = self._pending_aoi_set, None
+        self._clear_aoi_set()
+        if pending_set:                           # several polygons were loaded first
+            if not self._start_aoi_set(pending_set):
+                self._open_dtm_full()
+        elif self._pending_aoi is not None:
             poly, self._pending_aoi = self._pending_aoi, None
             self._open_dtm_cropped(poly)
         else:
@@ -571,6 +696,9 @@ class MainWindow(QMainWindow):
     def _clear_dtm(self):
         """Drop the loaded DTM (and the AOI/results that depend on it) and blank the
         map."""
+        if not self._confirm_discard_set():
+            return
+        self._clear_aoi_set()
         self.dtm = None; self.dtm_path = None
         self.is_geo = True
         self.drawn_polygon = None
@@ -638,31 +766,40 @@ class MainWindow(QMainWindow):
         return coords
 
     def _load_wkt_aoi(self):
-        """Load an AOI polygon from a .wkt file or a .csv with a WKT column (coordinates in
-        the DTM's CRS). With a DTM open, focus the map on it at native resolution. WITHOUT a
-        DTM, remember it and crop the DTM to it on the next Open DTM."""
+        """Load AOI polygon(s) from a .wkt file or a .csv with a WKT column (coordinates in
+        the DTM's CRS). ONE polygon becomes the survey area (map focused on it). SEVERAL
+        (e.g. one per CSV row) are all kept and you choose which to work on — each keeps its
+        own route, results and edits when you switch. Without a DTM, remember them and
+        crop to the (first) polygon on the next Open DTM."""
         path, _ = QFileDialog.getOpenFileName(
             self, 'Load polygon', '',
             'WKT or CSV (*.wkt *.csv *.txt);;All files (*)')
         if not path:
             return
         try:
-            geoms = _read_wkt_geoms(path)
+            named = _read_wkt_geoms(path, with_names=True)
         except Exception as e:
             QMessageBox.critical(self, 'Polygon', f'Could not read the file:\n{e}'); return
-        # Reduce to a single polygon (first polygonal geometry in the file).
-        poly = None
-        for g in geoms:
-            if g.geom_type == 'Polygon':
-                poly = g; break
-            if g.geom_type in ('MultiPolygon', 'GeometryCollection'):
-                poly = g.convex_hull; break          # a valid single Polygon
-        if poly is None:
+        items, bad = _polygons_from_named(named)
+        if not items:
             QMessageBox.warning(self, 'Polygon', 'No polygon found in the file.'); return
-        if not poly.is_valid:
-            poly = poly.buffer(0)
-        if poly.is_empty or poly.geom_type != 'Polygon':
-            QMessageBox.warning(self, 'Polygon', 'The polygon is empty or invalid.'); return
+        if not self._confirm_discard_set():
+            return
+        if len(items) > 1:
+            if self.dtm is None:
+                self._pending_aoi_set, self._pending_aoi = items, None
+                self.lbl_aoi.setText(f'{len(items)} polygons loaded — open a DTM to start '
+                                     f'working on them.')
+                self.statusBar().showMessage(
+                    f'{len(items)} polygons stored. File > Open DTM to start on the first one.')
+                return
+            self._clear_aoi_set()
+            self._start_aoi_set(items, bad)
+            return
+        # ── a single polygon ──
+        self._clear_aoi_set(); self._pending_aoi_set = None
+        self._warn_unusable(bad)
+        poly = items[0][1]
         if self.dtm is None:
             # No DTM yet — remember it; Open DTM will crop to it (CRS is checked then).
             self._pending_aoi = poly
@@ -685,14 +822,6 @@ class MainWindow(QMainWindow):
         self.lbl_aoi.setText('✓ polygon loaded from WKT — map focused at native resolution.')
         self.statusBar().showMessage(
             f'Polygon from {os.path.basename(path)}; map focused on the area.')
-
-    def _passes_region(self, pts):
-        """A polygon covering `pts` [(lon,lat)] — the convex hull, buffered to a real
-        area when the points are collinear (a single straight pass)."""
-        hull = MultiPoint(list(pts)).convex_hull
-        if hull.geom_type != 'Polygon':
-            hull = hull.buffer(0.0005 if self.is_geo else 50.0)
-        return hull
 
     def _load_wkt_route(self):
         """Load an operator-built route from a .wkt or a .csv with a WKT column (each
@@ -729,66 +858,109 @@ class MainWindow(QMainWindow):
         if not lines:
             QMessageBox.warning(self, 'Route', 'No line passes found in the file.')
             return
-        # Each straight segment (vertex A -> vertex B) is one selectable pass, so a
-        # multi-vertex line is split into its individual passes. 3D -> vertex Z is the
-        # flight altitude; 2D -> automatic altitude per pass (mean terrain + sidebar AGL,
-        # floored to clear the pass peak), same rule as the planner.
+        # Each straight segment (vertex A -> vertex B) is one selectable pass, CROPPED to
+        # the polygon: the part inside is kept, the rest dropped. With several polygons
+        # loaded, every polygon gets the parts of the lines inside it — the current one
+        # shows them now, the others keep theirs for when you switch. 3D -> vertex Z is
+        # the flight altitude (interpolated at a cut); 2D -> automatic altitude per pass
+        # (mean terrain + sidebar AGL, floored to clear the pass peak), as the planner does.
         have_z = all(ln.has_z for ln in lines)
         params = self._params()
         to_m = _LAT_M if self.is_geo else 1.0
         step_map = params.step_m / to_m
         res_map = min(abs(self.dtm.src.res[0]), abs(self.dtm.src.res[1]))
         elev_step = min(step_map, res_map)
-        route, pass_pts, auto, skipped, pid = [], [], 0, 0, 0
+        multi = len(self._aoi_set) > 1
+        targets = list(range(len(self._aoi_set))) if multi else [None]
+        polys = {k: (self._aoi_set[k]['poly'] if k is not None else self.drawn_polygon)
+                 for k in targets}
+        active = self._aoi_active if multi else None
+        polys[active] = self.drawn_polygon               # the live (maybe redrawn) one
+        pieces = {k: [] for k in targets}
+        outside = 0
         for ln in lines:
             cs = list(ln.coords)
             for a, b in zip(cs, cs[1:]):
-                seg = [(float(a[0]), float(a[1])), (float(b[0]), float(b[1]))]
+                hit = False
+                for k in targets:
+                    got = _clip_segment(a, b, polys[k], _MIN_PIECE_M / to_m)
+                    if got:
+                        pieces[k].extend(got); hit = True
+                if not hit:
+                    outside += 1
+
+        def build(parts):
+            route, skipped, pid = [], 0, 0
+            for (x0, y0, z0), (x1, y1, z1) in parts:
+                seg = [(x0, y0), (x1, y1)]
                 if have_z:
-                    zs, td = [float(a[2]), float(b[2])], None
+                    zs, td = [z0, z1], None
                 else:
                     zc = _pass_altitude(self.dtm, _densify_polyline(seg, step_map),
                                         params.altitude_m, step_map, elev_step,
                                         params.min_peak_clearance_m)
                     if math.isnan(zc):                   # no valid terrain under this pass
                         skipped += 1; continue
-                    auto += 1; zs, td = [zc, zc], params.altitude_m
+                    zs, td = [zc, zc], params.altitude_m
                 pid += 1
                 for (x, y), z in zip(seg, zs):
                     route.append({'x': x, 'y': y, 'z': z, 'pass_id': pid,
                                   'target_distance': td})
-                pass_pts.append((pid, seg))
-        if not route:
+            return route, skipped
+
+        built = {k: build(pieces[k]) for k in targets}
+        route, skipped = built[active]
+        others = {k: r for k, (r, _) in built.items() if k != active and r}
+        if not route and not others:
             QMessageBox.warning(
-                self, 'Route', 'No passes with valid terrain under them '
-                '(coordinates off the DTM, or in the wrong CRS).'); return
-        allpts = [(wp['x'], wp['y']) for wp in route]
-        b = self.dtm.src.bounds
-        if not self._passes_region(allpts).intersects(
-                shapely_box(b.left, b.bottom, b.right, b.top)):
-            QMessageBox.warning(
-                self, 'Route', 'The route does not overlap the DTM.\nCoordinates must '
-                'be in the same CRS as the DTM.'); return
+                self, 'Route', 'No part of the lines lies inside the polygon'
+                + ('s' if multi else '') + '.\nCoordinates must be in the same CRS as '
+                'the DTM.'); return
+        # Lines for OTHER polygons replace whatever route those polygons have — ask first.
+        busy = [self._aoi_set[k]['name'] for k in others if self._slot_has_route(k)]
+        if busy and QMessageBox.question(
+                self, 'Route', f'This file also has lines for {len(busy)} other polygon(s) '
+                f'that already have a route ({", ".join(busy[:4])}'
+                f'{"…" if len(busy) > 4 else ""}).\n\nReplace their routes with these lines?',
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        for k, r in others.items():                      # waiting for that polygon
+            slot = _empty_slot()
+            slot['loaded_route'] = r
+            slot['_route_auto_alt'] = not have_z
+            self._aoi_set[k]['slot'] = slot
+        other_note = (f'; lines kept for {len(others)} other polygon(s): '
+                      + ', '.join(self._aoi_set[k]['name'] for k in others)) if others else ''
+        out_note = f'; {outside} segment(s) outside every polygon ignored' if outside else ''
+        skip_note = f'; {skipped} skipped — off terrain' if skipped else ''
+        alt_note = ('altitude from Z' if have_z
+                    else f'auto altitude at {params.altitude_m:.0f} m AGL')
+        if not route:                                    # nothing for the current polygon
+            self._refresh_aoi_combo()
+            self.statusBar().showMessage(
+                f'No lines inside this polygon{other_note}{out_note}.')
+            return
         # Keep the AOI; drop any previous route/estimate. Show the AOI + passes and let
         # the operator pick the relevant passes.
         self.loaded_route = route
         self._route_auto_alt = not have_z    # band the altitudes on confirm (2D route only)
         self._clear_results()
         self._set_route_mode(False)          # active again once passes are confirmed
-        view = self._passes_region(list(self.drawn_polygon.exterior.coords) + allpts)
-        self._map_focused = True
-        self.mapview.focus_on(view, margin_m=150.0)
-        self._sync_focus_button()
-        self.mapview.set_aoi_polygon(list(self.drawn_polygon.exterior.coords))
-        self.mapview.show_route_passes(pass_pts)
-        alt_note = (f'altitude from Z' if have_z
-                    else f'auto altitude at {params.altitude_m:.0f} m AGL')
-        skip_note = f' ({skipped} skipped — off terrain)' if skipped else ''
+        self._render_map(focus=True)
+        self._show_loaded_passes()
+        self._refresh_aoi_combo()
+        self.statusBar().showMessage(
+            f'Route from {os.path.basename(path)}: {len(_route_pass_pts(route))} passes '
+            f'inside the polygon (cropped to it), {alt_note}{skip_note}{other_note}'
+            f'{out_note}. Click the relevant ones, then Confirm.')
+
+    def _show_loaded_passes(self):
+        """Show the uploaded passes waiting to be selected + confirmed for this polygon."""
+        if self.mapview is None or not self.loaded_route:
+            return
+        self.mapview.show_route_passes(_route_pass_pts(self.loaded_route))
         self.lbl_aoi.setText('Route loaded — click the passes relevant for point-cloud '
                              'production, then ✓ Confirm passes.')
-        self.statusBar().showMessage(
-            f'Route from {os.path.basename(path)}: {len(pass_pts)} passes, {alt_note}'
-            f'{skip_note}. Click the relevant ones, then Confirm.')
 
     def _confirm_selected_passes(self):
         """Estimate the selected passes over the CURRENT AOI, then behave exactly like an
@@ -868,6 +1040,7 @@ class MainWindow(QMainWindow):
         self._sync_focus_button()
         if self.drawn_polygon is not None:
             self.mapview.set_aoi_polygon(list(self.drawn_polygon.exterior.coords))
+        self._draw_other_polygons()
         if self.result and self.result.route:
             self._render_map_overlays(self.result)
             # set_dtm -> _reset_scene disabled the Edit button and dropped its overlay
@@ -920,6 +1093,8 @@ class MainWindow(QMainWindow):
                 f'Polygon too large ({area / 1e6:.2f} km²); max {MAX_AOI_M2 / 1e6:.0f} km².')
             return
         self.drawn_polygon = poly
+        if 0 <= self._aoi_active < len(self._aoi_set):    # redrawn: replaces this polygon
+            self._aoi_set[self._aoi_active]['poly'] = poly
         self._clear_results()                 # previous route no longer matches AOI
         self.loaded_route = None; self._set_route_mode(False)   # new AOI -> auto-plan mode
         self.lbl_aoi.setText('✓ polygon set.')
@@ -929,9 +1104,173 @@ class MainWindow(QMainWindow):
             self._render_map(focus=True)
         else:
             self._sync_focus_button()
+        self._refresh_aoi_combo()
         self.statusBar().showMessage('Polygon set. Click Compute.')
 
+    # ---- several polygons from one file: switch between them, each keeps its work ----
+    def _start_aoi_set(self, items, bad=()):
+        """Start working on several polygons [(name, Polygon)]. Drops ones off the DTM or
+        over the area cap (listed in a warning), opens the first. False if none usable."""
+        b = self.dtm.src.bounds
+        dtm_box = shapely_box(b.left, b.bottom, b.right, b.top)
+        ok, bad = [], list(bad)
+        for name, poly in items:
+            area = polygon_area_m2(poly, self.is_geo)
+            if not poly.intersects(dtm_box):
+                bad.append((name, "outside the DTM (coordinates must be in the DTM's CRS)"))
+            elif area > MAX_AOI_M2:
+                bad.append((name, f'{area / 1e6:.2f} km² — over the '
+                                  f'{MAX_AOI_M2 / 1e6:.0f} km² limit'))
+            else:
+                ok.append((name, poly))
+        self._warn_unusable(bad)
+        if not ok:
+            return False
+        self._clear_results()
+        self.loaded_route = None
+        self._aoi_set = [{'name': n, 'poly': p, 'slot': _empty_slot()} for n, p in ok]
+        self._aoi_active = 0
+        for f, v in _empty_slot().items():
+            setattr(self, f, v)
+        self.drawn_polygon = ok[0][1]
+        self._present_current()
+        self.lbl_aoi.setText(f'✓ {len(ok)} polygons loaded — pick one below. Each keeps its '
+                             f'own route and edits.')
+        self.statusBar().showMessage(
+            f'{len(ok)} polygons loaded; working on "{ok[0][0]}". Click Compute.')
+        return True
+
+    def _warn_unusable(self, bad):
+        if bad:
+            lines = [f'  • {n}: {why}' for n, why in bad[:15]]
+            if len(bad) > 15:
+                lines.append(f'  … and {len(bad) - 15} more')
+            QMessageBox.warning(
+                self, 'Polygons',
+                "These polygons can't be used and were left out:\n\n" + '\n'.join(lines))
+
+    def _stash_active(self):
+        """Save the active polygon's working state into its slot."""
+        a = self._aoi_active
+        if 0 <= a < len(self._aoi_set):
+            e = self._aoi_set[a]
+            e['slot'] = {f: getattr(self, f) for f in _SLOT_FIELDS}
+            if self.drawn_polygon is not None:
+                e['poly'] = self.drawn_polygon
+
+    def _switch_aoi(self, i):
+        """Switch to polygon i: keep the current one's route/results/edits, restore i's."""
+        if not 0 <= i < len(self._aoi_set) or i == self._aoi_active:
+            return
+        self._stash_active()
+        self._aoi_active = i
+        e = self._aoi_set[i]
+        for f, v in e['slot'].items():
+            setattr(self, f, v)
+        self.drawn_polygon = e['poly']
+        self._present_current()
+        has = bool(self.result and self.result.route)
+        waiting = not has and bool(self.loaded_route)
+        if not waiting:
+            self.lbl_aoi.setText(f'✓ working on "{e["name"]}" ({i + 1} of {len(self._aoi_set)}).')
+        self.statusBar().showMessage(
+            f'Switched to "{e["name"]}"' + (' — its route is restored.' if has else
+                                             ' — its uploaded lines are waiting: select them, '
+                                             'then Confirm.' if waiting else
+                                             ' — no route yet; click Compute.'))
+
+    def _present_current(self):
+        """Show the active polygon's state: map (focused on it, others outlined), route
+        overlays, results, profile, buttons and undo — without resetting its edit history."""
+        has = bool(self.result and self.result.route)
+        self._set_route_mode(self._route_active)
+        self.btn_compute.setEnabled(self.drawn_polygon is not None)
+        if self.mapview is not None and self.dtm is not None:
+            if self.mapview.dtm is not self.dtm:          # a just-opened DTM: crop straight to it
+                self._set_busy(True, 'Cropping the DTM to the polygon…')
+                try:
+                    self.mapview.set_dtm(self.dtm, self.dtm_path,
+                                         focus_polygon=self.drawn_polygon)
+                finally:
+                    self._set_busy(False)
+            self._render_map(focus=True)
+            if not has and self.loaded_route:             # uploaded lines waiting here
+                self._show_loaded_passes()
+        if has:
+            self._render_summary(self.result)
+        else:
+            self.lbl_summary.setText(self._empty_summary_html())
+        self.btn_geojson.setEnabled(has)
+        self.btn_csv.setEnabled(has)
+        self.act_save_route.setEnabled(has)
+        self._refresh_profile()
+        self._update_undo_actions()
+        self._update_workflow()
+        self._refresh_aoi_combo()
+
+    def _slot_has_route(self, k):
+        if k == self._aoi_active:
+            return bool(self.result and self.result.route)
+        r = self._aoi_set[k]['slot'].get('result')
+        return bool(r and r.route)
+
+    def _refresh_aoi_combo(self):
+        """The 'Working on' selector: one entry per polygon (✓ = has a route)."""
+        if not hasattr(self, 'cmb_aoi'):
+            return
+        self.aoi_row.setVisible(len(self._aoi_set) > 1)
+        self.cmb_aoi.blockSignals(True)
+        self.cmb_aoi.clear()
+        for k, e in enumerate(self._aoi_set):
+            lr = self.loaded_route if k == self._aoi_active else e['slot'].get('loaded_route')
+            tag = ('   ✓ route' if self._slot_has_route(k)
+                   else '   • lines to confirm' if lr else '')
+            self.cmb_aoi.addItem(e['name'] + tag)
+        if 0 <= self._aoi_active < len(self._aoi_set):
+            self.cmb_aoi.setCurrentIndex(self._aoi_active)
+        self.cmb_aoi.blockSignals(False)
+
+    def _draw_other_polygons(self):
+        if self.mapview is not None:
+            self.mapview.set_other_polygons(
+                [(e['name'], list(e['poly'].exterior.coords))
+                 for k, e in enumerate(self._aoi_set) if k != self._aoi_active])
+
+    def _clear_aoi_set(self):
+        """Leave multi-polygon mode (the active polygon's state stays as the current one)."""
+        self._aoi_set = []
+        self._aoi_active = -1
+        if self.mapview is not None:
+            self.mapview.set_other_polygons([])
+        self._refresh_aoi_combo()
+
+    def _confirm_discard_set(self):
+        """Before an action that closes the loaded polygons: ask if any have routes."""
+        if len(self._aoi_set) < 2:
+            return True
+        busy = [e['name'] for k, e in enumerate(self._aoi_set) if self._slot_has_route(k)]
+        if not busy:
+            return True
+        names = ', '.join(busy[:4]) + ('…' if len(busy) > 4 else '')
+        return QMessageBox.question(
+            self, 'Polygons',
+            f'This closes the {len(self._aoi_set)} loaded polygons and discards the routes '
+            f'planned on {len(busy)} of them ({names}).\n\nContinue?',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
+
+    def _active_aoi_name(self):
+        a = self._aoi_active
+        return self._aoi_set[a]['name'] if 0 <= a < len(self._aoi_set) else ''
+
+    def _export_name(self, default):
+        """Default export file name, prefixed with the active polygon's name if any."""
+        name = re.sub(r'[^A-Za-z0-9_\-]+', '_', self._active_aoi_name()).strip('_')
+        return f'{name}_{default}' if name else default
+
     def _clear_aoi(self):
+        if not self._confirm_discard_set():
+            return
+        self._clear_aoi_set()
         self.drawn_polygon = None
         self.loaded_route = None; self._set_route_mode(False)
         self.btn_compute.setEnabled(False)
@@ -1021,6 +1360,7 @@ class MainWindow(QMainWindow):
             status_msg = (f'Done — {self.result.n_waypoints} waypoints' if has_route
                           else 'Done — no route produced')
         self.statusBar().showMessage(status_msg)
+        self._refresh_aoi_combo()
 
     def _on_pass_drawn(self, payload):
         """Add Pass (Edit Route sub-tool): two free clicks define the pass — payload is
@@ -1279,7 +1619,7 @@ class MainWindow(QMainWindow):
         if not (self.result and self.result.route):
             return
         path, _ = QFileDialog.getSaveFileName(self, 'Export route GeoJSON',
-                                              'route.geojson', 'GeoJSON (*.geojson)')
+                                              self._export_name('route.geojson'), 'GeoJSON (*.geojson)')
         if not path:
             return
         feats = [{
@@ -1298,7 +1638,7 @@ class MainWindow(QMainWindow):
         if not (self.result and self.result.route):
             return
         path, _ = QFileDialog.getSaveFileName(self, 'Export route CSV',
-                                              'route.csv', 'CSV (*.csv)')
+                                              self._export_name('route.csv'), 'CSV (*.csv)')
         if not path:
             return
         wps = [w for w in self.result.route
@@ -1339,7 +1679,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, 'Save route', 'No valid passes to save.')
             return
         path, _ = QFileDialog.getSaveFileName(self, 'Save route WKT',
-                                              'route.wkt', 'WKT (*.wkt)')
+                                              self._export_name('route.wkt'), 'WKT (*.wkt)')
         if not path:
             return
         try:
@@ -1386,7 +1726,7 @@ class MainWindow(QMainWindow):
                         if not (isinstance(w['z'], float) and math.isnan(w['z']))})
 
         rows = [
-            ('<b>Polygon</b>', ''),
+            ('<b>Polygon</b>', self._active_aoi_name()),
             ('Area', area),
             ('<b>Route</b>', ''),
             ('Passes', f'{n_passes}'),
