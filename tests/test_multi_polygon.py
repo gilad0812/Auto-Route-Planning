@@ -49,10 +49,12 @@ def _csv(tmp, rows, delim=','):
 
 
 def _open(w, path):
-    with mock.patch('ui.main_window.QFileDialog.getOpenFileName', return_value=(path, '')):
-        if path.endswith('.tif'):
+    if isinstance(path, str) and path.endswith('.tif'):
+        with mock.patch('ui.main_window.QFileDialog.getOpenFileName', return_value=(path, '')):
             w._open_dtm()
-        else:
+    else:
+        paths = path if isinstance(path, list) else [path]
+        with mock.patch('ui.main_window.QFileDialog.getOpenFileNames', return_value=(paths, '')):
             w._load_wkt_aoi()
     _app.processEvents()
 
@@ -168,7 +170,8 @@ def _lines_csv(tmp, rows):
 
 
 def _load_route(w, path):
-    with mock.patch('ui.main_window.QFileDialog.getOpenFileName', return_value=(path, '')):
+    paths = path if isinstance(path, list) else [path]
+    with mock.patch('ui.main_window.QFileDialog.getOpenFileNames', return_value=(paths, '')):
         w._load_wkt_route()
     _app.processEvents()
 
@@ -226,6 +229,39 @@ def test_other_outlines_only_what_is_in_view():
         w.close()
 
 
+def test_several_files_at_once():
+    from ui.main_window import _route_pass_pts
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        w = MainWindow(); w.resize(1400, 900); w.show(); _app.processEvents()
+        _open(w, _dtm(tmp))
+        a = _csv(tmp, POLYS[:2])                                   # named: north, south
+        b = os.path.join(tmp, 'east_blocks.csv')                    # no name column
+        with open(b, 'w', newline='', encoding='utf-8') as f:
+            wr = csv.writer(f); wr.writerow(['wkt'])
+            wr.writerow([POLYS[2][1]])
+            wr.writerow(['POLYGON ((700 950, 1100 950, 1100 1150, 700 1150, 700 950))'])
+        c = os.path.join(tmp, 'dup.wkt')                            # named after the file...
+        open(c, 'w').write(POLYS[0][1].replace('100 650', '120 660'))
+        os.replace(c, os.path.join(tmp, 'north.wkt'))               # ...'north' -> duplicate
+        c = os.path.join(tmp, 'north.wkt')
+        broken = os.path.join(tmp, 'broken.csv')
+        open(broken, 'w').write('wkt\nPOLYGON ((0 0, 1 0\n')
+        with mock.patch('ui.main_window.QMessageBox.warning') as warn:
+            _open(w, [a, b, c, broken])
+        names = [e['name'] for e in w._aoi_set]
+        assert names == ['north', 'south', 'east_blocks 1', 'east_blocks 2', 'north (2)'], names
+        assert 'broken.csv' in warn.call_args[0][2]                 # the bad file is reported
+        # two route files -> their lines are combined, then cropped / shared as usual
+        r1 = _lines_csv(tmp, [('n', 'LINESTRING (20 800, 1180 800)')])
+        r2 = os.path.join(tmp, 'more_lines.csv')
+        with open(r2, 'w', newline='', encoding='utf-8') as f:
+            wr = csv.writer(f); wr.writerow(['wkt']); wr.writerow(['LINESTRING (20 1000, 1180 1000)'])
+        _load_route(w, [r1, r2])
+        assert len(_route_pass_pts(w.loaded_route)) == 2            # one from each file in north
+        assert '2 files' in w.statusBar().currentMessage()
+        w.close()
+
+
 def test_reader_names_and_semicolons():
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         p = _csv(tmp, POLYS[:2], delim=';')                       # Excel ';' CSV
@@ -238,7 +274,8 @@ if __name__ == '__main__':
     for fn in (test_switching_keeps_each_polygons_work, test_single_polygon_file_has_no_selector,
                test_polygons_loaded_before_the_dtm, test_clip_segment,
                test_lines_cropped_and_shared_between_polygons,
-               test_other_outlines_only_what_is_in_view, test_reader_names_and_semicolons):
+               test_other_outlines_only_what_is_in_view, test_several_files_at_once,
+               test_reader_names_and_semicolons):
         try:
             fn(); print(f'PASS  {fn.__name__}')
         except AssertionError as e:

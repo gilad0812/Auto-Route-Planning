@@ -150,6 +150,47 @@ def _read_wkt_geoms(path, with_names=False):
                      'text in a column).')
 
 
+def _read_files(paths, with_names=False):
+    """Read several .wkt / .csv files. Returns (geometries — or (name, geometry) pairs with
+    with_names — from all of them, problems) where problems = [(file name, reason)] for files
+    that couldn't be read (the others still count). With several files, a geometry without a
+    name of its own is named after its file: '<file>' or '<file> <n>'."""
+    out, problems = [], []
+    for path in paths:
+        try:
+            named = _read_wkt_geoms(path, with_names=True)
+        except Exception as e:
+            problems.append((os.path.basename(path), str(e).splitlines()[0][:150]))
+            continue
+        if len(paths) > 1:
+            stem = os.path.splitext(os.path.basename(path))[0]
+            named = [(nm or (stem if len(named) == 1 else f'{stem} {i}'), g)
+                     for i, (nm, g) in enumerate(named, 1)]
+        out.extend(named if with_names else [g for _, g in named])
+    return out, problems
+
+
+def _unique_names(items):
+    """[(name, x)] with repeated names made unique: 'A', 'A (2)', 'A (3)', …"""
+    seen, out = {}, []
+    taken = {n for n, _ in items}
+    for name, x in items:
+        if name in seen:
+            k = seen[name]
+            while True:
+                k += 1
+                cand = f'{name} ({k})'
+                if cand not in taken:
+                    break
+            seen[name] = k
+            taken.add(cand)
+            out.append((cand, x))
+        else:
+            seen[name] = 1
+            out.append((name, x))
+    return out
+
+
 def _polygons_from_named(named):
     """[(name|None, geometry)] -> ([(name, Polygon)], [(name, problem)]). Each Polygon is
     one survey area; a MultiPolygon is split into its parts ('name (1)', 'name (2)', ...);
@@ -322,9 +363,9 @@ class MainWindow(QMainWindow):
     def _build_menu(self):
         m = self.menuBar().addMenu('&File')
         a_dtm = QAction('Open DTM…', self); a_dtm.triggered.connect(self._open_dtm)
-        a_wkt = QAction('Load polygon (.wkt/.csv)…', self)
+        a_wkt = QAction('Load polygons (.wkt/.csv, one or more files)…', self)
         a_wkt.triggered.connect(self._load_wkt_aoi)
-        a_route = QAction('Load route (.wkt/.csv)…', self)
+        a_route = QAction('Load routes (.wkt/.csv, one or more files)…', self)
         a_route.triggered.connect(self._load_wkt_route)
         self.act_save_route = QAction('Save route (.wkt)…', self)
         self.act_save_route.setEnabled(False)
@@ -771,25 +812,29 @@ class MainWindow(QMainWindow):
         (e.g. one per CSV row) are all kept and you choose which to work on — each keeps its
         own route, results and edits when you switch. Without a DTM, remember them and
         crop to the (first) polygon on the next Open DTM."""
-        path, _ = QFileDialog.getOpenFileName(
-            self, 'Load polygon', '',
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, 'Load polygons — select one or more files', '',
             'WKT or CSV (*.wkt *.csv *.txt);;All files (*)')
-        if not path:
+        if not paths:
             return
-        try:
-            named = _read_wkt_geoms(path, with_names=True)
-        except Exception as e:
-            QMessageBox.critical(self, 'Polygon', f'Could not read the file:\n{e}'); return
+        named, problems = _read_files(paths, with_names=True)
         items, bad = _polygons_from_named(named)
+        items = _unique_names(items)
+        bad = [(f, f'could not read the file ({why})') for f, why in problems] + bad
         if not items:
-            QMessageBox.warning(self, 'Polygon', 'No polygon found in the file.'); return
+            msg = 'No polygon found in the file' + ('s.' if len(paths) > 1 else '.')
+            if problems:
+                msg += '\n\n' + '\n'.join(f'  • {f}: {why}' for f, why in problems)
+            QMessageBox.warning(self, 'Polygon', msg); return
+        src = os.path.basename(paths[0]) if len(paths) == 1 else f'{len(paths)} files'
         if not self._confirm_discard_set():
             return
         if len(items) > 1:
             if self.dtm is None:
+                self._warn_unusable(bad)
                 self._pending_aoi_set, self._pending_aoi = items, None
-                self.lbl_aoi.setText(f'{len(items)} polygons loaded — open a DTM to start '
-                                     f'working on them.')
+                self.lbl_aoi.setText(f'{len(items)} polygons loaded from {src} — open a DTM '
+                                     f'to start working on them.')
                 self.statusBar().showMessage(
                     f'{len(items)} polygons stored. File > Open DTM to start on the first one.')
                 return
@@ -820,8 +865,7 @@ class MainWindow(QMainWindow):
             return
         self._render_map(focus=True)                     # focus the map on the AOI
         self.lbl_aoi.setText('✓ polygon loaded from WKT — map focused at native resolution.')
-        self.statusBar().showMessage(
-            f'Polygon from {os.path.basename(path)}; map focused on the area.')
+        self.statusBar().showMessage(f'Polygon from {src}; map focused on the area.')
 
     def _load_wkt_route(self):
         """Load an operator-built route from a .wkt or a .csv with a WKT column (each
@@ -836,14 +880,20 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self, 'Route', 'Set a polygon first (draw one, or Load polygon), then load a '
                 'route to estimate inside it.'); return
-        path, _ = QFileDialog.getOpenFileName(
-            self, 'Load route', '', 'WKT or CSV (*.wkt *.csv *.txt);;All files (*)')
-        if not path:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, 'Load routes — select one or more files', '',
+            'WKT or CSV (*.wkt *.csv *.txt);;All files (*)')
+        if not paths:
             return
-        try:
-            geoms = _read_wkt_geoms(path)
-        except Exception as e:
-            QMessageBox.critical(self, 'Route', f'Could not read the file:\n{e}'); return
+        geoms, problems = _read_files(paths)
+        if problems:
+            listing = '\n'.join(f'  • {f}: {why}' for f, why in problems)
+            if not geoms:
+                QMessageBox.critical(self, 'Route', f'Could not read the file(s):\n\n{listing}')
+                return
+            QMessageBox.warning(self, 'Route', f'Some files could not be read and were left '
+                                               f'out:\n\n{listing}')
+        src = os.path.basename(paths[0]) if len(paths) == 1 else f'{len(paths)} files'
         # Collect every pass: LINESTRINGs directly, and the parts of MULTILINESTRINGs
         # (a route CSV may put one MULTILINESTRING in a row, or one LINESTRING per row).
         lines = []
@@ -950,7 +1000,7 @@ class MainWindow(QMainWindow):
         self._show_loaded_passes()
         self._refresh_aoi_combo()
         self.statusBar().showMessage(
-            f'Route from {os.path.basename(path)}: {len(_route_pass_pts(route))} passes '
+            f'Route from {src}: {len(_route_pass_pts(route))} passes '
             f'inside the polygon (cropped to it), {alt_note}{skip_note}{other_note}'
             f'{out_note}. Click the relevant ones, then Confirm.')
 
