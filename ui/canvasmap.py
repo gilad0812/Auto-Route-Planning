@@ -17,12 +17,16 @@ from PySide6.QtGui import (
     QImage, QPixmap, QPainter, QPen, QColor, QBrush, QPolygonF, QCursor,
 )
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGraphicsView, QGraphicsScene,
+    QWidget, QVBoxLayout, QGraphicsView, QGraphicsScene,
     QGraphicsPixmapItem, QGraphicsEllipseItem, QGraphicsPathItem,
     QGraphicsPolygonItem, QToolButton, QLabel, QGraphicsItemGroup, QToolTip,
     QMenu, QGraphicsSimpleTextItem, QGraphicsRectItem,
 )
 from PySide6.QtGui import QPainterPath
+try:
+    from .flowlayout import FlowLayout
+except ImportError:                                   # standalone import fallback
+    from flowlayout import FlowLayout
 
 _LAT_M = 111139.0
 
@@ -115,6 +119,10 @@ class _View(QGraphicsView):
         self.setDragMode(QGraphicsView.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setMouseTracking(True)
+
+    def leaveEvent(self, e):
+        self._owner._set_coord('')                   # cursor left the map: hide readout
+        super().leaveEvent(e)
 
     def wheelEvent(self, e):
         factor = 1.25 if e.angleDelta().y() > 0 else 0.8
@@ -213,7 +221,11 @@ class CanvasMap(QWidget):
         barw = QWidget(); barw.setObjectName('mapbar')
         barw.setStyleSheet('#mapbar { background:#232629; '
                            'border-bottom:1px solid #383c42; }')
-        bar = QHBoxLayout(barw); bar.setContentsMargins(8, 6, 8, 6); bar.setSpacing(6)
+        # Toolbar that never forces the map (and the window) wide: when the full labels
+        # don't fit in one row the buttons drop to their icons (name kept in the tooltip);
+        # only if even that doesn't fit do they wrap onto a 2nd row.
+        bar = FlowLayout(barw, spacing=6)
+        bar.setContentsMargins(8, 6, 8, 6)
         self.btn_draw = QToolButton(); self.btn_draw.setText('✎ Draw polygon')
         self.btn_draw.setCheckable(True); self.btn_draw.clicked.connect(self._toggle_draw)
         self.btn_draw.setToolTip('Click to add vertices; double-click to close the polygon.')
@@ -258,16 +270,29 @@ class CanvasMap(QWidget):
                   self.btn_point, self.btn_fit, self.btn_focus,
                   self.btn_all, self.btn_confirm):
             bar.addWidget(b)
-        bar.addStretch(1)
-        self.lbl_coord = QLabel(''); self.lbl_coord.setStyleSheet('color:#9aa0a6;')
-        bar.addWidget(self.lbl_coord)
         v.addWidget(barw)
+        self._bar, self._bar_compact, self._bar_busy = barw, None, False
+        # (button, icon-only text) — the full text and tooltip are remembered
+        self._bar_short = [(self.btn_draw, '✎ Draw'), (self.btn_edit, '✎ Edit'),
+                           (self.btn_pass, '✚ Add'), (self.btn_del, '🗑 Delete'),
+                           (self.btn_point, '📍 Point'), (self.btn_fit, '⤢ Fit'),
+                           (self.btn_focus, '◎ polygon'), (self.btn_confirm, '✓ Confirm')]
+        self._bar_full = {b: (b.text(), b.toolTip()) for b, _ in self._bar_short}
+        barw.installEventFilter(self)
 
         self.scene = QGraphicsScene(self)
         self.view = _View(self.scene, self)
         self.view.setBackgroundBrush(QColor('#16181b'))
         self.view.setFrameShape(self.view.Shape.NoFrame)
         v.addWidget(self.view, 1)
+        self.setMinimumWidth(340)              # map stays usable; toolbar wraps to ≤ 2 rows
+        # cursor coordinate readout: a small overlay in the map's bottom-left corner,
+        # shown while the cursor is over the terrain
+        self.lbl_coord = QLabel('', self.view)
+        self.lbl_coord.setStyleSheet('color:#e8eaed; background:rgba(22,24,27,190); '
+                                     'border-radius:4px; padding:3px 8px;')
+        self.lbl_coord.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.lbl_coord.hide()
 
     # ----------------------------------------------------------- data
     def _reset_scene(self):
@@ -384,6 +409,55 @@ class CanvasMap(QWidget):
         self.btn_confirm.setVisible(False); self.btn_confirm.setEnabled(False)
         self.btn_all.setVisible(False); self.btn_all.setEnabled(False)
 
+    def _set_coord(self, text):
+        """Show `text` in the bottom-left map overlay ('' hides it)."""
+        self.lbl_coord.setText(text)
+        if not text:
+            self.lbl_coord.hide(); return
+        self.lbl_coord.adjustSize()
+        self.lbl_coord.move(8, self.view.height() - self.lbl_coord.height() - 8)
+        self.lbl_coord.show()
+
+    def eventFilter(self, obj, e):
+        if obj is getattr(self, '_bar', None) and e.type() in (QEvent.Resize,
+                                                               QEvent.LayoutRequest):
+            self._fit_bar()
+        return super().eventFilter(obj, e)
+
+    def _fit_bar(self):
+        """Full button labels if they all fit in one row, else icon-only buttons."""
+        if self._bar_busy:
+            return
+        lay = self._bar.layout()
+        m = lay.contentsMargins()
+        room = self._bar.width() - m.left() - m.right()
+        widths = []
+        for i in range(lay.count()):
+            w = lay.itemAt(i).widget()
+            if w is None or w.isHidden():
+                continue
+            if w in self._bar_full:                  # width with its full label
+                fm = w.fontMetrics()
+                pad = w.sizeHint().width() - fm.horizontalAdvance(w.text())
+                widths.append(fm.horizontalAdvance(self._bar_full[w][0]) + pad)
+            else:
+                widths.append(w.sizeHint().width())
+        need = sum(widths) + lay._spacing * max(len(widths) - 1, 0)
+        compact = need > room
+        if compact == self._bar_compact:
+            return
+        self._bar_busy = True
+        try:
+            self._bar_compact = compact
+            for b, short in self._bar_short:
+                full, tip = self._bar_full[b]
+                b.setText(short if compact else full)
+                name = full.split(' ', 1)[-1]
+                b.setToolTip(f'<b>{name}</b><br>{tip}' if compact and tip else
+                             (name if compact else tip))
+        finally:
+            self._bar_busy = False
+
     def set_dtm(self, dtm, dtm_path=None, focus_polygon=None):
         if dtm is not self.dtm:
             self._points = []                        # different terrain: old points don't apply
@@ -466,7 +540,7 @@ class CanvasMap(QWidget):
         except ImportError:                              # standalone import fallback
             from geo import fmt_utm
         crs = self.dtm.src.crs if self.dtm is not None else None
-        self.lbl_coord.setText(f'{fmt_utm(crs, lon, lat)}   ·   {ztxt}')
+        self._set_coord(f'{fmt_utm(crs, lon, lat)}   ·   {ztxt}')
         if self.drawing_pass:
             self._update_pass_preview(sp)
         tip = self.hover_tip_text(sp)
@@ -974,6 +1048,7 @@ class CanvasMap(QWidget):
         self.adding_point = False
         self.btn_point.setChecked(False); self.btn_point.setEnabled(False)
         self.dtm = None; self._inv = None; self._disp_transform = None
+        self._set_coord('')
         self._focus_polygon = None
         self._route_passes = {}; self.selecting_passes = False
         self.btn_confirm.setVisible(False); self.btn_confirm.setEnabled(False)
@@ -998,7 +1073,7 @@ class CanvasMap(QWidget):
         self.btn_focus.blockSignals(False)
         self.view.setDragMode(QGraphicsView.ScrollHandDrag)
         self.view.setCursor(Qt.ArrowCursor)
-        self.lbl_coord.setText('')
+        self._set_coord('')
 
     # ----------------------------------------------------------- overlays
     def show_plan(self, route_wps, density_cells, density_color='#ff9900',

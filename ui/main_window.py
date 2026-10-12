@@ -596,6 +596,34 @@ class MainWindow(QMainWindow):
         if geo is not None:
             self.restoreGeometry(geo)
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not getattr(self, '_fitted_to_screen', False):     # once, on first show
+            self._fitted_to_screen = True
+            self._fit_to_screen()
+
+    def _fit_to_screen(self, avail=None):
+        """Keep the whole window on the screen it opens on: never larger than the screen's
+        free area (taskbar excluded) and moved back on-screen if its saved position isn't
+        (e.g. it was last used on a bigger or since-disconnected monitor, or at a different
+        Windows scaling). `avail` (a QRect) overrides the screen area — for tests."""
+        if self.isMaximized() or self.isFullScreen():
+            return
+        if avail is None:
+            scr = self.screen() or QApplication.primaryScreen()
+            if scr is None:
+                return
+            avail = scr.availableGeometry()
+        frame, inner = self.frameGeometry(), self.geometry()
+        dw, dh = frame.width() - inner.width(), frame.height() - inner.height()  # title bar
+        w = min(self.width(), avail.width() - dw)
+        h = min(self.height(), avail.height() - dh)
+        self.resize(max(w, self.minimumSizeHint().width()), max(h, 1))
+        w, h = self.width() + dw, self.height() + dh
+        x = min(max(frame.x(), avail.left()), avail.right() + 1 - w)
+        y = min(max(frame.y(), avail.top()), avail.bottom() + 1 - h)
+        self.move(max(x, avail.left()), max(y, avail.top()))
+
     def closeEvent(self, event):
         self._save_settings()
         super().closeEvent(event)
