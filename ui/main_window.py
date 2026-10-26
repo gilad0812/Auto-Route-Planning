@@ -26,6 +26,8 @@ from .planning import (PlanParams, compute_plan, load_dtm,
                        _LAT_M)
 from .geo import from_utm
 from .version import __version__
+from .route_csv import (_looks_like_wkt, _locate_wkt_column,  # noqa: F401
+                        read_route_table, row_segments, write_route_table)
 
 try:
     from .canvasmap import CanvasMap, FAILURE_REASON_STYLE, FAILURE_REASON_LABEL
@@ -52,35 +54,6 @@ PULSE_FREQS = (150_000, 300_000, 600_000, 1_200_000, 1_800_000, 2_400_000)
 # Passes are always floored at least this far above their highest point. Fixed (not
 # exposed in the UI) — it's a safety clearance, not a routine tuning knob.
 _MIN_PEAK_CLEARANCE_M = 50.0
-
-# Column names an exported CSV might use for the WKT geometry.
-_WKT_COLUMNS = {'wkt', 'geometry', 'geom', 'the_geom', 'wkt_geom', 'wkt_geometry',
-                'shape', 'well_known_text'}
-
-
-def _looks_like_wkt(s):
-    return s.upper().lstrip().startswith((
-        'POLYGON', 'MULTIPOLYGON', 'LINESTRING', 'MULTILINESTRING',
-        'POINT', 'MULTIPOINT', 'GEOMETRYCOLLECTION', 'LINEARRING'))
-
-
-def _locate_wkt_column(rows):
-    """(column index, data rows) for the WKT column in parsed CSV `rows`, or (None, rows).
-    Prefers a known header name; otherwise finds a column whose values look like WKT
-    (treating the first row as data if it is itself WKT — a header-less file)."""
-    header = rows[0]
-    for i, h in enumerate(header):
-        if (h or '').strip().lower() in _WKT_COLUMNS:
-            return i, rows[1:]
-    ncol = max(len(r) for r in rows)
-    for i in range(ncol):
-        cell = lambda r: (r[i] if i < len(r) else '').strip()
-        if _looks_like_wkt(cell(header)):
-            return i, rows                      # header row was actually data
-        if any(_looks_like_wkt(cell(r)) for r in rows[1:3]):
-            return i, rows[1:]
-    return None, rows
-
 
 def _densify_polyline(xy, step):
     """Sample points along a polyline `xy` [(x,y)] at ~`step` spacing (map units), so a
@@ -263,13 +236,14 @@ def _route_pass_pts(route):
 
 # Per-polygon working state: what each loaded polygon remembers while you work on another.
 _SLOT_FIELDS = ('base_result', 'result', 'survey_route', '_edit_undo', '_edit_redo',
-                '_route_active', '_route_auto_alt', 'loaded_route')
+                '_route_active', '_route_auto_alt', 'loaded_route', '_route_src',
+                '_route_picked')
 
 
 def _empty_slot():
     return {'base_result': None, 'result': None, 'survey_route': [], '_edit_undo': [],
             '_edit_redo': [], '_route_active': False, '_route_auto_alt': False,
-            'loaded_route': None}
+            'loaded_route': None, '_route_src': {}, '_route_picked': set()}
 
 
 def _hr():
@@ -329,6 +303,14 @@ class MainWindow(QMainWindow):
         self._map_focused = False        # map zoomed to the AOI (vs full-extent overview)
         self.loaded_route = None         # operator route from .wkt (list of waypoints), for pass selection
         self._route_auto_alt = False     # loaded route had no Z (altitudes auto-assigned -> band on confirm)
+        # Route CSV round-trip: the CSVs of the last route load (every row kept), and per
+        # polygon which row/segment each pass came from + which passes were confirmed —
+        # so Export CSV can write the original file back with the edits applied.
+        self._route_tables = []          # [RouteTable] of the last load
+        self._route_rows = {}            # (table, row) -> original geometry
+        self._route_gen = 0              # load counter; older keys are ignored
+        self._route_src = {}             # pass_id -> (gen, table, row, segment, t0, t1)
+        self._route_picked = set()       # pass_ids confirmed from the loaded lines
         self._route_active = False       # a confirmed uploaded route is active (Compute re-estimates it)
         self._pending_aoi = None         # AOI loaded before a DTM — crop to it on the next Open DTM
         self._aoi_set = []               # several polygons from one file: [{'name','poly','slot'}]
@@ -914,7 +896,19 @@ class MainWindow(QMainWindow):
             'WKT or CSV (*.wkt *.csv *.txt);;All files (*)')
         if not paths:
             return
-        geoms, problems = _read_files(paths)
+        # CSVs are read keeping every row (for Export CSV); .wkt files as plain geometry.
+        items, problems, tables = [], [], []           # items: (geometry, (table, row) | None)
+        for path in paths:
+            try:
+                if os.path.splitext(path)[1].lower() == '.csv':
+                    table, rows = read_route_table(path)
+                    items += [(g, (len(tables), ri)) for ri, g in rows]
+                    tables.append(table)
+                else:
+                    items += [(g, None) for g in _read_wkt_geoms(path)]
+            except Exception as e:
+                problems.append((os.path.basename(path), str(e).splitlines()[0][:150]))
+        geoms = [g for g, _ in items]
         if problems:
             listing = '\n'.join(f'  • {f}: {why}' for f, why in problems)
             if not geoms:
@@ -923,18 +917,15 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, 'Route', f'Some files could not be read and were left '
                                                f'out:\n\n{listing}')
         src = os.path.basename(paths[0]) if len(paths) == 1 else f'{len(paths)} files'
-        # Collect every pass: LINESTRINGs directly, and the parts of MULTILINESTRINGs
-        # (a route CSV may put one MULTILINESTRING in a row, or one LINESTRING per row).
-        lines = []
-        for g in geoms:
-            if g.geom_type == 'LineString':
-                lines.append(g)
-            elif g.geom_type == 'MultiLineString':
-                lines.extend(g.geoms)
-            elif g.geom_type == 'GeometryCollection':
-                lines.extend(x for x in g.geoms if x.geom_type == 'LineString')
-        lines = [ln for ln in lines if not ln.is_empty and len(ln.coords) >= 2]
-        if not lines:
+        # Every straight segment of every line: LINESTRINGs, and the parts of
+        # MULTILINESTRINGs (a route CSV may put one MULTILINESTRING in a row, or one
+        # LINESTRING per row). Each remembers its CSV row + segment number, if any.
+        gen = self._route_gen + 1
+        segments = []                                    # (a, b, (gen, table, row, seg) | None)
+        for g, where in items:
+            for k, (a, b) in enumerate(row_segments(g)):
+                segments.append((a, b, (gen, *where, k) if where is not None else None))
+        if not segments:
             QMessageBox.warning(self, 'Route', 'No line passes found in the file.')
             return
         # Each straight segment (vertex A -> vertex B) is one selectable pass, CROPPED to
@@ -943,7 +934,8 @@ class MainWindow(QMainWindow):
         # shows them now, the others keep theirs for when you switch. 3D -> vertex Z is
         # the flight altitude (interpolated at a cut); 2D -> automatic altitude per pass
         # (mean terrain + sidebar AGL, floored to clear the pass peak), as the planner does.
-        have_z = all(ln.has_z for ln in lines)
+        have_z = all(g.has_z for g, _ in items
+                     if g.geom_type in ('LineString', 'MultiLineString', 'GeometryCollection'))
         params = self._params()
         to_m = _LAT_M if self.is_geo else 1.0
         step_map = params.step_m / to_m
@@ -957,20 +949,22 @@ class MainWindow(QMainWindow):
         polys[active] = self.drawn_polygon               # the live (maybe redrawn) one
         pieces = {k: [] for k in targets}
         outside = 0
-        for ln in lines:
-            cs = list(ln.coords)
-            for a, b in zip(cs, cs[1:]):
-                hit = False
-                for k in targets:
-                    got = _clip_segment(a, b, polys[k], _MIN_PIECE_M / to_m)
-                    if got:
-                        pieces[k].extend(got); hit = True
-                if not hit:
-                    outside += 1
+        for a, b, key in segments:
+            hit = False
+            seg_len = max(math.hypot(b[0] - a[0], b[1] - a[1]), 1e-12)
+            for k in targets:
+                got = _clip_segment(a, b, polys[k], _MIN_PIECE_M / to_m)
+                for piece in got:                        # its stretch [t0, t1] of a→b
+                    t0 = math.hypot(piece[0][0] - a[0], piece[0][1] - a[1]) / seg_len
+                    t1 = math.hypot(piece[1][0] - a[0], piece[1][1] - a[1]) / seg_len
+                    pieces[k].append((piece, (*key, t0, t1) if key is not None else None))
+                hit = hit or bool(got)
+            if not hit:
+                outside += 1
 
         def build(parts):
-            route, skipped, pid = [], 0, 0
-            for (x0, y0, z0), (x1, y1, z1) in parts:
+            route, skipped, pid, rows_of = [], 0, 0, {}
+            for ((x0, y0, z0), (x1, y1, z1)), key in parts:
                 seg = [(x0, y0), (x1, y1)]
                 if have_z:
                     zs, td = [z0, z1], None
@@ -982,14 +976,15 @@ class MainWindow(QMainWindow):
                         skipped += 1; continue
                     zs, td = [zc, zc], params.altitude_m
                 pid += 1
+                rows_of[pid] = key
                 for (x, y), z in zip(seg, zs):
                     route.append({'x': x, 'y': y, 'z': z, 'pass_id': pid,
                                   'target_distance': td})
-            return route, skipped
+            return route, skipped, rows_of
 
         built = {k: build(pieces[k]) for k in targets}
-        route, skipped = built[active]
-        others = {k: r for k, (r, _) in built.items() if k != active and r}
+        route, skipped, pass_rows = built[active]
+        others = {k: (r, s) for k, (r, _, s) in built.items() if k != active and r}
         if not route and not others:
             QMessageBox.warning(
                 self, 'Route', 'No part of the lines lies inside the polygon'
@@ -1003,10 +998,16 @@ class MainWindow(QMainWindow):
                 f'{"…" if len(busy) > 4 else ""}).\n\nReplace their routes with these lines?',
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
-        for k, r in others.items():                      # waiting for that polygon
+        # Accepted: this load's CSVs become the ones Export CSV writes back.
+        self._route_gen = gen
+        self._route_tables = tables
+        self._route_rows = {(ti, ri): g for g, (ti, ri) in
+                            ((g, w) for g, w in items if w is not None)}
+        for k, (r, s) in others.items():                 # waiting for that polygon
             slot = _empty_slot()
             slot['loaded_route'] = r
             slot['_route_auto_alt'] = not have_z
+            slot['_route_src'] = s
             self._aoi_set[k]['slot'] = slot
         other_note = (f'; lines kept for {len(others)} other polygon(s): '
                       + ', '.join(self._aoi_set[k]['name'] for k in others)) if others else ''
@@ -1022,6 +1023,7 @@ class MainWindow(QMainWindow):
         # Keep the AOI; drop any previous route/estimate. Show the AOI + passes and let
         # the operator pick the relevant passes.
         self.loaded_route = route
+        self._route_src, self._route_picked = pass_rows, set()
         self._route_auto_alt = not have_z    # band the altitudes on confirm (2D route only)
         self._clear_results()
         self._set_route_mode(False)          # active again once passes are confirmed
@@ -1061,6 +1063,7 @@ class MainWindow(QMainWindow):
             route = band_pass_altitudes(route, self.dtm, self._params().altitude_m,
                                         is_geo=self.is_geo)
         self.mapview.clear_route_passes()            # leave selection mode
+        self._route_picked = set(ids)                # for Export CSV: picked vs deleted
         self.lbl_aoi.setText(f'✓ polygon + {len(ids)} selected passes (uploaded route).')
         self._estimate_uploaded_route(route)
 
@@ -1448,8 +1451,9 @@ class MainWindow(QMainWindow):
         if not (self.survey_route and self.dtm and self.drawn_polygon is not None):
             return
         p0, p1 = payload
-        pid = max((w.get('pass_id', 0) for w in self.survey_route
-                   if isinstance(w.get('pass_id'), int)), default=-1) + 1
+        pid = max([w.get('pass_id', 0) for w in self.survey_route
+                   if isinstance(w.get('pass_id'), int)]
+                  + [k for k in self._route_src if isinstance(k, int)], default=-1) + 1
         new_pass = build_manual_pass(self.dtm, p0, p1, self._params(), self.is_geo, pid)
         if not new_pass:
             self.statusBar().showMessage('Drawn pass has no valid terrain — not added.')
@@ -1716,6 +1720,9 @@ class MainWindow(QMainWindow):
     def _export_csv(self):
         if not (self.result and self.result.route):
             return
+        if self._route_tables and self._route_active:
+            self._export_original_csv()
+            return
         path, _ = QFileDialog.getSaveFileName(self, 'Export route CSV',
                                               self._export_name('route.csv'), 'CSV (*.csv)')
         if not path:
@@ -1729,6 +1736,96 @@ class MainWindow(QMainWindow):
                 wr.writerow([i, w['x'], w['y'], w['z'],
                              w.get('target_distance'), w.get('pass_id')])
         self.statusBar().showMessage(f'Wrote {len(wps)} waypoints → {path}')
+
+    def _polygon_route_states(self):
+        """(survey route, pass -> source key, picked passes) of every polygon whose
+        route is a confirmed uploaded route — the active one live, the others stashed."""
+        states = []
+        multi = len(self._aoi_set) > 1
+        for i in (range(len(self._aoi_set)) if multi else [None]):
+            if i is None or i == self._aoi_active:
+                st = {f: getattr(self, f) for f in _SLOT_FIELDS}
+            else:
+                st = self._aoi_set[i].get('slot') or {}
+            if st.get('_route_active') and st.get('survey_route'):
+                states.append((st['survey_route'], st.get('_route_src') or {},
+                               st.get('_route_picked') or set()))
+        return states
+
+    def _csv_edits(self):
+        """What changed per original CSV: ({table: {row: {segment: [(t0, t1, piece)]}}},
+        {table: [added lines]}). Each flown stretch [t0, t1] of an edge with its piece as
+        flown now ((x, y, z), (x, y, z)), or None if it was deleted."""
+        edits = {ti: {} for ti in range(len(self._route_tables))}
+        added = {ti: [] for ti in range(len(self._route_tables))}
+        for survey, src, picked in self._polygon_route_states():
+            ends = {}                                    # pass -> (first, last) waypoint
+            for w in survey:
+                pid, z = w.get('pass_id'), w.get('z')
+                if pid is None or (isinstance(z, float) and math.isnan(z)):
+                    continue
+                pt = (float(w['x']), float(w['y']), float(z))
+                ends[pid] = (ends[pid][0], pt) if pid in ends else (pt, pt)
+            placed = {}                                  # (ti, ri, k) -> [(t0, t1, piece)]
+            for pid in set(picked) | set(ends):
+                key = src.get(pid)
+                if key is None or key[0] != self._route_gen:
+                    if pid in ends:                      # drawn with Add Pass (no row)
+                        added.setdefault('?', []).append(ends[pid])
+                    continue
+                _, ti, ri, k, t0, t1 = key
+                placed.setdefault((ti, ri, k), []).append(
+                    (t0, t1, ends.get(pid)))             # None: deleted in Edit Route
+            for (ti, ri, k), lst in placed.items():
+                cur = edits[ti].setdefault(ri, {}).setdefault(k, [])
+                cur.extend(lst)
+        # Added lines go to the file of the nearest original line.
+        for a, b in added.pop('?', []):
+            mid = Point((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
+            ti = min(self._route_rows.items(), key=lambda kv: kv[1].distance(mid))[0][0]
+            added[ti].append((a, b))
+        return edits, added
+
+    def _export_original_csv(self):
+        """Export CSV for a route loaded from CSV: write each original file back — every
+        row and column kept — with your edits applied to the lines (moved, altitudes,
+        deleted parts removed, Add Pass lines as new rows; X/Y = new midpoint). Cropping
+        to the polygon is not an edit: the parts outside it stay in the file."""
+        tables = self._route_tables
+        edits, added = self._csv_edits()
+        if len(tables) == 1:
+            t = tables[0]
+            stem, ext = os.path.splitext(t.path)
+            path, _ = QFileDialog.getSaveFileName(self, 'Export route CSV (original format)',
+                                                  f'{stem}_edited{ext or ".csv"}',
+                                                  'CSV (*.csv)')
+            if not path:
+                return
+            targets = [(0, path)]
+        else:
+            folder = QFileDialog.getExistingDirectory(
+                self, f'Export {len(tables)} route CSVs (original format) — choose a folder',
+                os.path.dirname(tables[0].path))
+            if not folder:
+                return
+            targets = [(ti, os.path.join(folder, f'{os.path.splitext(t.name)[0]}_edited.csv'))
+                       for ti, t in enumerate(tables)]
+        rows_geo = {ti: {} for ti in range(len(tables))}
+        for (ti, ri), g in self._route_rows.items():
+            rows_geo[ti][ri] = g
+        done = []
+        for ti, path in targets:
+            if os.path.abspath(path) == os.path.abspath(tables[ti].path):
+                QMessageBox.warning(self, 'Export CSV', 'Choose a new file name — the '
+                                    'original CSV is kept as it is.'); return
+            try:
+                ch, rm, ad = write_route_table(tables[ti], rows_geo[ti], edits[ti],
+                                               added[ti], path)
+            except OSError as e:
+                QMessageBox.critical(self, 'Export CSV', f'Could not write the file:\n{e}')
+                return
+            done.append(f'{os.path.basename(path)}: {ch} changed, {rm} removed, {ad} added')
+        self.statusBar().showMessage('Exported — ' + '; '.join(done))
 
     def _survey_pass_lines(self):
         """The survey passes as shapely LineString Z (one per pass, endpoint→endpoint),
