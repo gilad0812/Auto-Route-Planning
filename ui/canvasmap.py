@@ -183,6 +183,7 @@ class CanvasMap(QWidget):
     passesConfirmed = Signal()           # operator confirmed the selected passes
     passEditDelete = Signal(object)      # list[int] pass_ids to delete (Edit Route mode)
     passEditGeom = Signal(object)        # list[(pass_id, (lon0,lat0), (lon1,lat1))] after a drag
+    passEditSplit = Signal(object)       # (pass_id, start, joint, end) lon/lat: bend into two
     #   (a shared endpoint moves every pass meeting there — a joint — in one batch)
 
     def __init__(self, parent=None):
@@ -198,7 +199,7 @@ class CanvasMap(QWidget):
         self._edit_group = None          # scene group holding the edit overlay
         self._edit_drag = None           # [(pass_id, end_idx), …] the joint being dragged
         self._edit_drag_start = None     # scene point where the drag began (dead-zone test)
-        self._edit_move = None           # whole-line move: {'pid','start','seg0'} while dragging
+        self._edit_split = None          # body drag = new joint: {'pid','start','seg0','handle'}
         self._disp_transform = None      # scene(overview) pixel -> world; None until loaded
         self.drawing = False
         self.drawing_pass = False
@@ -237,8 +238,10 @@ class CanvasMap(QWidget):
         self.btn_pass.clicked.connect(self._toggle_pass)
         self.btn_edit = QToolButton(); self.btn_edit.setText('✎ Edit Route')
         self.btn_edit.setCheckable(True); self.btn_edit.setEnabled(False)
-        self.btn_edit.setToolTip('Edit the planned route: click a pass to select it, drag '
-                                 'its round endpoints to move it, press Delete to remove it.')
+        self.btn_edit.setToolTip('Edit the planned route: click a line to select it, drag its '
+                                 'round endpoints to move them, drag the middle of a line to '
+                                 'bend it at a new joint (splits it in two), press Delete to '
+                                 'remove it.')
         self.btn_edit.clicked.connect(self._toggle_edit)
         self.btn_del = QToolButton(); self.btn_del.setText('🗑 Delete pass')
         self.btn_del.setEnabled(False); self.btn_del.setVisible(False)
@@ -310,7 +313,7 @@ class CanvasMap(QWidget):
         self.drawing_pass = False; self.btn_pass.setChecked(False)
         self.btn_pass.setEnabled(False); self.btn_pass.setVisible(False)
         self._edit_group = None; self._edit_passes = {}; self._edit_drag = None
-        self._edit_move = None
+        self._edit_split = None
         self._edit_route = []; self.editing = False
         self.btn_edit.setChecked(False); self.btn_edit.setEnabled(False)
         self.btn_del.setVisible(False); self.btn_del.setEnabled(False)
@@ -728,7 +731,7 @@ class CanvasMap(QWidget):
         else:
             if self.btn_pass.isChecked():        # leaving edit closes the Add Pass sub-tool
                 self.btn_pass.setChecked(False); self._toggle_pass(False)
-            self._edit_drag = None; self._edit_move = None
+            self._edit_drag = None; self._edit_split = None
             self._clear_edit_overlay()
         self.btn_del.setEnabled(on and bool(self._selected_edit_pids()))
 
@@ -822,7 +825,8 @@ class CanvasMap(QWidget):
     def edit_press(self, sp):
         """Left-click in edit mode: grab an endpoint handle to drag — together with any
         other pass endpoints sharing that point, so a joint moves as one — else select
-        the nearest pass. Returns True when the click was consumed."""
+        the nearest pass; dragging its body then bends it at a new joint. Returns True
+        when the click was consumed."""
         scale = abs(self.view.transform().m11()) or 1.0
         htol = 9.0 / scale
         for pid, d in self._edit_passes.items():
@@ -843,15 +847,16 @@ class CanvasMap(QWidget):
         if best_pid is None:
             return False
         self._select_only(best_pid)
-        # Arm a whole-line move: dragging the line's body translates it as-is (same
-        # length and heading); a press with no drag stays a plain selection click.
-        self._edit_move = {'pid': best_pid, 'start': QPointF(sp),
-                           'seg0': self._edit_passes[best_pid]['seg']}
+        # Arm a split: dragging the line's body puts a new joint under the cursor and
+        # bends the line there (two lines sharing the joint); a press with no drag stays
+        # a plain selection click.
+        self._edit_split = {'pid': best_pid, 'start': QPointF(sp),
+                            'seg0': self._edit_passes[best_pid]['seg'], 'handle': None}
         return True
 
     def edit_dragging(self):
-        """True while an edit-mode drag is in progress (a joint or a whole line)."""
-        return self._edit_drag is not None or self._edit_move is not None
+        """True while an edit-mode drag is in progress (a joint, or bending a line)."""
+        return self._edit_drag is not None or self._edit_split is not None
 
     def _set_edit_seg(self, pid, seg):
         d = self._edit_passes[pid]
@@ -860,13 +865,21 @@ class CanvasMap(QWidget):
         d['item'].setPath(path); self._place_handles(pid)
 
     def edit_drag_move(self, sp):
-        mv = self._edit_move
-        if mv is not None:                          # whole-line move: translate both ends
-            if mv['pid'] not in self._edit_passes:
+        sp_ = self._edit_split
+        if sp_ is not None:                         # bending: start → cursor → end
+            d = self._edit_passes.get(sp_['pid'])
+            if d is None:
                 return
-            dx, dy = sp.x() - mv['start'].x(), sp.y() - mv['start'].y()
-            ax, ay, bx, by = mv['seg0']
-            self._set_edit_seg(mv['pid'], (ax + dx, ay + dy, bx + dx, by + dy))
+            ax, ay, bx, by = sp_['seg0']
+            path = QPainterPath(QPointF(ax, ay))
+            path.lineTo(sp); path.lineTo(QPointF(bx, by))
+            d['item'].setPath(path)
+            if sp_['handle'] is None:               # the new joint's handle
+                h = QGraphicsEllipseItem(-5, -5, 10, 10)
+                h.setPen(QPen(Qt.black, 1.0)); h.setBrush(QBrush(QColor('#ffd400')))
+                h.setFlag(QGraphicsEllipseItem.ItemIgnoresTransformations)
+                h.setZValue(26); self.scene.addItem(h); sp_['handle'] = h
+            sp_['handle'].setPos(sp)
             self.view.setCursor(Qt.ClosedHandCursor)
             return
         for pid, idx in (self._edit_drag or []):     # move every endpoint at the joint
@@ -880,21 +893,23 @@ class CanvasMap(QWidget):
             d['item'].setPath(path); self._place_handles(pid)
 
     def edit_drag_release(self, sp):
-        mv = self._edit_move
-        if mv is not None:
-            self._edit_move = None
+        sp_ = self._edit_split
+        if sp_ is not None:
+            self._edit_split = None
             self.view.setCursor(Qt.ArrowCursor)
+            if sp_['handle'] is not None:
+                self.scene.removeItem(sp_['handle'])
             scale = abs(self.view.transform().m11()) or 1.0
-            moved_px = math.hypot(sp.x() - mv['start'].x(), sp.y() - mv['start'].y()) * scale
-            d = self._edit_passes.get(mv['pid'])
+            moved_px = math.hypot(sp.x() - sp_['start'].x(),
+                                  sp.y() - sp_['start'].y()) * scale
+            d = self._edit_passes.get(sp_['pid'])
             if d is None:
                 return
-            if moved_px < _EDIT_DRAG_MIN_PX:        # just a click: keep the line where it was
-                self._set_edit_seg(mv['pid'], mv['seg0'])
+            if moved_px < _EDIT_DRAG_MIN_PX:        # just a click: keep the line straight
+                self._set_edit_seg(sp_['pid'], sp_['seg0'])
                 return
-            ax, ay, bx, by = d['seg']
-            p0 = self._world(QPointF(ax, ay)); p1 = self._world(QPointF(bx, by))
-            self.passEditGeom.emit([(mv['pid'], p0, p1)])
+            a, b = d['coords']                       # the line's ends stay put (lon, lat)
+            self.passEditSplit.emit((sp_['pid'], a, self._world(sp), b))
             return
         group = self._edit_drag or []
         start = self._edit_drag_start
@@ -1066,7 +1081,7 @@ class CanvasMap(QWidget):
         self.btn_edit.setChecked(False); self.btn_edit.setEnabled(False)
         self.btn_del.setVisible(False)
         self._edit_group = None; self._edit_passes = {}; self._edit_drag = None
-        self._edit_move = None
+        self._edit_split = None
         self._edit_route = []
         self.btn_focus.blockSignals(True)
         self.btn_focus.setChecked(False); self.btn_focus.setEnabled(False)

@@ -309,7 +309,7 @@ class MainWindow(QMainWindow):
         self._route_tables = []          # [RouteTable] of the last load
         self._route_rows = {}            # (table, row) -> original geometry
         self._route_gen = 0              # load counter; older keys are ignored
-        self._route_src = {}             # pass_id -> (gen, table, row, segment, t0, t1)
+        self._route_src = {}             # pass_id -> (gen, table, row, segment, t0, t1, order)
         self._route_picked = set()       # pass_ids confirmed from the loaded lines
         self._route_active = False       # a confirmed uploaded route is active (Compute re-estimates it)
         self._pending_aoi = None         # AOI loaded before a DTM — crop to it on the next Open DTM
@@ -621,6 +621,7 @@ class MainWindow(QMainWindow):
             self.mapview.passesConfirmed.connect(self._confirm_selected_passes)
             self.mapview.passEditDelete.connect(self._on_edit_delete)
             self.mapview.passEditGeom.connect(self._on_edit_geom)
+            self.mapview.passEditSplit.connect(self._on_edit_split)
             return self.mapview
         self.mapview = None
         return self._stub('🗺  Map canvas failed to load.\n' + (_MAPVIEW_ERR or ''))
@@ -957,7 +958,8 @@ class MainWindow(QMainWindow):
                 for piece in got:                        # its stretch [t0, t1] of a→b
                     t0 = math.hypot(piece[0][0] - a[0], piece[0][1] - a[1]) / seg_len
                     t1 = math.hypot(piece[1][0] - a[0], piece[1][1] - a[1]) / seg_len
-                    pieces[k].append((piece, (*key, t0, t1) if key is not None else None))
+                    pieces[k].append((piece, (*key, t0, t1, ())
+                                      if key is not None else None))
                 hit = hit or bool(got)
             if not hit:
                 outside += 1
@@ -1605,6 +1607,45 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f'Moved {n} pass{"es" if n != 1 else ""} — {self.result.n_waypoints} waypoints.')
 
+    def _on_edit_split(self, payload):
+        """Edit Route: the middle of a line was dragged — bend it at a new joint: the line
+        becomes two (start → joint keeps its pass id, joint → end gets a new one), each
+        rebuilt from the terrain like a moved line, then re-estimate once. A line from a
+        route CSV keeps both halves in its original row (one more vertex on export)."""
+        if not self.survey_route:
+            return
+        pid, a, joint, b = payload
+        new_pid = max([w.get('pass_id', 0) for w in self.survey_route
+                       if isinstance(w.get('pass_id'), int)]
+                      + [k for k in self._route_src if isinstance(k, int)], default=-1) + 1
+        first = build_manual_pass(self.dtm, a, joint, self._params(), self.is_geo, pid)
+        second = build_manual_pass(self.dtm, joint, b, self._params(), self.is_geo, new_pid)
+        if not (first and second):
+            self.statusBar().showMessage('The bent line has no valid terrain — edit ignored.')
+            if self.mapview is not None:
+                self.mapview.set_editable_route(self.survey_route)   # straighten it back
+            return
+        new_survey, done = [], False
+        for w in self.survey_route:                  # the two halves where the line was
+            if w.get('pass_id') == pid:
+                if not done:
+                    new_survey.extend(first + second); done = True
+            else:
+                new_survey.append(w)
+        if not done:
+            return
+        key = self._route_src.get(pid)
+        if key is not None:                          # both halves stay in the CSV row,
+            *stretch, order = key                    # in this order along the line
+            self._route_src[pid] = (*stretch, order + (0,))
+            self._route_src[new_pid] = (*stretch, order + (1,))
+        pre = self._snapshot_route(self.survey_route)
+        if self._reestimate_survey(new_survey, 'Line bent at a new joint — re-estimating…'):
+            self._record_edit(pre)
+            self.statusBar().showMessage(
+                f'Line split in two at the new joint — {self.result.n_waypoints} waypoints. '
+                'Drag the joint to move it.')
+
     # ---------------------------------------------------------------- profile
     def _toggle_profile(self, on):
         """Show/hide the bottom elevation-profile bar (View menu / Ctrl+E)."""
@@ -1766,19 +1807,21 @@ class MainWindow(QMainWindow):
                     continue
                 pt = (float(w['x']), float(w['y']), float(z))
                 ends[pid] = (ends[pid][0], pt) if pid in ends else (pt, pt)
-            placed = {}                                  # (ti, ri, k) -> [(t0, t1, piece)]
+            placed = {}                          # (ti, ri, k) -> [(t0, order, t1, piece)]
             for pid in set(picked) | set(ends):
                 key = src.get(pid)
                 if key is None or key[0] != self._route_gen:
                     if pid in ends:                      # drawn with Add Pass (no row)
                         added.setdefault('?', []).append(ends[pid])
                     continue
-                _, ti, ri, k, t0, t1 = key
+                _, ti, ri, k, t0, t1, order = key
                 placed.setdefault((ti, ri, k), []).append(
-                    (t0, t1, ends.get(pid)))             # None: deleted in Edit Route
+                    (t0, order, t1, ends.get(pid)))      # None: deleted in Edit Route
             for (ti, ri, k), lst in placed.items():
                 cur = edits[ti].setdefault(ri, {}).setdefault(k, [])
-                cur.extend(lst)
+                # along the edge, and the halves of a bent line in their order
+                cur.extend((t0, t1, pc) for t0, _, t1, pc in
+                           sorted(lst, key=lambda e: (e[0], e[1])))
         # Added lines go to the file of the nearest original line.
         for a, b in added.pop('?', []):
             mid = Point((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)

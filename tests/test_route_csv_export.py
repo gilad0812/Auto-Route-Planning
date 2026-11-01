@@ -247,6 +247,68 @@ def test_line_across_two_polygons_keeps_both_parts():
         w.close()
 
 
+def _drag_body(w, at, to):
+    """Edit Route mouse drag on the map, in world coordinates: press at `at`, move, release."""
+    m = w.mapview
+    if not m.editing:
+        m.btn_edit.setChecked(True); m._toggle_edit(True)
+    a, b = m._scene(*at), m._scene(*to)
+    assert m.edit_press(a)
+    m.edit_drag_move(b); m.edit_drag_release(b)
+    _app.processEvents()
+
+
+def _passes(w):
+    out = {}
+    for p in w.survey_route:
+        out.setdefault(p['pass_id'], []).append((round(p['x'], 6), round(p['y'], 6)))
+    return {pid: (pts[0], pts[-1]) for pid, pts in out.items()}
+
+
+def test_dragging_a_line_body_bends_it_at_a_new_joint():
+    """Drag the middle of a line: it splits into two lines meeting at the new joint (the
+    ends stay put); export keeps it ONE row with the extra vertex. A click doesn't split."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        rows = [_row(1, 'LINESTRING (200 300, 800 300)', 'bent'),
+                _row(2, 'LINESTRING (200 600, 800 600)', 'clicked only')]
+        w = _window(tmp, _write_csv(tmp, rows))
+        _confirm(w, _pids(w, 0) + _pids(w, 1))
+        before = _passes(w)
+        _drag_body(w, (500, 600), (500, 600))                       # click: no split
+        assert _passes(w) == before
+        pid = _pids(w, 0)[0]
+        _drag_body(w, (400, 300), (450, 400))                       # bend line 1 at (450, 400)
+        after = _passes(w)
+        assert len(after) == len(before) + 1, after
+        joint = (450.0, 400.0)
+        halves = sorted(v for k, v in after.items() if k not in before or k == pid)
+        assert halves == [((200.0, 300.0), joint), (joint, (800.0, 300.0))], halves
+        assert w.result is not None and w._edit_undo                 # re-estimated, undoable
+
+        out = os.path.join(tmp, 'bent.csv')
+        _export(w, out)
+        _, got = _read_csv(out)
+        assert len(got) == 3, got                                   # header + 2 rows, no new row
+        assert wkt_loads(got[1][3]).equals(
+            wkt_loads('LINESTRING (200 300, 450 400, 800 300)')), got[1][3]
+        assert _xy(got[1]) == (500.0, 300.0)                        # start-to-end midpoint
+        assert got[2] == rows[1]
+
+        _drag_body(w, (300, 350), (300, 450))                       # bend the 1st half again
+        _export(w, out)
+        _, got = _read_csv(out)
+        g = wkt_loads(got[1][3])
+        assert len(got) == 3 and len(g.coords) == 4, got[1][3]
+        assert list(g.coords)[-2:] == [(450, 400), (800, 300)]      # order along the line kept
+
+        w._undo_edit(); w._undo_edit(); _app.processEvents()        # back to the straight line
+        assert _passes(w) == before
+        _export(w, out)
+        _, got = _read_csv(out)
+        assert got[1] == rows[0]
+        w.close()
+
+
 def test_original_file_is_never_overwritten():
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         src = _write_csv(tmp, [_row(1, 'LINESTRING (200 200, 800 200)', 'a')])
@@ -265,6 +327,7 @@ if __name__ == '__main__':
                test_outside_parts_are_kept_with_the_edits,
                test_3d_edges_at_different_altitudes_split,
                test_line_across_two_polygons_keeps_both_parts,
+               test_dragging_a_line_body_bends_it_at_a_new_joint,
                test_original_file_is_never_overwritten):
         try:
             fn(); print(f'PASS  {fn.__name__}')
